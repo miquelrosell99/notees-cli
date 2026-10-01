@@ -53,7 +53,8 @@ import { defaultStatePath, serverState } from "./state.js";
 import { queryString, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID } from "./uuid.js";
 
-const API_KEY_PATTERN = /^nk_[A-Za-z0-9_-]{32}$/;
+// User API keys are nk_+40 base64url chars; operator keys nk_+32.
+const API_KEY_PATTERN = /^nk_[A-Za-z0-9_-]{32,40}$/;
 
 export interface CliIo {
   stdout: { write(chunk: string): unknown };
