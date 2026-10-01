@@ -150,7 +150,10 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   color?: string;
 }): Promise<void> {
   const body: Record<string, unknown> = {};
-  if (options.name !== undefined) body.name = options.name;
+  // Title-is-content: --name rewrites the node's text content (its title).
+  if (options.name !== undefined) {
+    body.contentAst = [{ type: "text", text: options.name }];
+  }
   if (options.nodeType !== undefined) body.nodeType = options.nodeType;
   if (options.icon !== undefined) body.icon = options.icon;
   if (options.color !== undefined) body.color = options.color;
@@ -661,7 +664,10 @@ async function upsertSourceByCitekey(
     id = existing.id;
     counts.updated += 1;
     if (existing.name !== spec.title) {
-      await ctx.client.patchJson(`/api/v1/objects/${encodeURIComponent(id)}`, { name: spec.title });
+      // Title-is-content: the title update rewrites the node's text content.
+      await ctx.client.patchJson(`/api/v1/objects/${encodeURIComponent(id)}`, {
+        contentAst: [{ type: "text", text: spec.title }],
+      });
     }
   }
   const properties = existing === undefined ? [] : fullPropertiesOf(existing);

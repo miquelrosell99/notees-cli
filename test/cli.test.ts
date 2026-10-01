@@ -95,12 +95,22 @@ async function bootServer(): Promise<Harness> {
       return code;
     },
     async createPage(name: string, contentAst: unknown[]) {
+      // Title-is-content: the page's own content IS its title; the given
+      // contentAst becomes a child block (pages are text-only by invariant).
       const code = await this.runCliWithStdin(
-        JSON.stringify({ nodeType: "page", name, contentAst }),
+        JSON.stringify({ nodeType: "page", contentAst: [{ type: "text", text: name }] }),
         "--json", "object", "create", "--stdin",
       );
       if (code !== EXIT.ok) throw new Error(`createPage ${name} failed: ${io.stderrText}`);
-      return (JSON.parse(io.stdoutText) as { id: string }).id;
+      const id = (JSON.parse(io.stdoutText) as { id: string }).id;
+      if (contentAst.length > 0) {
+        const blockCode = await this.runCliWithStdin(
+          JSON.stringify({ nodeType: "block", parentId: id, contentAst }),
+          "--json", "object", "create", "--stdin",
+        );
+        if (blockCode !== EXIT.ok) throw new Error(`createPage block ${name} failed: ${io.stderrText}`);
+      }
+      return id;
     },
   };
   return harness;
@@ -122,10 +132,11 @@ describe("object lifecycle (json mode)", () => {
     const h = harness;
 
     // create (prints the new id; --json wraps it) — content via --stdin
+    // Title-is-content: the title IS the content; `name` is only a create
+    // convenience when no contentAst is given.
     const stdin = JSON.stringify({
       nodeType: "page",
-      name: "t1-cli-page",
-      contentAst: [{ type: "text", text: "quixotic CLI expedition notes" }],
+      contentAst: [{ type: "text", text: "t1-cli-page" }],
     });
     const createCode = await h.runCliWithStdin(stdin, "--json", "object", "create", "--stdin");
     expect(createCode).toBe(EXIT.ok);
@@ -134,7 +145,7 @@ describe("object lifecycle (json mode)", () => {
 
     // get
     expect(await h.runCli("--json", "object", "get", created.id)).toBe(EXIT.ok);
-    expect(JSON.parse(h.io.stdoutText).object.name).toBe("t1-cli-page");
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("t1-cli-page"); // derived from content
 
     // update
     expect(await h.runCli("--json", "object", "update", created.id, "--name", "t1-cli-page-v2")).toBe(EXIT.ok);
@@ -146,8 +157,8 @@ describe("object lifecycle (json mode)", () => {
     expect(list.objects.map((o: { id: string }) => o.id)).toContain(created.id);
     expect(list.nextCursor).toBeDefined();
 
-    // search
-    expect(await h.runCli("--json", "search", "quixotic")).toBe(EXIT.ok);
+    // search (title term — title-is-content: it lives in the content)
+    expect(await h.runCli("--json", "search", "t1-cli-page-v2")).toBe(EXIT.ok);
     expect(JSON.parse(h.io.stdoutText).results.map((r: { id: string }) => r.id)).toContain(created.id);
 
     // delete without --yes: exit 2, nothing deleted
@@ -169,7 +180,7 @@ describe("object lifecycle (json mode)", () => {
 
   it("create reads the body from --stdin", async () => {
     const h = harness;
-    const stdin = JSON.stringify({ nodeType: "page", name: "t2-stdin-page", contentAst: [{ type: "text", text: "from stdin" }] });
+    const stdin = JSON.stringify({ nodeType: "page", contentAst: [{ type: "text", text: "t2-stdin-page" }] });
     const code = await h.runCliWithStdin(stdin, "--json", "object", "create", "--stdin");
     expect(code).toBe(EXIT.ok);
     const { id } = JSON.parse(h.io.stdoutText);
@@ -656,9 +667,14 @@ describe("search (query language)", () => {
     }
     const { id } = await apiPost<{ id: string }>("/api/v1/objects", {
       nodeType: "page",
-      name,
-      contentAst: [{ type: "text", text: `${name} body text` }],
+      // Title-is-content: the paper's own content IS its title.
+      contentAst: [{ type: "text", text: name }],
       classIds: [SYSTEM_CLASS_UUIDS.paper],
+    });
+    await apiPost<{ id: string }>("/api/v1/objects", {
+      nodeType: "block",
+      parentId: id,
+      contentAst: [{ type: "text", text: `${name} body text` }],
     });
     if (year !== undefined) {
       await apiPost(`/api/v1/objects/${id}/properties`, {
@@ -703,24 +719,44 @@ describe("search (query language)", () => {
   it("text:, quoted phrases, boolean composition and linked:Name", async () => {
     const h = harness;
     const target = await makePaper("dsllinktarget");
-    const notes = await h.createPage("dsllinknotes", [
-      { type: "mention", targetNodeId: target, text: "dsllinktarget" },
-      { type: "text", text: "revolutionary ideas" },
-    ]);
-    const other = await h.createPage("dsllinkother", [
-      { type: "text", text: "revolutionary manifesto" },
-    ]);
+    // Title-is-content: page content IS the title, so the prose lives on a
+    // child block; the block is what text:/linked: match against.
+    const notes = await h.createPage("dsllinknotes", []);
+    const notesBlock = await h.runCliWithStdin(
+      JSON.stringify({
+        nodeType: "block",
+        parentId: notes,
+        contentAst: [
+          { type: "mention", targetNodeId: target, text: "the linked paper" },
+          { type: "text", text: "revolutionary ideas" },
+        ],
+      }),
+      "--json", "object", "create", "--stdin",
+    );
+    expect(notesBlock).toBe(EXIT.ok);
+    const notesBlockId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const other = await h.createPage("dsllinkother", []);
+    const otherBlock = await h.runCliWithStdin(
+      JSON.stringify({
+        nodeType: "block",
+        parentId: other,
+        contentAst: [{ type: "text", text: "revolutionary manifesto" }],
+      }),
+      "--json", "object", "create", "--stdin",
+    );
+    expect(otherBlock).toBe(EXIT.ok);
+    const otherBlockId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
 
-    // text: term + phrase both hit the notes page; NOT excludes it.
+    // text: term + phrase both hit the notes block; NOT excludes it.
     expect(await h.runCli("--json", "search", 'text:revolutionary AND "ideas"')).toBe(EXIT.ok);
-    expect(JSON.parse(h.io.stdoutText).ids).toEqual([notes]);
+    expect(JSON.parse(h.io.stdoutText).ids).toEqual([notesBlockId]);
 
     expect(await h.runCli("--json", "search", "text:revolutionary NOT linked:dsllinktarget")).toBe(EXIT.ok);
-    expect(JSON.parse(h.io.stdoutText).ids).toEqual([other]);
+    expect(JSON.parse(h.io.stdoutText).ids).toEqual([otherBlockId]);
 
     // linked:<name> resolves the node by name and matches its referrers.
     expect(await h.runCli("--json", "search", "linked:dsllinktarget")).toBe(EXIT.ok);
-    expect(JSON.parse(h.io.stdoutText).ids).toEqual([notes]);
+    expect(JSON.parse(h.io.stdoutText).ids).toEqual([notesBlockId]);
   });
 
   it("human mode lists result names; plain text still routes to FTS", async () => {
@@ -756,13 +792,12 @@ describe("shell (scripted mode)", () => {
     const script = `
       const p = await create({
         nodeType: "page",
-        name: "shell-t1-page",
-        contentAst: [{ type: "text", text: "shellabyss crossing notes" }],
+        contentAst: [{ type: "text", text: "shell-t1-page" }],
       });
       console.log("created " + p.id);
       const got = await get(p.id);
       console.log("got " + got.name);
-      const hits = await search("shellabyss");
+      const hits = await search("shell-t1-page");
       console.log("hits " + hits.map((hit) => hit.id).join(","));
       const eff = await effective(p.id);
       console.log("effective-count " + eff.length);
