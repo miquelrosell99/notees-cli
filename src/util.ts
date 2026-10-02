@@ -19,7 +19,7 @@ export function readStdin(source: StdinSource): Promise<string> {
   });
 }
 
-export function queryString(params: Record<string, string | number | undefined>): string {
+export function queryString(params: Record<string, string | number | boolean | undefined>): string {
   const entries = Object.entries(params).filter(([, value]) => value !== undefined && value !== "");
   if (entries.length === 0) return "";
   return `?${entries.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`).join("&")}`;

@@ -18,7 +18,8 @@ import { queryString } from "./util.js";
 
 export interface ExportApiObject {
   id: string;
-  nodeType: string;
+  isClass: boolean;
+  presentAsMain: boolean;
   parentId: string | null;
   classIds: string[];
   name: string | null;
@@ -36,7 +37,8 @@ export interface ApiEdgeRow {
 
 interface ApiObjectStub {
   id: string;
-  nodeType: string;
+  isClass: boolean;
+  presentAsMain: boolean;
   parentId: string | null;
 }
 
@@ -45,12 +47,11 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function toExportNode(obj: ExportApiObject): ExportNode {
-  const nodeType = (
-    obj.nodeType === "page" || obj.nodeType === "class" ? obj.nodeType : "block"
-  ) as ExportNode["nodeType"];
   return {
     id: obj.id,
-    nodeType,
+    isClass: obj.isClass ? 1 : 0,
+    presentAsMain: obj.presentAsMain ? 1 : 0,
+    parentId: obj.parentId ?? null,
     name: obj.name ?? null,
     contentAst: Array.isArray(obj.contentAst) ? (obj.contentAst as ExportNode["contentAst"]) : [],
     classIds: Array.isArray(obj.classIds) ? obj.classIds : [],
@@ -61,6 +62,14 @@ export function toExportNode(obj: ExportApiObject): ExportNode {
       ...(isRecord(property.metadata) ? { metadata: property.metadata } : {}),
     })),
   };
+}
+
+/** Document-chrome predicate over the export shape (Revision 11): non-class
+ * nodes render as documents when parentless or render-bit set. */
+export function rendersAsDocument(
+  node: Pick<ExportNode, "isClass" | "presentAsMain" | "parentId">,
+): boolean {
+  return node.isClass === 0 && (node.parentId === null || node.presentAsMain === 1);
 }
 
 /** Collect every id export rendering may resolve: mentions, chips, bound verbs, class ids, node-typed property values. */
@@ -91,8 +100,8 @@ export interface ObjectResolver {
 
 /**
  * Cached full-object fetch shared by both exporters; parent ids kept on the
- * side for containing-page walks (ExportNode deliberately carries no
- * placement).
+ * side for containing-page walks (ExportNode carries placement since
+ * Revision 11 — the map stays as the walk's cheap lookup).
  */
 export function makeObjectResolver(client: ApiClient): ObjectResolver {
   const objectCache = new Map<string, ExportNode | undefined>();
@@ -118,8 +127,10 @@ export function makeObjectResolver(client: ApiClient): ObjectResolver {
     for (let hops = 0; currentId !== null && hops < 64; hops += 1) {
       const node = await getObject(currentId);
       if (node === undefined) return undefined;
-      if (node.nodeType === "page") return node;
-      if (node.nodeType === "class") return undefined;
+      // Classes are never inside a document; the first document-chrome
+      // ancestor (parentless or render-bit set) is the containing page.
+      if (node.isClass === 1) return undefined;
+      if (rendersAsDocument(node)) return node;
       currentId = parentOf.get(currentId) ?? null;
     }
     return undefined;
@@ -164,7 +175,7 @@ export async function collectClosure(
           visitedSources.add(sourceId);
           const source = await resolver.getObject(sourceId);
           if (source === undefined) continue;
-          const page = source.nodeType === "page" ? source : await resolver.containingPage(sourceId);
+          const page = rendersAsDocument(source) ? source : await resolver.containingPage(sourceId);
           if (page === undefined || visitedPages.has(page.id)) continue;
           visitedPages.add(page.id);
           included.set(page.id, page);
@@ -202,14 +213,15 @@ export async function buildMarkdownBundle(
   });
 
   // Children map: the object API exposes no children endpoint (M1), so the
-  // parent→children map is derived from the paged object list (id-ordered —
-  // bullet order is id order, not child-position order; documented deviation),
-  // then each child is full-gotten for its contentAst.
+  // parent→children map is derived from the paged object list filtered to
+  // the inline body (non-class rows with the render bit unset — id-ordered,
+  // so bullet order is id order, not child-position order; documented
+  // deviation), then each child is full-gotten for its contentAst.
   const childrenMap = new Map<string, ExportNode[]>();
   const stubs: ApiObjectStub[] = [];
   let cursor: string | undefined;
   do {
-    const query = queryString({ nodeType: "block", limit: 500, cursor });
+    const query = queryString({ isClass: false, presentAsMain: false, limit: 500, cursor });
     const body = await client.getJson<{ objects: ApiObjectStub[]; nextCursor: string | null }>(
       `/api/objects${query}`,
     );

@@ -42,7 +42,8 @@ export interface ShellOptions {
 }
 
 export interface ListOptions {
-  nodeType?: "page" | "block" | "class";
+  isClass?: boolean;
+  presentAsMain?: boolean;
   class?: string;
   q?: string;
   property?: string;
@@ -51,7 +52,8 @@ export interface ListOptions {
 }
 
 export interface SearchOptions {
-  nodeType?: "page" | "block" | "class";
+  isClass?: boolean;
+  presentAsMain?: boolean;
   limit?: number;
 }
 
@@ -92,15 +94,15 @@ export interface ShellHelpers {
 const HELP_TEXT = `notees shell helpers (object API, top-level await works):
   api                                        raw ApiClient: getJson/postJson/patchJson/deleteJson/postMultipart, .server, .apiKey
   get(id)                                    fetch an object (contentAst + authored properties)
-  list(opts?)                                list objects -> array (opts: nodeType, class, q, property, limit, cursor)
-  search(q, opts?)                           full-text search -> results array (opts: nodeType, limit)
+  list(opts?)                                list objects -> array (opts: isClass, presentAsMain, class, q, property, limit, cursor)
+  search(q, opts?)                           full-text search -> results array (opts: isClass, presentAsMain, limit)
   classes()                                  list classes
   classInfo(id)                              one class (with members) merged into a single object
   backlinks(id)                              edges pointing at id
   props(id)                                  authored properties of an object
   effective(id)                              authored + class-default effective properties
-  create(partial)                            POST /objects -> created object (fields: nodeType, name, contentAst, classIds, parentId)
-  update(id, fields)                         PATCH fields (name, nodeType, icon, color, contentAst) -> updated object
+  create(partial)                            POST /objects -> created object (fields: isClass, presentAsMain, name, contentAst, classIds, parentId)
+  update(id, fields)                         PATCH fields (name, presentAsMain, icon, color, contentAst) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   upload(filePath)                           upload a file from disk -> asset id
@@ -124,7 +126,8 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     get: async (id) => (await client.getJson<{ object: unknown }>(objectUrl(id))).object,
     list: async (opts = {}) => {
       const query = queryString({
-        nodeType: opts.nodeType,
+        isClass: opts.isClass,
+        presentAsMain: opts.presentAsMain,
         class: opts.class,
         q: opts.q,
         property: opts.property,
@@ -135,7 +138,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       return body.objects;
     },
     search: async (q, opts = {}) => {
-      const query = queryString({ q, nodeType: opts.nodeType, limit: opts.limit });
+      const query = queryString({ q, isClass: opts.isClass, presentAsMain: opts.presentAsMain, limit: opts.limit });
       const body = await client.getJson<{ results: unknown[] }>(`/api/search${query}`);
       return body.results;
     },

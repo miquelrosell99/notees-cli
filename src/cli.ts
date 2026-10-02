@@ -118,7 +118,8 @@ async function objectGet(ctx: CommandContext, id: string): Promise<void> {
 }
 
 async function objectCreate(ctx: CommandContext, options: {
-  nodeType?: string;
+  presentAsMain?: boolean;
+  isClass?: boolean;
   name?: string;
   class?: string[];
   parent?: string;
@@ -133,7 +134,12 @@ async function objectCreate(ctx: CommandContext, options: {
       throw new CliError(EXIT.usage, "--stdin body is not valid JSON");
     }
   }
-  if (options.nodeType !== undefined) body.nodeType = options.nodeType;
+  // Revision 11 render state: --isClass declares a class node (a root —
+  // rejected server-side alongside --parent/--class); --presentAsMain sets
+  // the render bit (server default: true when parentless, false when
+  // parented).
+  if (options.isClass === true) body.isClass = true;
+  if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
   if (options.name !== undefined) body.name = options.name;
   if (options.parent !== undefined) body.parentId = options.parent;
   const classIds = options.class ?? [];
@@ -145,7 +151,7 @@ async function objectCreate(ctx: CommandContext, options: {
 
 async function objectUpdate(ctx: CommandContext, id: string, options: {
   name?: string;
-  nodeType?: string;
+  presentAsMain?: boolean;
   icon?: string;
   color?: string;
 }): Promise<void> {
@@ -154,11 +160,13 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   if (options.name !== undefined) {
     body.contentAst = [{ type: "text", text: options.name }];
   }
-  if (options.nodeType !== undefined) body.nodeType = options.nodeType;
+  // Promotion/demotion: flip the render bit between the parent's
+  // main-children zone (true) and the inline body (false).
+  if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
   if (options.icon !== undefined) body.icon = options.icon;
   if (options.color !== undefined) body.color = options.color;
   if (Object.keys(body).length === 0) {
-    failUsage("object update requires at least one of --name, --nodeType, --icon, --color");
+    failUsage("object update requires at least one of --name, --presentAsMain, --icon, --color");
   }
   const updated = await ctx.client.patchJson<{ object: unknown }>(
     `/api/objects/${encodeURIComponent(id)}`,
@@ -167,13 +175,27 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   emit(ctx, `${JSON.stringify(updated.object, null, 2)}\n`, updated);
 }
 
+/**
+ * Render-state vocabulary for human output (Revision 11): the booleans read
+ * as the retired page/block/class words — a class node is a "class", a
+ * non-class node with document chrome (parentless or render-bit set) is a
+ * "page", and a parented node with the bit unset is a "block".
+ */
+function renderKindLabel(node: { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }): string {
+  if (node.isClass === true) return "class";
+  if (node.isClass === false) {
+    return node.parentId === null || node.presentAsMain === true ? "page" : "block";
+  }
+  return "object";
+}
+
 async function objectDelete(ctx: CommandContext, id: string, options: { permanent?: boolean; yes?: boolean }): Promise<void> {
   const permanent = options.permanent === true;
   if (options.yes !== true) {
     // Blast-radius preview — never prompt when --json or non-tty.
-    let preview: { name?: string | null; nodeType?: string } = {};
+    let preview: { name?: string | null; isClass?: boolean; presentAsMain?: boolean } = {};
     try {
-      const fetched = await ctx.client.getJson<{ object: { name?: string | null; nodeType?: string } }>(
+      const fetched = await ctx.client.getJson<{ object: { name?: string | null; isClass?: boolean; presentAsMain?: boolean } }>(
         `/api/objects/${encodeURIComponent(id)}`,
       );
       preview = fetched.object;
@@ -184,7 +206,7 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
     const scope = permanent ? "permanently delete (unrecoverable)" : "move to trash";
     const label = preview.name !== null && preview.name !== undefined && preview.name.length > 0 ? `"${preview.name}"` : id;
     ctx.io.stderr.write(
-      `Refusing to ${scope} ${label} (${preview.nodeType ?? "object"}) without confirmation.\n` +
+      `Refusing to ${scope} ${label} (${renderKindLabel(preview)}) without confirmation.\n` +
         `Re-run with --yes to proceed. Deleted object id: ${id}\n`,
     );
     throw new CliError(EXIT.usage, "destructive command requires --yes", { preview });
@@ -197,7 +219,8 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
 }
 
 async function objectList(ctx: CommandContext, options: {
-  nodeType?: string;
+  isClass?: boolean;
+  presentAsMain?: boolean;
   class?: string[];
   q?: string;
   property?: string;
@@ -206,7 +229,8 @@ async function objectList(ctx: CommandContext, options: {
 }): Promise<void> {
   const classes = options.class ?? [];
   const query = queryString({
-    nodeType: options.nodeType,
+    isClass: options.isClass,
+    presentAsMain: options.presentAsMain,
     ...(classes.length === 1 ? { class: classes[0] } : {}),
     q: options.q,
     property: options.property,
@@ -217,14 +241,14 @@ async function objectList(ctx: CommandContext, options: {
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
-async function search(ctx: CommandContext, queryText: string, options: { nodeType?: string }): Promise<void> {
+async function search(ctx: CommandContext, queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }): Promise<void> {
   // Plain text goes to the FTS endpoint; query-language syntax (class:,
   // prop:…, AND/OR/NOT, quotes — see looksLikeQueryLanguage) is compiled to a
   // QueryAST here and executed through POST /api/query. DSL parse errors
   // fail loud (exit 2) with the parser's message — never silently degraded
   // to a text search.
   if (!looksLikeQueryLanguage(queryText)) {
-    const query = queryString({ q: queryText, nodeType: options.nodeType });
+    const query = queryString({ q: queryText, isClass: options.isClass, presentAsMain: options.presentAsMain });
     const body = await ctx.client.getJson<unknown>(`/api/search${query}`);
     emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
     return;
@@ -234,13 +258,15 @@ async function search(ctx: CommandContext, queryText: string, options: { nodeTyp
   const rows = body.rows ?? [];
   const human = rows.length === 0
     ? "no results\n"
-    : `${rows.map((row) => `${row.name ?? row.id}  (${row.nodeType})`).join("\n")}\n`;
+    : `${rows.map((row) => `${row.name ?? row.id}  (${renderKindLabel(row)})`).join("\n")}\n`;
   emit(ctx, human, body);
 }
 
 interface SearchRow {
   id: string;
-  nodeType: string;
+  isClass: boolean;
+  presentAsMain: boolean;
+  parentId: string | null;
   name: string | null;
 }
 
@@ -624,7 +650,7 @@ async function findOrCreatePerson(
   const existing = await findPersonByName(ctx, literal);
   if (existing !== undefined) return existing;
   const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-    nodeType: "page",
+    presentAsMain: true,
     name: literal,
     classIds: [SYSTEM_CLASS_UUIDS.person],
   });
@@ -654,7 +680,7 @@ async function upsertSourceByCitekey(
   let id: string;
   if (existing === undefined) {
     const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-      nodeType: "page",
+      presentAsMain: true,
       name: spec.title,
       classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
     });
@@ -805,7 +831,12 @@ function buildProgram(): Command {
   object
     .command("create")
     .description("create an object (prints the new id)")
-    .addOption(new Option("--nodeType <type>", "page | block").choices(["page", "block"]))
+    .option("--isClass", "declare a class node (a root: no --parent/--class/--presentAsMain)")
+    .option(
+      "--presentAsMain",
+      "render bit: set for the parent's main-children zone (server default: true when parentless, false when parented)",
+      undefined,
+    )
     .option("--name <name>", "object name")
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "parent object id")
@@ -817,10 +848,15 @@ function buildProgram(): Command {
     .command("update <id>")
     .description("update an object")
     .option("--name <name>", "new name")
-    .addOption(new Option("--nodeType <type>", "page | block").choices(["page", "block"]))
+    .addOption(
+      new Option("--presentAsMain", "promote: render the node in its parent's main-children zone").default(
+        undefined,
+      ),
+    )
+    .addOption(new Option("--no-presentAsMain", "demote: render the node in the inline body"))
     .option("--icon <icon>", "icon")
     .option("--color <color>", "color")
-    .action(async (id: string, options: { name?: string; nodeType?: string; icon?: string; color?: string }, command: Command) => {
+    .action(async (id: string, options: { name?: string; presentAsMain?: boolean; icon?: string; color?: string }, command: Command) => {
       await objectUpdate(ctxOf(command), id, options);
     });
   object
@@ -834,7 +870,17 @@ function buildProgram(): Command {
   object
     .command("list")
     .description("list objects")
-    .addOption(new Option("--nodeType <type>", "page | block | class").choices(["page", "block", "class"]))
+    .addOption(new Option("--isClass", "filter: class nodes only").default(undefined))
+    .addOption(new Option("--no-isClass", "filter: non-class nodes only"))
+    .addOption(
+      new Option(
+        "--presentAsMain",
+        "filter: document-chrome rows (non-class roots + main children — the pages-ish listing)",
+      ).default(undefined),
+    )
+    .addOption(
+      new Option("--no-presentAsMain", "filter: inline-body blocks (parented rows with the render bit unset)"),
+    )
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--q <text>", "full-text filter")
     .option("--property <schemaId:value>", "exact-match property filter (value = everything after the first colon)")
@@ -847,12 +893,19 @@ function buildProgram(): Command {
   program
     .command("search <query>")
     .description(
-      "search — plain text (FTS) or the query language: class:Name, type:page|block|class, " +
+      "search — plain text (FTS) or the query language: class:Name, isClass:true|false, presentAsMain:true|false, " +
         "prop:name:<op>value (:= != :> :>= :< :<=, bare : = contains, no value = exists), " +
         "bare schema fields (year:>2010), text:term, linked:Name, \"quoted phrases\", AND OR NOT, ( )",
     )
-    .addOption(new Option("--nodeType <type>", "page | block | class (plain-text search only)").choices(["page", "block", "class"]))
-    .action(async (queryText: string, options: { nodeType?: string }, command: Command) => {
+    .addOption(new Option("--isClass", "filter: class nodes only (plain-text search only)").default(undefined))
+    .addOption(new Option("--no-isClass", "filter: non-class nodes only (plain-text search only)"))
+    .addOption(
+      new Option("--presentAsMain", "filter: document-chrome rows only (plain-text search only)").default(undefined),
+    )
+    .addOption(
+      new Option("--no-presentAsMain", "filter: inline-body blocks only (plain-text search only)"),
+    )
+    .action(async (queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }, command: Command) => {
       await search(ctxOf(command), queryText, options);
     });
 
