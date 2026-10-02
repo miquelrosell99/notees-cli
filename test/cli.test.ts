@@ -658,26 +658,26 @@ describe("search (query language)", () => {
   async function makePaper(name: string, year?: number): Promise<string> {
     if (yearSchemaId === "") {
       yearSchemaId = (
-        await apiPost<{ propertySchema: { id: string } }>("/api/v1/property-schemas", {
+        await apiPost<{ propertySchema: { id: string } }>("/api/property-schemas", {
           propertySchemaId: crypto.randomUUID(),
           name: "year",
           type: "number",
         })
       ).propertySchema.id;
     }
-    const { id } = await apiPost<{ id: string }>("/api/v1/objects", {
+    const { id } = await apiPost<{ id: string }>("/api/objects", {
       nodeType: "page",
       // Title-is-content: the paper's own content IS its title.
       contentAst: [{ type: "text", text: name }],
       classIds: [SYSTEM_CLASS_UUIDS.paper],
     });
-    await apiPost<{ id: string }>("/api/v1/objects", {
+    await apiPost<{ id: string }>("/api/objects", {
       nodeType: "block",
       parentId: id,
       contentAst: [{ type: "text", text: `${name} body text` }],
     });
     if (year !== undefined) {
-      await apiPost(`/api/v1/objects/${id}/properties`, {
+      await apiPost(`/api/objects/${id}/properties`, {
         propertySchemaId: yearSchemaId,
         value: year,
         idx: 0,

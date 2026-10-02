@@ -102,7 +102,7 @@ export function makeObjectResolver(client: ApiClient): ObjectResolver {
     let node: ExportNode | undefined;
     try {
       const body = await client.getJson<{ object: ExportApiObject }>(
-        `/api/v1/objects/${encodeURIComponent(id)}`,
+        `/api/objects/${encodeURIComponent(id)}`,
       );
       parentOf.set(id, body.object.parentId ?? null);
       node = toExportNode(body.object);
@@ -156,7 +156,7 @@ export async function collectClosure(
       const next: string[] = [];
       for (const id of frontier) {
         const body = await client.getJson<{ nodeId: string; backlinks: ApiEdgeRow[] }>(
-          `/api/v1/objects/${encodeURIComponent(id)}/backlinks`,
+          `/api/objects/${encodeURIComponent(id)}/backlinks`,
         );
         for (const edge of body.backlinks) {
           const sourceId = edge.source_id;
@@ -211,7 +211,7 @@ export async function buildMarkdownBundle(
   do {
     const query = queryString({ nodeType: "block", limit: 500, cursor });
     const body = await client.getJson<{ objects: ApiObjectStub[]; nextCursor: string | null }>(
-      `/api/v1/objects${query}`,
+      `/api/objects${query}`,
     );
     stubs.push(...body.objects);
     cursor = body.nextCursor ?? undefined;

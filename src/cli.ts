@@ -113,7 +113,7 @@ function requireServerAndKey(opts: GlobalOptions): { server: string; apiKey: str
 // --- command handlers --------------------------------------------------------
 
 async function objectGet(ctx: CommandContext, id: string): Promise<void> {
-  const body = await ctx.client.getJson<{ object: unknown }>(`/api/v1/objects/${encodeURIComponent(id)}`);
+  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, body);
 }
 
@@ -138,7 +138,7 @@ async function objectCreate(ctx: CommandContext, options: {
   if (options.parent !== undefined) body.parentId = options.parent;
   const classIds = options.class ?? [];
   if (classIds.length > 0) body.classIds = classIds;
-  const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/v1/objects", body);
+  const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/objects", body);
   // Non-json prints the new id only (script-friendly).
   emit(ctx, `${created.id}\n`, created);
 }
@@ -161,7 +161,7 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
     failUsage("object update requires at least one of --name, --nodeType, --icon, --color");
   }
   const updated = await ctx.client.patchJson<{ object: unknown }>(
-    `/api/v1/objects/${encodeURIComponent(id)}`,
+    `/api/objects/${encodeURIComponent(id)}`,
     body,
   );
   emit(ctx, `${JSON.stringify(updated.object, null, 2)}\n`, updated);
@@ -174,7 +174,7 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
     let preview: { name?: string | null; nodeType?: string } = {};
     try {
       const fetched = await ctx.client.getJson<{ object: { name?: string | null; nodeType?: string } }>(
-        `/api/v1/objects/${encodeURIComponent(id)}`,
+        `/api/objects/${encodeURIComponent(id)}`,
       );
       preview = fetched.object;
     } catch (error) {
@@ -191,7 +191,7 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
   }
   const query = permanent ? `?permanent=true&confirm=${encodeURIComponent(id)}` : "";
   const result = await ctx.client.deleteJson<{ id: string; deleted: boolean; permanent: boolean }>(
-    `/api/v1/objects/${encodeURIComponent(id)}${query}`,
+    `/api/objects/${encodeURIComponent(id)}${query}`,
   );
   emit(ctx, `deleted ${result.id}${result.permanent ? " (permanent)" : ""}\n`, result);
 }
@@ -213,24 +213,24 @@ async function objectList(ctx: CommandContext, options: {
     limit: options.limit !== undefined ? Number.parseInt(options.limit, 10) : undefined,
     cursor: options.cursor,
   });
-  const body = await ctx.client.getJson<unknown>(`/api/v1/objects${query}`);
+  const body = await ctx.client.getJson<unknown>(`/api/objects${query}`);
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
 async function search(ctx: CommandContext, queryText: string, options: { nodeType?: string }): Promise<void> {
   // Plain text goes to the FTS endpoint; query-language syntax (class:,
   // prop:…, AND/OR/NOT, quotes — see looksLikeQueryLanguage) is compiled to a
-  // QueryAST here and executed through POST /api/v1/query. DSL parse errors
+  // QueryAST here and executed through POST /api/query. DSL parse errors
   // fail loud (exit 2) with the parser's message — never silently degraded
   // to a text search.
   if (!looksLikeQueryLanguage(queryText)) {
     const query = queryString({ q: queryText, nodeType: options.nodeType });
-    const body = await ctx.client.getJson<unknown>(`/api/v1/search${query}`);
+    const body = await ctx.client.getJson<unknown>(`/api/search${query}`);
     emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
     return;
   }
   const ast = await compileQueryLanguage(ctx, queryText);
-  const body = await ctx.client.postJson<{ ids: string[]; rows: SearchRow[] }>("/api/v1/query", { ast });
+  const body = await ctx.client.postJson<{ ids: string[]; rows: SearchRow[] }>("/api/query", { ast });
   const rows = body.rows ?? [];
   const human = rows.length === 0
     ? "no results\n"
@@ -253,8 +253,8 @@ interface SearchRow {
  */
 async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<QueryAst> {
   const [{ classes }, { propertySchemas }] = await Promise.all([
-    ctx.client.getJson<{ classes: { id: string; name: string }[] }>("/api/v1/classes"),
-    ctx.client.getJson<{ propertySchemas: { id: string; name: string }[] }>("/api/v1/property-schemas"),
+    ctx.client.getJson<{ classes: { id: string; name: string }[] }>("/api/classes"),
+    ctx.client.getJson<{ propertySchemas: { id: string; name: string }[] }>("/api/property-schemas"),
   ]);
   const classIds = new Map(classes.map((klass) => [klass.name.toLowerCase(), klass.id]));
   const schemaIds = new Map(propertySchemas.map((schema) => [schema.name.toLowerCase(), schema.id]));
@@ -266,7 +266,7 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
     if (nodeIds.has(wanted)) continue;
     const query = queryString({ q: name, limit: 50 });
     const body = await ctx.client.getJson<{ results: { id: string; name: string | null }[] }>(
-      `/api/v1/search${query}`,
+      `/api/search${query}`,
     );
     const hit = body.results.find((result) => (result.name ?? "").toLowerCase() === wanted);
     if (hit !== undefined) nodeIds.set(wanted, hit.id);
@@ -299,12 +299,12 @@ function extractLinkedNames(text: string): string[] {
 }
 
 async function classList(ctx: CommandContext): Promise<void> {
-  const body = await ctx.client.getJson<unknown>("/api/v1/classes");
+  const body = await ctx.client.getJson<unknown>("/api/classes");
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
 async function backlinks(ctx: CommandContext, id: string): Promise<void> {
-  const body = await ctx.client.getJson<unknown>(`/api/v1/objects/${encodeURIComponent(id)}/backlinks`);
+  const body = await ctx.client.getJson<unknown>(`/api/objects/${encodeURIComponent(id)}/backlinks`);
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
@@ -318,12 +318,12 @@ async function assetAdd(ctx: CommandContext, filePath: string, options: { object
   const form = new FormData();
   form.append("file", new Blob([bytes]), basename(filePath));
   if (options.object !== undefined) form.append("objectId", options.object);
-  const body = await ctx.client.postMultipart<{ assetId: string }>("/api/v1/assets", form);
+  const body = await ctx.client.postMultipart<{ assetId: string }>("/api/assets", form);
   emit(ctx, `${body.assetId}\n`, body);
 }
 
 async function assetGet(ctx: CommandContext, id: string, options: { output?: string }): Promise<void> {
-  const response = await ctx.client.getBytes(`/api/v1/assets/${encodeURIComponent(id)}`);
+  const response = await ctx.client.getBytes(`/api/assets/${encodeURIComponent(id)}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   if (options.output !== undefined) {
     writeFileSync(options.output, bytes);
@@ -376,7 +376,7 @@ async function doctor(ctx: CommandContext): Promise<void> {
 
   if (server !== undefined && server.length > 0) {
     try {
-      const version = await ctx.client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/v1/version");
+      const version = await ctx.client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/version");
       push("server reachable", true, `${version.name} ${version.version} (protocol v${version.protocolVersion})`, EXIT.ok);
     } catch (error) {
       if (error instanceof CliError) {
@@ -484,7 +484,7 @@ function fullPropertiesOf(object: unknown): FullApiProperty[] {
 
 async function getFullObject(ctx: CommandContext, id: string): Promise<FullApiObject> {
   const body = await ctx.client.getJson<{ object: FullApiObject }>(
-    `/api/v1/objects/${encodeURIComponent(id)}`,
+    `/api/objects/${encodeURIComponent(id)}`,
   );
   return body.object;
 }
@@ -496,7 +496,7 @@ async function setProperty(
   value: unknown,
   idx = 0,
 ): Promise<void> {
-  await ctx.client.postJson(`/api/v1/objects/${encodeURIComponent(objectId)}/properties`, {
+  await ctx.client.postJson(`/api/objects/${encodeURIComponent(objectId)}/properties`, {
     propertySchemaId,
     value,
     idx,
@@ -510,7 +510,7 @@ async function deleteProperty(
   idx = 0,
 ): Promise<void> {
   await ctx.client.deleteJson(
-    `/api/v1/objects/${encodeURIComponent(objectId)}/properties/${encodeURIComponent(propertySchemaId)}?idx=${idx}`,
+    `/api/objects/${encodeURIComponent(objectId)}/properties/${encodeURIComponent(propertySchemaId)}?idx=${idx}`,
   );
 }
 
@@ -527,14 +527,14 @@ async function deleteProperty(
 async function ensurePropertySchema(ctx: CommandContext, name: SystemPropertyName): Promise<void> {
   const propertySchemaId = SYSTEM_PROPERTY_UUIDS[name];
   try {
-    await ctx.client.getJson(`/api/v1/property-schemas/${propertySchemaId}`);
+    await ctx.client.getJson(`/api/property-schemas/${propertySchemaId}`);
     return;
   } catch (error) {
     if (!(error instanceof CliError) || error.exitCode !== EXIT.domain) throw error;
   }
   const spec = SYSTEM_PROPERTY_SPECS[name];
   if (spec === undefined) throw new CliError(EXIT.domain, `no system spec for property schema "${name}"`);
-  await ctx.client.postJson("/api/v1/property-schemas", {
+  await ctx.client.postJson("/api/property-schemas", {
     propertySchemaId,
     name,
     type: spec.type,
@@ -607,7 +607,7 @@ async function importBibtex(ctx: CommandContext, filePath: string): Promise<void
 /** M1 person match: exact display name via the objects?q= title search. */
 async function findPersonByName(ctx: CommandContext, literal: string): Promise<string | undefined> {
   const query = queryString({ q: literal });
-  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/v1/objects${query}`);
+  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/objects${query}`);
   return body.objects.find(
     (object) =>
       object.name === literal &&
@@ -623,7 +623,7 @@ async function findOrCreatePerson(
 ): Promise<string> {
   const existing = await findPersonByName(ctx, literal);
   if (existing !== undefined) return existing;
-  const created = await ctx.client.postJson<{ id: string }>("/api/v1/objects", {
+  const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
     nodeType: "page",
     name: literal,
     classIds: [SYSTEM_CLASS_UUIDS.person],
@@ -638,7 +638,7 @@ async function findSourceByCitekey(
   citekey: string,
 ): Promise<FullApiObject | undefined> {
   const query = queryString({ property: `${SYSTEM_PROPERTY_UUIDS.citekey}:${citekey}` });
-  const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/v1/objects${query}`);
+  const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/objects${query}`);
   const first = body.objects[0];
   if (first === undefined) return undefined;
   return getFullObject(ctx, first.id);
@@ -653,7 +653,7 @@ async function upsertSourceByCitekey(
   const existing = await findSourceByCitekey(ctx, spec.citekey);
   let id: string;
   if (existing === undefined) {
-    const created = await ctx.client.postJson<{ id: string }>("/api/v1/objects", {
+    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
       nodeType: "page",
       name: spec.title,
       classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
@@ -665,7 +665,7 @@ async function upsertSourceByCitekey(
     counts.updated += 1;
     if (existing.name !== spec.title) {
       // Title-is-content: the title update rewrites the node's text content.
-      await ctx.client.patchJson(`/api/v1/objects/${encodeURIComponent(id)}`, {
+      await ctx.client.patchJson(`/api/objects/${encodeURIComponent(id)}`, {
         contentAst: [{ type: "text", text: spec.title }],
       });
     }

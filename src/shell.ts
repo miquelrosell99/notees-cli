@@ -9,7 +9,7 @@
  *   agent/script path: `echo 'const p = await create({…}); console.log(p.id)' |
  *   notees shell --server … --key …`.
  *
- * Startup probes the server doctor-style: reachability (`GET /api/v1/version`,
+ * Startup probes the server doctor-style: reachability (`GET /api/version`,
  * public) then key validity (an authenticated read). Failure prints a clear
  * message and exits with the mapped code (network → 5, auth → 3), matching
  * the CLI's exit-code contract. `--json` switches the REPL's result writer to
@@ -112,7 +112,7 @@ function errorMessage(error: unknown): string {
 }
 
 function buildHelpers(client: ApiClient): ShellHelpers {
-  const objectUrl = (id: string): string => `/api/v1/objects/${encodeURIComponent(id)}`;
+  const objectUrl = (id: string): string => `/api/objects/${encodeURIComponent(id)}`;
   // `export` is a reserved word — not callable from plain script/REPL syntax,
   // so the ergonomic entry point is the exportMd alias (same function).
   const exportMarkdown = async (ids: string[]): Promise<string> => {
@@ -131,18 +131,18 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         limit: opts.limit,
         cursor: opts.cursor,
       });
-      const body = await client.getJson<{ objects: unknown[] }>(`/api/v1/objects${query}`);
+      const body = await client.getJson<{ objects: unknown[] }>(`/api/objects${query}`);
       return body.objects;
     },
     search: async (q, opts = {}) => {
       const query = queryString({ q, nodeType: opts.nodeType, limit: opts.limit });
-      const body = await client.getJson<{ results: unknown[] }>(`/api/v1/search${query}`);
+      const body = await client.getJson<{ results: unknown[] }>(`/api/search${query}`);
       return body.results;
     },
-    classes: async () => (await client.getJson<{ classes: unknown[] }>("/api/v1/classes")).classes,
+    classes: async () => (await client.getJson<{ classes: unknown[] }>("/api/classes")).classes,
     classInfo: async (id) => {
       const body = await client.getJson<{ class: Record<string, unknown>; members: unknown[] }>(
-        `/api/v1/classes/${encodeURIComponent(id)}`,
+        `/api/classes/${encodeURIComponent(id)}`,
       );
       return { ...body.class, members: body.members };
     },
@@ -155,7 +155,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     effective: async (id) =>
       (await client.getJson<{ properties: unknown[] }>(`${objectUrl(id)}/effective-properties`)).properties,
     create: async (partial) =>
-      (await client.postJson<{ object: unknown }>("/api/v1/objects", partial)).object,
+      (await client.postJson<{ object: unknown }>("/api/objects", partial)).object,
     update: async (id, fields) =>
       (await client.patchJson<{ object: unknown }>(objectUrl(id), fields)).object,
     del: async (id, opts = {}) => {
@@ -178,7 +178,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       const bytes = readFileSync(filePath);
       const form = new FormData();
       form.append("file", new Blob([bytes]), basename(filePath));
-      const body = await client.postMultipart<{ assetId: string }>("/api/v1/assets", form);
+      const body = await client.postMultipart<{ assetId: string }>("/api/assets", form);
       return body.assetId;
     },
     export: exportMarkdown,
@@ -189,7 +189,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
 /** Doctor-style startup probe: reachability first (public route), then key validity (authenticated read). */
 async function probe(client: ApiClient): Promise<void> {
   try {
-    await client.getJson<{ name: string; version: string }>("/api/v1/version");
+    await client.getJson<{ name: string; version: string }>("/api/version");
   } catch (error) {
     throw new CliError(
       error instanceof CliError ? error.exitCode : EXIT.network,
@@ -197,7 +197,7 @@ async function probe(client: ApiClient): Promise<void> {
     );
   }
   try {
-    await client.getJson<unknown>("/api/v1/classes");
+    await client.getJson<unknown>("/api/classes");
   } catch (error) {
     throw new CliError(
       error instanceof CliError ? error.exitCode : EXIT.auth,
