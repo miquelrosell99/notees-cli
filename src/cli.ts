@@ -58,7 +58,7 @@ import {
 import { runShell } from "./shell.js";
 import { defaultStatePath, serverState, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
-import { DEFAULT_WORKSPACE_ID, deriveUuid } from "./uuid.js";
+import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
 
 export interface CliIo {
   stdout: { write(chunk: string): unknown };
@@ -1099,6 +1099,171 @@ async function deleteProperty(
   );
 }
 
+// --- property schema verbs (§34.32 PG7) ------------------------------------------
+
+const PROPERTY_TYPES = [
+  "text",
+  "number",
+  "boolean",
+  "date",
+  "date_range",
+  "url",
+  "email",
+  "select",
+  "multi_select",
+  "object",
+  "image",
+] as const;
+
+interface ApiPropertySchema {
+  id: string;
+  name: string;
+  type: string;
+  multi: boolean;
+  scope: string;
+  options: Array<{ id: string; label: string }> | null;
+  targetClassFilter: string[] | null;
+  datePrecision: string | null;
+  dateQualified: boolean | null;
+}
+
+async function propertyList(ctx: CommandContext): Promise<void> {
+  const body = await ctx.client.getJson<{ propertySchemas: ApiPropertySchema[] }>("/api/property-schemas");
+  const rows = body.propertySchemas.map((schema) => [
+    schema.name,
+    schema.type,
+    schema.multi ? "multi" : "",
+    schema.scope,
+    schema.id,
+  ]);
+  emit(ctx, `${formatTable([["NAME", "TYPE", "MULTI", "SCOPE", "ID"], ...rows])}\n`, body);
+}
+
+async function propertyGet(ctx: CommandContext, schemaRef: string): Promise<void> {
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const body = await ctx.client.getJson<{ propertySchema: ApiPropertySchema }>(
+    `/api/property-schemas/${encodeURIComponent(schema.id)}`,
+  );
+  emit(ctx, `${JSON.stringify(body.propertySchema, null, 2)}\n`, body);
+}
+
+/** `notees property create` — the server stamps the envelope; the schema id is
+ * caller-chosen (UUIDv7 here, so a retry with the same args never collides
+ * with a live schema). Option ids derive deterministically from the schema id
+ * + label (idempotent re-runs land on the same option ids). */
+async function propertyCreate(
+  ctx: CommandContext,
+  name: string,
+  options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[] },
+): Promise<void> {
+  const type = options.type ?? "text";
+  if (!(PROPERTY_TYPES as readonly string[]).includes(type)) {
+    failUsage(`unknown property type "${type}" — one of: ${PROPERTY_TYPES.join(", ")}`);
+  }
+  const propertySchemaId = uuidv7();
+  const targetClassFilter: string[] = [];
+  for (const ref of options.targetClass ?? []) {
+    targetClassFilter.push((await resolveClassRef(ctx, ref)).id);
+  }
+  const body = await ctx.client.postJson<{ propertySchema: ApiPropertySchema }>("/api/property-schemas", {
+    propertySchemaId,
+    name,
+    type,
+    multi: options.multi === true,
+    scope: "global",
+    ...(options.option !== undefined && options.option.length > 0
+      ? {
+          options: options.option.map((label) => ({
+            id: deriveUuid(`notees:property-option:${propertySchemaId}:${label}`),
+            label,
+          })),
+        }
+      : {}),
+    ...(targetClassFilter.length > 0 ? { targetClassFilter } : {}),
+  });
+  emit(ctx, `${body.propertySchema.id}\n`, body);
+}
+
+async function propertyRename(ctx: CommandContext, schemaRef: string, name: string): Promise<void> {
+  const trimmed = name.trim();
+  if (trimmed === "") failUsage("property rename: new name must not be empty");
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const body = await ctx.client.patchJson<{ propertySchema: ApiPropertySchema }>(
+    `/api/property-schemas/${encodeURIComponent(schema.id)}`,
+    { name: trimmed },
+  );
+  emit(ctx, `${JSON.stringify(body.propertySchema, null, 2)}\n`, body);
+}
+
+/** `notees property delete` — soft-delete (authored values survive; the same
+ * UUID can be recreated later, the delete+recreate path the register blesses
+ * pending PG3). Preview-first like the other destructive verbs. */
+async function propertyDelete(
+  ctx: CommandContext,
+  schemaRef: string,
+  options: { yes?: boolean },
+): Promise<void> {
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  if (options.yes !== true) {
+    ctx.io.stderr.write(
+      `Refusing to delete property schema "${schema.name}": authored values survive, but every binding and the schema row go inactive.\nRe-run with --yes to proceed.\n`,
+    );
+    throw new CliError(EXIT.usage, "destructive command requires --yes", { schemaId: schema.id });
+  }
+  await ctx.client.deleteJson(`/api/property-schemas/${encodeURIComponent(schema.id)}`);
+  emit(ctx, `deleted ${schema.id}\n`, { id: schema.id, deleted: true });
+}
+
+interface ClassPropertyFlags {
+  sequence?: string;
+  required?: boolean;
+  readonly?: boolean;
+  hideWhenEmpty?: boolean;
+  default?: string;
+}
+
+/** `notees property bind` — the class.property.set patch: omitted flags keep
+ * their stored values, `--no-<flag>` clears them (null), --default parses as JSON. */
+async function propertyBind(
+  ctx: CommandContext,
+  classRef: string,
+  schemaRef: string,
+  options: ClassPropertyFlags,
+): Promise<void> {
+  const klass = await resolveClassRef(ctx, classRef);
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const body: Record<string, unknown> = { propertySchemaId: schema.id };
+  if (options.sequence !== undefined) {
+    const sequence = Number.parseInt(options.sequence, 10);
+    if (!Number.isInteger(sequence) || sequence < 0) failUsage("--sequence must be a non-negative integer");
+    body.sequence = sequence;
+  }
+  if (options.required !== undefined) body.required = options.required;
+  if (options.readonly !== undefined) body.readonly = options.readonly;
+  if (options.hideWhenEmpty !== undefined) body.hideWhenEmpty = options.hideWhenEmpty;
+  if (options.default !== undefined) {
+    try {
+      body.defaultValue = JSON.parse(options.default) as unknown;
+    } catch {
+      failUsage("--default must be valid JSON (e.g. --default '\"n/a\"' or --default '42')");
+    }
+  }
+  const res = await ctx.client.postJson<{ binding: unknown }>(
+    `/api/classes/${encodeURIComponent(klass.id)}/properties`,
+    body,
+  );
+  emit(ctx, `${JSON.stringify(res.binding, null, 2)}\n`, { classId: klass.id, ...res });
+}
+
+async function propertyUnbind(ctx: CommandContext, classRef: string, schemaRef: string): Promise<void> {
+  const klass = await resolveClassRef(ctx, classRef);
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const res = await ctx.client.deleteJson<{ unbound: boolean }>(
+    `/api/classes/${encodeURIComponent(klass.id)}/properties/${encodeURIComponent(schema.id)}`,
+  );
+  emit(ctx, `unbound ${schema.name} from ${klass.name}\n`, { classId: klass.id, schemaId: schema.id, ...res });
+}
+
 /**
  * Get-or-create a property schema by its fixed system UUID (all replicas
  * converge on the same ids). Seeded workspaces already carry the
@@ -1598,6 +1763,66 @@ function buildProgram(): Command {
     .option("--idx <n>", "slot index for multi-valued schemas", "0")
     .action(async (id: string, schema: string, options: { idx?: string }, command: Command) => {
       await objectPropertyDelete(ctxOf(command), id, schema, options);
+    });
+
+  const schemaCmd = program.command("property").description("property schema operations (§34.32 PG7)");
+  schemaCmd
+    .command("list")
+    .description("list property schemas")
+    .action(async (_options: object, command: Command) => {
+      await propertyList(ctxOf(command));
+    });
+  schemaCmd
+    .command("get <schema>")
+    .description("show one property schema (schema: uuid or name)")
+    .action(async (schema: string, _options: object, command: Command) => {
+      await propertyGet(ctxOf(command), schema);
+    });
+  schemaCmd
+    .command("create <name>")
+    .description("create a property schema (prints the new id)")
+    .option("--type <type>", "property type (default: text)", "text")
+    .option("--multi", "allow multiple values", false)
+    .option("--option <label>", "select option label (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
+    .option("--targetClass <ref>", "constrain node-typed targets to this class (repeatable; uuid or title)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
+    .action(async (name: string, options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[] }, command: Command) => {
+      await propertyCreate(ctxOf(command), name, options);
+    });
+  schemaCmd
+    .command("rename <schema> <name>")
+    .description("rename a property schema (schema: uuid or name)")
+    .action(async (schema: string, name: string, _options: object, command: Command) => {
+      await propertyRename(ctxOf(command), schema, name);
+    });
+  schemaCmd
+    .command("delete <schema>")
+    .description("delete a property schema — soft-delete: bindings go inactive, authored values survive (schema: uuid or name; requires --yes)")
+    .option("--yes", "confirm the destructive action", false)
+    .action(async (schema: string, options: { yes?: boolean }, command: Command) => {
+      await propertyDelete(ctxOf(command), schema, options);
+    });
+  schemaCmd
+    .command("bind <class> <schema>")
+    .description(
+      "bind a property schema to a class (class.property.set; class/schema: uuid or title/name; " +
+        "omitted flags keep their values, --no-<flag> clears)",
+    )
+    .option("--sequence <n>", "binding order within the class")
+    .addOption(new Option("--required", "mark the binding required").default(undefined))
+    .addOption(new Option("--no-required", "clear the required flag"))
+    .addOption(new Option("--readonly", "mark the binding read-only").default(undefined))
+    .addOption(new Option("--no-readonly", "clear the read-only flag"))
+    .addOption(new Option("--hideWhenEmpty", "hide the row while unvalued").default(undefined))
+    .addOption(new Option("--no-hideWhenEmpty", "clear the hide-when-empty flag"))
+    .option("--default <json>", "binding default value (JSON; a wrong-typed default is rejected)")
+    .action(async (classRef: string, schemaRef: string, options: ClassPropertyFlags, command: Command) => {
+      await propertyBind(ctxOf(command), classRef, schemaRef, options);
+    });
+  schemaCmd
+    .command("unbind <class> <schema>")
+    .description("remove a class binding (class.property.unset; authored values survive)")
+    .action(async (classRef: string, schemaRef: string, _options: object, command: Command) => {
+      await propertyUnbind(ctxOf(command), classRef, schemaRef);
     });
   object
     .command("children <id>")

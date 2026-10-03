@@ -464,6 +464,9 @@ describe("export markdown", () => {
         // assertion below carries the failure, not the empty bundle.
         return jsonResponse({ objects: [], nextCursor: null });
       }
+      if (url.pathname === "/api/property-schemas") {
+        return jsonResponse({ propertySchemas: [] });
+      }
       return jsonResponse({ error: { code: "unexpected", message: url.pathname } }, 500);
     };
     const client = new ApiClient({ server: "http://export-test.local", apiKey: "k", fetchImpl });
@@ -947,6 +950,69 @@ describe("search (query language)", () => {
   });
 });
 
+describe("property schema verbs (§34.32 PG7)", () => {
+  it("create → list → get → rename → bind → unbind → delete", async () => {
+    const h = harness;
+
+    // create prints the bare new id (human mode), options get deterministic ids.
+    expect(await h.runCli("property", "create", "pg7-genre", "--type", "select", "--option", "Fiction", "--option", "Mystery")).toBe(EXIT.ok);
+    const schemaId = h.io.stdoutText.trim();
+    expect(schemaId).toMatch(/^[0-9a-f-]{36}$/);
+
+    // --json list round-trips the schema rows.
+    expect(await h.runCli("--json", "property", "list")).toBe(EXIT.ok);
+    const listed = JSON.parse(h.io.stdoutText) as { propertySchemas: Array<{ id: string; name: string; type: string }> };
+    expect(listed.propertySchemas).toContainEqual(expect.objectContaining({ id: schemaId, name: "pg7-genre", type: "select" }));
+
+    // get resolves by name.
+    expect(await h.runCli("--json", "property", "get", "pg7-genre")).toBe(EXIT.ok);
+    const got = JSON.parse(h.io.stdoutText) as { propertySchema: { id: string; options: Array<{ label: string }> } };
+    expect(got.propertySchema.id).toBe(schemaId);
+    expect(got.propertySchema.options.map((o) => o.label)).toEqual(["Fiction", "Mystery"]);
+
+    // rename (by name) → get by the new name resolves.
+    expect(await h.runCli("property", "rename", "pg7-genre", "pg7-style")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "property", "get", "pg7-style")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText) as { propertySchema: { id: string } }).propertySchema.id).toBe(schemaId);
+
+    // bind to a class by title; unbind by name.
+    expect(await h.runCli("object", "create", "--isClass", "--name", "pg7-shelf")).toBe(EXIT.ok);
+    const classId = h.io.stdoutText.trim();
+    expect(
+      await h.runCli("--json", "property", "bind", "pg7-shelf", "pg7-style", "--sequence", "3", "--required", "--default", '"n/a"'),
+    ).toBe(EXIT.ok);
+    const bound = JSON.parse(h.io.stdoutText) as { classId: string; binding: { sequence: number; required: boolean; defaultValue: string } };
+    expect(bound.classId).toBe(classId);
+    expect(bound.binding).toMatchObject({ sequence: 3, required: true, defaultValue: "n/a" });
+
+    expect(await h.runCli("property", "unbind", "pg7-shelf", "pg7-style")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("unbound pg7-style from pg7-shelf");
+
+    // delete is preview-first; --yes soft-deletes. A uuid get then 404s
+    // (exit 1); a name get fails name-resolution (exit 2) — the CLI's
+    // schema-ref contract.
+    expect(await h.runCli("property", "delete", "pg7-style")).toBe(EXIT.usage);
+    expect(await h.runCli("property", "delete", "pg7-style", "--yes")).toBe(EXIT.ok);
+    expect(await h.runCli("property", "get", schemaId)).toBe(EXIT.domain);
+    expect(await h.runCli("property", "get", "pg7-style")).toBe(EXIT.usage);
+  });
+
+  it("usage and domain failures fail loud", async () => {
+    const h = harness;
+    expect(await h.runCli("property", "create", "x", "--type", "bogus")).toBe(EXIT.usage);
+    expect(await h.runCli("property", "get", "no-such-schema")).toBe(EXIT.usage);
+    expect(await h.runCli("property", "get", "10000000-0000-4000-8000-00000000dead")).toBe(EXIT.domain);
+    expect(await h.runCli("property", "rename", "citekey", "")).toBe(EXIT.usage);
+
+    // A wrong-typed binding default is a server-side 422 → exit 1.
+    expect(await h.runCli("property", "create", "pg7-num", "--type", "number")).toBe(EXIT.ok);
+    expect(await h.runCli("object", "create", "--isClass", "--name", "pg7-shelf-2")).toBe(EXIT.ok);
+    expect(
+      await h.runCli("property", "bind", "pg7-shelf-2", "pg7-num", "--default", '"not-a-number"'),
+    ).toBe(EXIT.domain);
+  });
+});
+
 describe("shell (scripted mode)", () => {
   it("scripted create → get → search → effective → delete; stdout carries the ids", async () => {
     const h = harness;
@@ -1025,6 +1091,55 @@ describe("shell (scripted mode)", () => {
     expect(h.io.stdoutText).toMatch(/asset [0-9a-f-]{36}/);
     expect(h.io.stdoutText).toContain("export true");
     expect(h.io.stdoutText).toContain("export-alias true");
+  });
+
+  it("scripted property helpers: schema CRUD, class bind/unbind, unsetProperty", async () => {
+    const h = harness;
+    const script = `
+      const schema = await createPropertySchema({
+        propertySchemaId: "20000000-0000-7000-8000-0000000000ab",
+        name: "shell-pg7-code",
+        type: "text",
+        multi: false,
+        scope: "class",
+      });
+      console.log("created " + schema.id);
+      const renamed = await updatePropertySchema(schema.id, { name: "shell-pg7-key" });
+      console.log("renamed " + renamed.name);
+      const all = await propertySchemas();
+      console.log("listed " + all.some((s) => s.id === schema.id));
+      const one = await propertySchema(schema.id);
+      console.log("got " + one.name);
+      const klasses = await classes();
+      const source = klasses.find((c) => c.name === "source");
+      const binding = await setClassProperty(source.id, schema.id, { sequence: 99, defaultValue: "shell-def" });
+      console.log("bound " + binding.sequence + " " + binding.defaultValue);
+      const obj = await create({ presentAsMain: true, name: "shell-pg7-src", classIds: [source.id] });
+      await setProperty(obj.id, schema.id, "shell-authored");
+      const eff = await effective(obj.id);
+      console.log("shadowed " + eff.find((r) => r.schemaId === schema.id).value);
+      await unsetProperty(obj.id, schema.id);
+      const after = await effective(obj.id);
+      console.log("default-back " + after.find((r) => r.schemaId === schema.id).value);
+      await unsetClassProperty(source.id, schema.id);
+      await deletePropertySchema(schema.id);
+      try {
+        await propertySchema(schema.id);
+        console.log("deleted no");
+      } catch {
+        console.log("deleted yes");
+      }
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("created 20000000-0000-7000-8000-0000000000ab");
+    expect(h.io.stdoutText).toContain("renamed shell-pg7-key");
+    expect(h.io.stdoutText).toContain("listed true");
+    expect(h.io.stdoutText).toContain("got shell-pg7-key");
+    expect(h.io.stdoutText).toContain("bound 99 shell-def");
+    expect(h.io.stdoutText).toContain("shadowed shell-authored");
+    expect(h.io.stdoutText).toContain("default-back shell-def");
+    expect(h.io.stdoutText).toContain("deleted yes");
   });
 
   it("erroring script exits 1 with the failure on stderr", async () => {

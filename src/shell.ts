@@ -84,6 +84,22 @@ export interface ShellHelpers {
   update(id: string, fields: Record<string, unknown>): Promise<unknown>;
   del(id: string, opts?: DeleteOptions): Promise<unknown>;
   setProperty(id: string, schemaId: string, value: unknown, opts?: SetPropertyOptions): Promise<unknown>;
+  /** Unset one property slot (the missing partner of setProperty; idx defaults 0). */
+  unsetProperty(id: string, schemaId: string, idx?: number): Promise<unknown>;
+  /** Active property schemas (GET /property-schemas). */
+  propertySchemas(): Promise<unknown>;
+  /** One active property schema (404s on unknown/inactive ids). */
+  propertySchema(id: string): Promise<unknown>;
+  /** propertySchema.create — the payload must carry a caller-chosen schema uuid. */
+  createPropertySchema(input: Record<string, unknown>): Promise<unknown>;
+  /** propertySchema.update — patch fields only (name/options/datePrecision/dateQualified). */
+  updatePropertySchema(id: string, fields: Record<string, unknown>): Promise<unknown>;
+  /** propertySchema.delete — soft-delete (authored values survive). */
+  deletePropertySchema(id: string): Promise<unknown>;
+  /** class.property.set — the binding patch (sequence/flags/defaultValue). */
+  setClassProperty(classId: string, propertySchemaId: string, fields: Record<string, unknown>): Promise<unknown>;
+  /** class.property.unset — remove the binding (authored values survive). */
+  unsetClassProperty(classId: string, propertySchemaId: string): Promise<unknown>;
   upload(filePath: string): Promise<string>;
   /** Markdown bundle text for the given object ids. `export` is a reserved
    * word in JS, so the callable alias is `exportMd`; the spec-named property
@@ -118,6 +134,14 @@ const HELP_TEXT = `notees shell helpers (object API, top-level await works):
   update(id, fields)                         PATCH fields (name, presentAsMain, icon, color, contentAst) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
+  unsetProperty(id, schemaId, idx?)          unset a property slot (idx defaults 0) -> updated object
+  propertySchemas()                          list active property schemas
+  propertySchema(id)                         one active property schema
+  createPropertySchema(input)                propertySchema.create (input carries the schema uuid) -> schema
+  updatePropertySchema(id, fields)           propertySchema.update (name/options/datePrecision/dateQualified) -> schema
+  deletePropertySchema(id)                   propertySchema.delete (soft-delete; authored values survive)
+  setClassProperty(classId, schemaId, fields)  class.property.set (sequence/flags/defaultValue patch) -> binding
+  unsetClassProperty(classId, schemaId)      class.property.unset (authored values survive)
   upload(filePath)                           upload a file from disk -> asset id
   exportMd(ids) (alias: export)              markdown bundle text for the given object ids
   makeOp(opType, payload, affected?)         build an envelope-v3 op (HLC-stamped; NOT submitted)
@@ -214,6 +238,44 @@ function buildHelpers(client: ApiClient): ShellHelpers {
           ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
         })
       ).object,
+    unsetProperty: async (id, schemaId, idx = 0) =>
+      (
+        await client.deleteJson<{ object: unknown }>(
+          `${objectUrl(id)}/properties/${encodeURIComponent(schemaId)}?idx=${idx}`,
+        )
+      ).object,
+    propertySchemas: async () =>
+      (await client.getJson<{ propertySchemas: unknown[] }>("/api/property-schemas")).propertySchemas,
+    propertySchema: async (id) =>
+      (
+        await client.getJson<{ propertySchema: unknown }>(
+          `/api/property-schemas/${encodeURIComponent(id)}`,
+        )
+      ).propertySchema,
+    createPropertySchema: async (input) =>
+      (await client.postJson<{ propertySchema: unknown }>("/api/property-schemas", input)).propertySchema,
+    updatePropertySchema: async (id, fields) =>
+      (
+        await client.patchJson<{ propertySchema: unknown }>(
+          `/api/property-schemas/${encodeURIComponent(id)}`,
+          fields,
+        )
+      ).propertySchema,
+    deletePropertySchema: async (id) =>
+      client.deleteJson<{ id: string; deleted: boolean }>(
+        `/api/property-schemas/${encodeURIComponent(id)}`,
+      ),
+    setClassProperty: async (classId, propertySchemaId, fields) =>
+      (
+        await client.postJson<{ binding: unknown }>(
+          `/api/classes/${encodeURIComponent(classId)}/properties`,
+          { propertySchemaId, ...fields },
+        )
+      ).binding,
+    unsetClassProperty: async (classId, propertySchemaId) =>
+      client.deleteJson<{ classId: string; propertySchemaId: string; unbound: boolean }>(
+        `/api/classes/${encodeURIComponent(classId)}/properties/${encodeURIComponent(propertySchemaId)}`,
+      ),
     upload: async (filePath) => {
       const bytes = readFileSync(filePath);
       const form = new FormData();

@@ -23,22 +23,28 @@ export interface ExportApiObject {
   classIds: string[];
   name: string | null;
   contentAst?: unknown;
-  properties?: { schemaId: string; schemaName: string; value: unknown; metadata?: unknown }[];
+  properties?: {
+    schemaId: string;
+    schemaName: string;
+    schemaType?: string;
+    value: unknown;
+    metadata?: unknown;
+  }[];
 }
 
-export interface ApiEdgeRow {
-  id: string;
-  source_id: string;
-  target_id: string | null;
+/** The property-schema facts the exporter's per-type branches need. */
+export interface SchemaIndexEntry {
   type: string;
-  verb: string | null;
+  options: Array<{ id: string; label: string }> | null;
 }
+
+export type SchemaIndex = ReadonlyMap<string, SchemaIndexEntry>;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function toExportNode(obj: ExportApiObject): ExportNode {
+export function toExportNode(obj: ExportApiObject, schemaIndex?: SchemaIndex): ExportNode {
   return {
     id: obj.id,
     isClass: obj.isClass ? 1 : 0,
@@ -50,10 +56,36 @@ export function toExportNode(obj: ExportApiObject): ExportNode {
     properties: (Array.isArray(obj.properties) ? obj.properties : []).map((property) => ({
       schemaId: property.schemaId,
       schemaName: property.schemaName,
+      ...(property.schemaType !== undefined ? { schemaType: property.schemaType } : {}),
+      ...(schemaIndex !== undefined
+        ? (() => {
+            const entry = schemaIndex.get(property.schemaId);
+            return entry !== undefined && entry.options !== null && entry.options.length > 0
+              ? { schemaOptions: entry.options }
+              : {};
+          })()
+        : {}),
       value: property.value,
       ...(isRecord(property.metadata) ? { metadata: property.metadata } : {}),
     })),
   };
+}
+
+/** Fetch the workspace's property schemas once (the per-type export branches
+ * need each schema's type + options). */
+export async function fetchSchemaIndex(client: ApiClient): Promise<SchemaIndex> {
+  const body = await client.getJson<{
+    propertySchemas: Array<{ id: string; type: string; options: Array<{ id: string; label: string }> | null }>;
+  }>("/api/property-schemas");
+  return new Map(body.propertySchemas.map((schema) => [schema.id, { type: schema.type, options: schema.options }]));
+}
+
+export interface ApiEdgeRow {
+  id: string;
+  source_id: string;
+  target_id: string | null;
+  type: string;
+  verb: string | null;
 }
 
 /** Document-chrome predicate over the export shape (Revision 11): non-class
@@ -95,7 +127,7 @@ export interface ObjectResolver {
  * side for containing-page walks (ExportNode carries placement since
  * Revision 11 — the map stays as the walk's cheap lookup).
  */
-export function makeObjectResolver(client: ApiClient): ObjectResolver {
+export function makeObjectResolver(client: ApiClient, schemaIndex?: SchemaIndex): ObjectResolver {
   const objectCache = new Map<string, ExportNode | undefined>();
   const parentOf = new Map<string, string | null>();
   const getObject = async (id: string): Promise<ExportNode | undefined> => {
@@ -106,7 +138,7 @@ export function makeObjectResolver(client: ApiClient): ObjectResolver {
         `/api/objects/${encodeURIComponent(id)}`,
       );
       parentOf.set(id, body.object.parentId ?? null);
-      node = toExportNode(body.object);
+      node = toExportNode(body.object, schemaIndex);
     } catch (error) {
       if (error instanceof CliError && error.exitCode === EXIT.domain) node = undefined;
       else throw error;
@@ -197,7 +229,8 @@ export async function buildMarkdownBundle(
   client: ApiClient,
   selection: MarkdownBundleSelection,
 ): Promise<ExportBundle> {
-  const resolver = makeObjectResolver(client);
+  const schemaIndex = await fetchSchemaIndex(client);
+  const resolver = makeObjectResolver(client, schemaIndex);
   const included = await collectClosure(client, resolver, {
     ids: selection.ids,
     linkedTo: selection.linkedTo,
@@ -232,7 +265,7 @@ export async function buildMarkdownBundle(
     const inline: ExportNode[] = [];
     for (const child of rows) {
       if (child.parentId === null || child.isClass || child.presentAsMain) continue;
-      inline.push(toExportNode(child));
+      inline.push(toExportNode(child, schemaIndex));
       pending.push(child.id);
     }
     if (inline.length > 0) childrenMap.set(id, inline);
