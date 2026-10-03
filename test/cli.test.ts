@@ -1602,4 +1602,18 @@ describe("object get --ids and create --icon/--color", () => {
     expect(object.icon).toBe("star");
     expect(object.color).toBe("#ff0000");
   });
+
+  it("object update --color accepts preset tokens and 'none' clears", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--name", "color-probe")).toBe(EXIT.ok);
+    const id = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    // Preset token rides the wire as-is.
+    expect(await h.runCli("--json", "object", "update", id, "--color", "sky")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).object as { color: string | null }).color).toBe("sky");
+    // 'none' clears (object.update color: null — §34.43 grammar).
+    expect(await h.runCli("--json", "object", "update", id, "--color", "none")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).object as { color: string | null }).color).toBeNull();
+    // Garbage is rejected server-side (strict color grammar) — 422 → domain exit.
+    expect(await h.runCli("--json", "object", "update", id, "--color", "var(--color-preset-red)")).toBe(EXIT.domain);
+  });
 });

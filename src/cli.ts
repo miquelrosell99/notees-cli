@@ -410,7 +410,10 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   // main-children zone (true) and the inline body (false).
   if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
   if (options.icon !== undefined) body.icon = options.icon;
-  if (options.color !== undefined) body.color = options.color;
+  if (options.color !== undefined) {
+    // Color grammar (SCHEMA.md): preset token or #RRGGBB; "none" clears.
+    body.color = options.color.toLowerCase() === "none" ? null : options.color;
+  }
   if (Object.keys(body).length === 0) {
     failUsage("object update requires at least one of --name, --presentAsMain, --icon, --color");
   }
@@ -1575,7 +1578,7 @@ function buildProgram(): Command {
     )
     .addOption(new Option("--no-presentAsMain", "demote: render the node in the inline body"))
     .option("--icon <icon>", "icon")
-    .option("--color <color>", "color")
+    .option("--color <color>", "color: preset token (red…gray) or #RRGGBB; 'none' clears")
     .action(async (id: string, options: { name?: string; presentAsMain?: boolean; icon?: string; color?: string }, command: Command) => {
       await objectUpdate(ctxOf(command), id, options);
     });
