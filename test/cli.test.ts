@@ -1324,3 +1324,282 @@ describe("ops catalog", () => {
     expect(h.io.stdoutText).toMatch(/count 2[0-9]/);
   });
 });
+
+describe("object children", () => {
+  it("lists direct children in child-position order with render kinds", async () => {
+    const h = harness;
+    const parent = await h.createPage("children-probe", []);
+    expect(await h.runCli("object", "create", "--name", "child-main", "--parent", parent, "--presentAsMain")).toBe(
+      EXIT.ok,
+    );
+    const mainId = h.io.stdoutText.trim();
+    expect(await h.runCli("object", "create", "--name", "child-block-1", "--parent", parent)).toBe(EXIT.ok);
+    const b1 = h.io.stdoutText.trim();
+    expect(await h.runCli("object", "create", "--name", "child-block-2", "--parent", parent)).toBe(EXIT.ok);
+    const b2 = h.io.stdoutText.trim();
+
+    expect(await h.runCli("--json", "object", "children", parent)).toBe(EXIT.ok);
+    const res = JSON.parse(h.io.stdoutText) as {
+      children: Array<{ id: string; name: string | null; presentAsMain: boolean }>;
+    };
+    expect(res.children.map((c) => c.id)).toEqual([mainId, b1, b2]);
+    expect(res.children.map((c) => c.name)).toEqual(["child-main", "child-block-1", "child-block-2"]);
+
+    // Human table: main-zone child reads as "page", inline body as "block".
+    expect(await h.runCli("object", "children", parent)).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toMatch(/child-main\s+page/);
+    expect(h.io.stdoutText).toMatch(/child-block-1\s+block/);
+  });
+});
+
+describe("object create --batch", () => {
+  it("creates every entry, prints ids in input order, keeps per-parent order", async () => {
+    const h = harness;
+    expect(await h.runCli("object", "create", "--name", "batch-parent")).toBe(EXIT.ok);
+    const parentId = h.io.stdoutText.trim();
+    const entries = [
+      { name: "batch-root-1" },
+      { name: "batch-root-2" },
+      { name: "batch-b1", parentId },
+      { name: "batch-b2", parentId },
+      { name: "batch-b3", parentId },
+    ];
+    expect(await h.runCliWithStdin(JSON.stringify(entries), "--json", "object", "create", "--batch")).toBe(EXIT.ok);
+    const res = JSON.parse(h.io.stdoutText) as { created: number; ids: string[]; failures: unknown[] };
+    expect(res.created).toBe(5);
+    expect(res.failures).toEqual([]);
+    expect(res.ids).toHaveLength(5);
+
+    // The parent's children keep the array order (same-parent entries are sequential).
+    expect(await h.runCli("--json", "object", "children", parentId)).toBe(EXIT.ok);
+    const children = JSON.parse(h.io.stdoutText).children as Array<{ id: string; name: string | null }>;
+    expect(children.map((c) => c.id)).toEqual([res.ids[2], res.ids[3], res.ids[4]]);
+    expect(children.map((c) => c.name)).toEqual(["batch-b1", "batch-b2", "batch-b3"]);
+  });
+
+  it("collects failures (exit 1) and honors --stop-on-error", async () => {
+    const h = harness;
+    // isClass alongside a parent is rejected server-side — a reliable failure.
+    expect(await h.runCli("object", "create", "--name", "batch-parent-2")).toBe(EXIT.ok);
+    const parentId = h.io.stdoutText.trim();
+    const entries = [
+      { name: "batch-ok-1" },
+      { name: "batch-bad", isClass: true, parentId },
+      { name: "batch-ok-2" },
+    ];
+    expect(await h.runCliWithStdin(JSON.stringify(entries), "--json", "object", "create", "--batch")).toBe(EXIT.domain);
+    const res = JSON.parse(h.io.stdoutText) as { created: number; failures: Array<{ index: number }> };
+    expect(res.created).toBe(2);
+    expect(res.failures.map((f) => f.index)).toEqual([1]);
+
+    const failing = [
+      { name: "batch-bad-x", isClass: true, parentId },
+      { name: "batch-never" },
+    ];
+    expect(
+      await h.runCliWithStdin(JSON.stringify(failing), "--json", "object", "create", "--batch", "--stop-on-error", "--jobs", "1"),
+    ).toBe(EXIT.domain);
+    const res2 = JSON.parse(h.io.stdoutText) as { created: number; failures: Array<{ index: number; error: string }> };
+    expect(res2.created).toBe(0);
+    expect(res2.failures).toHaveLength(2);
+    expect(res2.failures[1]!.error).toContain("skipped");
+
+    // Usage: stdin must be a non-empty JSON array.
+    expect(await h.runCliWithStdin("{}", "--json", "object", "create", "--batch")).toBe(EXIT.usage);
+    expect(await h.runCliWithStdin("[]", "--json", "object", "create", "--batch")).toBe(EXIT.usage);
+  });
+});
+
+describe("object upsert", () => {
+  it("creates once, then returns the existing id without duplicating (case-insensitive title)", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "upsert-klass")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    expect(await h.runCli("--json", "object", "upsert", "--name", "Upsert Target", "--class", klassId)).toBe(EXIT.ok);
+    const first = JSON.parse(h.io.stdoutText) as { id: string; created: boolean };
+    expect(first.created).toBe(true);
+
+    expect(await h.runCli("--json", "object", "upsert", "--name", "upsert target", "--class", klassId)).toBe(EXIT.ok);
+    const second = JSON.parse(h.io.stdoutText) as { id: string; created: boolean };
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+
+    expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
+    const row = (JSON.parse(h.io.stdoutText).classes as Array<{ id: string; memberCount: number }>).find(
+      (c) => c.id === klassId,
+    );
+    expect(row?.memberCount).toBe(1);
+  });
+
+  it("ambiguity fails loud; --parent narrows the match", async () => {
+    const h = harness;
+    const p1 = await h.createPage("upsert-parent-1", []);
+    const p2 = await h.createPage("upsert-parent-2", []);
+    for (const p of [p1, p2]) {
+      expect(await h.runCli("object", "create", "--name", "Same Title", "--parent", p)).toBe(EXIT.ok);
+    }
+    expect(await h.runCli("object", "upsert", "--name", "Same Title")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("narrow with --class/--parent");
+
+    expect(await h.runCli("object", "upsert", "--name", "Same Title", "--parent", p2)).toBe(EXIT.ok);
+    expect(h.io.stdoutText.trim()).toBe(p2 === "" ? "" : h.io.stdoutText.trim());
+    expect(h.io.stdoutText.trim()).not.toBe(p1);
+  });
+});
+
+describe("class empty / delete-members", () => {
+  it("empty unassigns without confirmation; delete-members previews, dry-runs, then trashes with --yes", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "bulk-klass")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const ids: string[] = [];
+    for (const name of ["bulk-m1", "bulk-m2", "bulk-m3"]) {
+      expect(await h.runCli("object", "create", "--name", name, "--class", klassId)).toBe(EXIT.ok);
+      ids.push(h.io.stdoutText.trim());
+    }
+
+    // empty: no confirmation, membership gone, the nodes themselves stay.
+    expect(await h.runCli("--json", "class", "empty", "bulk-klass")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText) as { done: number }).done).toBe(3);
+    expect(await h.runCli("--json", "object", "get", ids[0]!)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.classIds as string[]).not.toContain(klassId);
+
+    // Re-assign, then the destructive path: preview → dry-run → --yes.
+    for (const id of ids) {
+      expect(await h.runCli("class", "assign", id, "bulk-klass")).toBe(EXIT.ok);
+    }
+    expect(await h.runCli("class", "delete-members", "bulk-klass")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("3 member nodes");
+    expect(await h.runCli("class", "delete-members", "bulk-klass", "--dry-run")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", ids[0]!)).toBe(EXIT.ok);
+
+    expect(await h.runCli("--json", "class", "delete-members", "bulk-klass", "--yes")).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { done: number; failures: unknown[] };
+    expect(machine.done).toBe(3);
+    expect(machine.failures).toEqual([]);
+    // Trash is recoverable: the node is still fetchable, flagged inactive.
+    expect(await h.runCli("--json", "object", "get", ids[0]!)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(false);
+  });
+});
+
+describe("object restore + trash listing", () => {
+  it("delete → list --trashed → restore brings the whole subtree back", async () => {
+    const h = harness;
+    const parent = await h.createPage("restore-probe-page", []);
+    expect(await h.runCli("object", "create", "--name", "restore-probe-block", "--parent", parent)).toBe(EXIT.ok);
+    const blockId = h.io.stdoutText.trim();
+
+    expect(await h.runCli("object", "delete", parent, "--yes")).toBe(EXIT.ok);
+    // Trashed: the trash listing shows both rows; the active listing does not.
+    expect(await h.runCli("--json", "object", "list", "--trashed")).toBe(EXIT.ok);
+    const trashed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(trashed.map((o) => o.id)).toContain(parent);
+    expect(await h.runCli("--json", "object", "list", "--q", "restore-probe")).toBe(EXIT.ok);
+    const active = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(active.map((o) => o.id)).not.toContain(parent);
+
+    expect(await h.runCli("--json", "object", "restore", parent)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).restored).toEqual([parent]);
+    expect(await h.runCli("--json", "object", "get", parent)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(true);
+    // Whole-tree: the child block rides the restore.
+    expect(await h.runCli("--json", "object", "children", parent)).toBe(EXIT.ok);
+    const children = JSON.parse(h.io.stdoutText).children as Array<{ id: string }>;
+    expect(children.map((c) => c.id)).toContain(blockId);
+  });
+
+  it("restore of a node with no trash row still reactivates (idempotent read)", async () => {
+    const h = harness;
+    const page = await h.createPage("restore-noop", []);
+    expect(await h.runCli("--json", "object", "restore", page)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(true);
+  });
+});
+
+describe("object property set/delete", () => {
+  it("sets a typed value by schema name, shows it, unsets it", async () => {
+    const h = harness;
+    const schemaId = "00000000-0000-0000-0001-0000000000f1";
+    const created = await h.app.inject({
+      method: "POST",
+      url: "/api/property-schemas",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      payload: { propertySchemaId: schemaId, name: "cliProbeRating", type: "number", multi: false, scope: "global" },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const page = await h.createPage("property-probe", []);
+    expect(await h.runCli("--json", "object", "property", "set", page, "cliProbeRating", "42")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    let props = JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>;
+    expect(props.map((p) => ({ schemaId: p.schemaId, value: p.value }))).toEqual([{ schemaId, value: 42 }]);
+
+    // String values stay strings; --idx addresses multi-valued slots.
+    expect(await h.runCli("--json", "object", "property", "set", page, "cliProbeRating", "42")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "property", "delete", page, "cliProbeRating")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    props = JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>;
+    expect(props).toEqual([]);
+  });
+
+  it("unknown schema name fails with usage", async () => {
+    const h = harness;
+    const page = await h.createPage("property-probe-2", []);
+    expect(await h.runCli("object", "property", "set", page, "no.such.schema", "1")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("no property schema named");
+  });
+});
+
+describe("object list --parent", () => {
+  it("filters to direct children of one parent", async () => {
+    const h = harness;
+    const parent = await h.createPage("parent-filter-probe", []);
+    expect(await h.runCli("object", "create", "--name", "pf-child-1", "--parent", parent)).toBe(EXIT.ok);
+    expect(await h.runCli("object", "create", "--name", "pf-child-2", "--parent", parent)).toBe(EXIT.ok);
+    expect(await h.runCli("object", "create", "--name", "pf-other")).toBe(EXIT.ok);
+
+    expect(await h.runCli("--json", "object", "list", "--parent", parent)).toBe(EXIT.ok);
+    const names = (JSON.parse(h.io.stdoutText).objects as Array<{ name: string | null }>).map((o) => o.name);
+    expect(names.sort()).toEqual(["pf-child-1", "pf-child-2"]);
+  });
+});
+
+describe("export markdown --class", () => {
+  it("seeds the bundle with the class's members", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "exp-klass")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    for (const name of ["exp-member-a", "exp-member-b"]) {
+      expect(await h.runCli("object", "create", "--name", name, "--class", klassId)).toBe(EXIT.ok);
+    }
+    expect(await h.runCli("export", "markdown", "--class", "exp-klass", "--stdout")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("exp-member-a");
+    expect(h.io.stdoutText).toContain("exp-member-b");
+    // Mutually exclusive with the other selectors.
+    expect(await h.runCli("export", "markdown", "--class", "exp-klass", "--ids", klassId, "--stdout")).toBe(EXIT.usage);
+  });
+});
+
+describe("object get --ids and create --icon/--color", () => {
+  it("multi-get returns objects in argument order", async () => {
+    const h = harness;
+    const a = await h.createPage("multi-get-a", []);
+    const b = await h.createPage("multi-get-b", []);
+    expect(await h.runCli("--json", "object", "get", "--ids", b, a)).toBe(EXIT.ok);
+    const objects = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(objects.map((o) => o.id)).toEqual([b, a]);
+  });
+
+  it("create --icon/--color lands on the object", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--name", "styled-probe", "--icon", "star", "--color", "#ff0000")).toBe(EXIT.ok);
+    const id = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "object", "get", id)).toBe(EXIT.ok);
+    const object = JSON.parse(h.io.stdoutText).object as { icon: string | null; color: string | null };
+    expect(object.icon).toBe("star");
+    expect(object.color).toBe("#ff0000");
+  });
+});

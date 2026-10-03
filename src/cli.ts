@@ -136,23 +136,27 @@ async function objectGet(ctx: CommandContext, id: string): Promise<void> {
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, body);
 }
 
-async function objectCreate(ctx: CommandContext, options: {
+/** `notees object get --ids <uuid…>` — multi-read: one fetch per id, in
+ * argument order (verification scripts audit bulk imports without a loop). */
+async function objectGetMany(ctx: CommandContext, ids: string[]): Promise<void> {
+  const objects: unknown[] = [];
+  for (const id of ids) {
+    const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+    objects.push(body.object);
+  }
+  const human = objects.map((object) => `${JSON.stringify(object, null, 2)}\n`).join("");
+  emit(ctx, human, { objects });
+}
+
+/** Shared create-body assembly for `object create` / `object upsert`. */
+function buildCreateBody(options: {
   presentAsMain?: boolean;
   isClass?: boolean;
   name?: string;
   class?: string[];
   parent?: string;
-  stdin?: boolean;
-}): Promise<void> {
-  let body: Record<string, unknown> = {};
-  if (options.stdin === true) {
-    const raw = await readStdin(ctx.io);
-    try {
-      body = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      throw new CliError(EXIT.usage, "--stdin body is not valid JSON");
-    }
-  }
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
   // Revision 11 render state: --isClass declares a class node (a root —
   // rejected server-side alongside --parent/--class); --presentAsMain sets
   // the render bit (server default: true when parentless, false when
@@ -163,9 +167,232 @@ async function objectCreate(ctx: CommandContext, options: {
   if (options.parent !== undefined) body.parentId = options.parent;
   const classIds = options.class ?? [];
   if (classIds.length > 0) body.classIds = classIds;
-  const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/objects", body);
+  return body;
+}
+
+async function objectCreate(ctx: CommandContext, options: {
+  presentAsMain?: boolean;
+  isClass?: boolean;
+  name?: string;
+  class?: string[];
+  parent?: string;
+  stdin?: boolean;
+  icon?: string;
+  color?: string;
+}): Promise<void> {
+  let body: Record<string, unknown> = {};
+  if (options.stdin === true) {
+    const raw = await readStdin(ctx.io);
+    try {
+      body = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new CliError(EXIT.usage, "--stdin body is not valid JSON");
+    }
+  }
+  const created = await ctx.client.postJson<{ id: string; object: unknown }>(
+    "/api/objects",
+    { ...body, ...buildCreateBody(options) },
+  );
+  // icon/color ride a follow-up patch — the object.create op payload carries
+  // no appearance fields (object.update does).
+  if (options.icon !== undefined || options.color !== undefined) {
+    await ctx.client.patchJson(`/api/objects/${encodeURIComponent(created.id)}`, {
+      ...(options.icon !== undefined ? { icon: options.icon } : {}),
+      ...(options.color !== undefined ? { color: options.color } : {}),
+    });
+    const refreshed = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(created.id)}`);
+    emit(ctx, `${created.id}\n`, { id: created.id, object: refreshed.object });
+    return;
+  }
   // Non-json prints the new id only (script-friendly).
   emit(ctx, `${created.id}\n`, created);
+}
+
+/**
+ * `notees object create --batch` — bulk import from a JSON array on stdin:
+ * one create per entry, each entry a POST /api/objects body (`name`,
+ * `contentAst`, `parentId`, `presentAsMain`, `classIds`, … — the server
+ * validates). Entries group by parent and groups run concurrently; entries
+ * under one parent stay sequential, because child position follows apply
+ * order and bulk blocks under a single parent must keep their array order.
+ * Human output prints the created ids one per line, in input order.
+ * Failures are collected and reported (exit 1) unless --stop-on-error.
+ */
+async function objectCreateBatch(ctx: CommandContext, options: {
+  jobs?: string;
+  stopOnError?: boolean;
+}): Promise<void> {
+  const raw = await readStdin(ctx.io);
+  let entries: unknown[];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    entries = parsed;
+  } catch {
+    throw new CliError(EXIT.usage, "--batch expects a JSON array of create bodies on stdin");
+  }
+  if (entries.length === 0) failUsage("--batch expects a non-empty JSON array");
+  entries.forEach((entry, index) => {
+    if (!isRecord(entry)) failUsage(`--batch entry ${index} is not a JSON object`);
+  });
+
+  const jobs = Number.parseInt(options.jobs ?? "8", 10);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32) failUsage("--jobs must be an integer between 1 and 32");
+
+  // Group by parent (roots are order-independent — each gets its own group).
+  const groups = new Map<string, { body: Record<string, unknown>; index: number }[]>();
+  entries.forEach((entry, index) => {
+    const body = entry as Record<string, unknown>;
+    const key = typeof body.parentId === "string" ? `parent:${body.parentId}` : `root:${index}`;
+    const list = groups.get(key) ?? [];
+    list.push({ body, index });
+    groups.set(key, list);
+  });
+
+  const created: { index: number; id: string }[] = [];
+  const failures: { index: number; error: string }[] = [];
+  let stopped = false;
+  const queue = [...groups.values()];
+  let done = 0;
+
+  await Promise.all(
+    Array.from({ length: Math.min(jobs, queue.length) }, async () => {
+      for (let group = queue.shift(); group !== undefined; group = queue.shift()) {
+        for (const { body, index } of group) {
+          if (stopped) {
+            failures.push({ index, error: "skipped (--stop-on-error)" });
+            continue;
+          }
+          try {
+            const res = await ctx.client.postJson<{ id: string }>("/api/objects", body);
+            created.push({ index, id: res.id });
+          } catch (error) {
+            failures.push({ index, error: error instanceof Error ? error.message : String(error) });
+            if (options.stopOnError === true) stopped = true;
+          }
+          done += 1;
+          if (done % 500 === 0) {
+            ctx.io.stderr.write(`notees: batch ${done}/${entries.length}\n`);
+          }
+        }
+      }
+    }),
+  );
+
+  const ids = [...created].sort((a, b) => a.index - b.index).map((entry) => entry.id);
+  const machine = {
+    created: ids.length,
+    ids,
+    failures: [...failures].sort((a, b) => a.index - b.index),
+  };
+  emit(ctx, ids.map((id) => `${id}\n`).join(""), machine);
+  if (failures.length > 0) {
+    const detail = machine.failures
+      .slice(0, 5)
+      .map((failure) => `#${failure.index}: ${failure.error}`)
+      .join("; ");
+    throw new CliError(
+      EXIT.domain,
+      `--batch: ${failures.length}/${entries.length} failed (${detail}${failures.length > 5 ? "; …" : ""})`,
+      machine,
+    );
+  }
+}
+
+/**
+ * `notees object children <id>` — direct children in child-position order
+ * (both render zones: main children and inline body blocks), wrapping the
+ * endpoint the editor's bullet renderer reads.
+ */
+async function objectChildren(ctx: CommandContext, id: string): Promise<void> {
+  const body = await ctx.client.getJson<{ children: Array<Record<string, unknown>> }>(
+    `/api/objects/${encodeURIComponent(id)}/children`,
+  );
+  const rows = body.children.map((child) => [
+    typeof child.name === "string" && child.name.length > 0 ? child.name : "(untitled)",
+    renderKindLabel(child as { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }),
+    String(child.id),
+  ]);
+  emit(ctx, `${formatTable([["NAME", "KIND", "ID"], ...rows])}\n`, { children: body.children });
+}
+
+/**
+ * `notees object restore <id>…` — bring trashed nodes back (whole-tree per
+ * the object.restore op; descendants trashed independently stay trashed).
+ * Ids apply sequentially; a permanently deleted id fails loud (exit 1).
+ */
+async function objectRestore(ctx: CommandContext, ids: string[]): Promise<void> {
+  if (ids.length === 0) failUsage("object restore requires at least one id");
+  const restored: Array<Record<string, unknown>> = [];
+  for (const id of ids) {
+    const body = await ctx.client.postJson<{ object: Record<string, unknown> }>(
+      `/api/objects/${encodeURIComponent(id)}/restore`,
+      {},
+    );
+    restored.push(body.object);
+  }
+  emit(
+    ctx,
+    restored.map((object) => `${String(object.id)}\n`).join(""),
+    { restored: restored.map((object) => object.id), objects: restored },
+  );
+}
+
+/**
+ * `notees object upsert` — find-or-create by exact title (case-insensitive)
+ * within optional scopes (--class, --parent). Zero matches → create with
+ * the same flags as `object create`; one → print its id, no write; many →
+ * usage error telling the caller to narrow the scopes. Lets import scripts
+ * re-run without duplicating nodes.
+ */
+async function objectUpsert(ctx: CommandContext, options: {
+  name?: string;
+  class?: string[];
+  parent?: string;
+  presentAsMain?: boolean;
+}): Promise<void> {
+  const name = options.name ?? "";
+  const wanted = name.trim().toLowerCase();
+  if (wanted.length === 0) failUsage("object upsert requires a non-empty --name");
+  const classIds = options.class ?? [];
+  // Title lookup rides the object listing (exact-name filter client-side);
+  // a single-class scope narrows the server query.
+  const query = queryString({
+    q: name,
+    ...(classIds.length === 1 ? { class: classIds[0] } : {}),
+    limit: 500,
+  });
+  const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>> }>(`/api/objects${query}`);
+  const matches = body.objects.filter((object) => {
+    if (typeof object.name !== "string" || object.name.trim().toLowerCase() !== wanted) return false;
+    const classes = Array.isArray(object.classIds) ? object.classIds : [];
+    if (classIds.length > 0 && !classIds.every((id) => classes.includes(id))) return false;
+    if (options.parent !== undefined && object.parentId !== options.parent) return false;
+    return true;
+  });
+  if (matches.length > 1) {
+    const shown = matches
+      .map((match) => String(match.id))
+      .slice(0, 5)
+      .join(", ");
+    failUsage(
+      `upsert ambiguous: ${matches.length} objects named "${name}" in scope — narrow with --class/--parent ` +
+        `(matches: ${shown}${matches.length > 5 ? ", …" : ""})`,
+    );
+  }
+  if (matches.length === 1) {
+    const existing = matches[0]!;
+    emit(ctx, `${String(existing.id)}\n`, { id: existing.id, created: false, object: existing });
+    return;
+  }
+  const createBody = buildCreateBody({
+    name,
+    class: classIds,
+    ...(options.parent !== undefined ? { parent: options.parent } : {}),
+    ...(options.presentAsMain !== undefined ? { presentAsMain: options.presentAsMain } : {}),
+  });
+  const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/objects", createBody);
+  emit(ctx, `${created.id}\n`, { ...created, created: true });
 }
 
 async function objectUpdate(ctx: CommandContext, id: string, options: {
@@ -241,6 +468,8 @@ async function objectList(ctx: CommandContext, options: {
   isClass?: boolean;
   presentAsMain?: boolean;
   class?: string[];
+  parent?: string;
+  trashed?: boolean;
   q?: string;
   property?: string;
   limit?: string;
@@ -260,6 +489,8 @@ async function objectList(ctx: CommandContext, options: {
     isClass: options.isClass,
     presentAsMain: options.presentAsMain,
     ...(classes.length === 1 ? { class: classes[0] } : {}),
+    ...(options.parent !== undefined ? { parent: options.parent } : {}),
+    ...(options.trashed === true ? { trashed: "true" } : {}),
     q: options.q,
     property: options.property,
     limit,
@@ -530,6 +761,60 @@ async function classMembership(
   emit(ctx, `${action}ed ${objectId} — classes now: ${machine.classIds.join(", ") || "(none)"}\n`, machine);
 }
 
+/**
+ * Shared bulk-membership verb behind `class empty` (unassign every member —
+ * idempotent and non-destructive, no confirmation) and
+ * `class delete-members` (trash every member node — preview-first like
+ * remap: without --yes it prints the blast radius and exits 2, --dry-run
+ * prints and exits 0).
+ */
+async function classBulkMembers(
+  ctx: CommandContext,
+  classRef: string,
+  action: "unassign" | "trash",
+  options: { dryRun?: boolean; yes?: boolean },
+): Promise<void> {
+  const klass = await resolveClassRef(ctx, classRef);
+  const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
+    `/api/classes/${encodeURIComponent(klass.id)}`,
+  );
+  const plan = { class: { id: klass.id, name: klass.name }, members: detail.members.length, action };
+  const preview =
+    action === "unassign"
+      ? `unassign ${plan.members} members from "${klass.name}" (the nodes stay, only the membership goes)`
+      : `trash ${plan.members} member nodes of "${klass.name}" (recoverable from the trash)`;
+  if (options.dryRun === true) {
+    emit(ctx, `dry run: ${preview}\n`, { ...plan, dryRun: true });
+    return;
+  }
+  if (action === "trash" && options.yes !== true) {
+    ctx.io.stderr.write(`Refusing to ${preview}.\nRe-run with --yes to proceed (or --dry-run to inspect).\n`);
+    throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
+  }
+  let done = 0;
+  const failures: Array<{ id: string; error: string }> = [];
+  for (const member of detail.members) {
+    try {
+      if (action === "unassign") {
+        await ctx.client.deleteJson(
+          `/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(klass.id)}`,
+        );
+      } else {
+        await ctx.client.deleteJson(`/api/objects/${encodeURIComponent(member.id)}`);
+      }
+      done += 1;
+    } catch (error) {
+      failures.push({ id: member.id, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const verb = action === "unassign" ? "unassigned" : "trashed";
+  emit(ctx, `${verb} ${done}/${plan.members} members of "${klass.name}" (${failures.length} failures)\n`, {
+    ...plan,
+    done,
+    failures,
+  });
+}
+
 async function backlinks(ctx: CommandContext, id: string): Promise<void> {
   const body = await ctx.client.getJson<unknown>(`/api/objects/${encodeURIComponent(id)}/backlinks`);
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
@@ -647,26 +932,34 @@ function parseDepth(options: { depth?: string; fixpoint?: boolean }): number {
   return parsed;
 }
 
-function requireExportSelectors(command: string, options: { ids?: string[]; linkedTo?: string | undefined }): string[] {
+function requireExportSelectors(command: string, options: { ids?: string[]; linkedTo?: string | undefined; classRef?: string | undefined }): string[] {
   const ids = options.ids ?? [];
-  if (ids.length === 0 && options.linkedTo === undefined) {
-    failUsage(`${command} requires --ids <uuid...> or --linked-to <uuid>`);
-  }
-  if (ids.length > 0 && options.linkedTo !== undefined) {
-    failUsage("--ids and --linked-to are mutually exclusive");
-  }
+  const modes = [ids.length > 0, options.linkedTo !== undefined, options.classRef !== undefined].filter(Boolean).length;
+  if (modes === 0) failUsage(`${command} requires --ids <uuid...>, --linked-to <uuid>, or --class <id|title>`);
+  if (modes > 1) failUsage("--ids, --linked-to, and --class are mutually exclusive");
   return ids;
 }
 
 async function exportMarkdown(ctx: CommandContext, options: {
   ids?: string[];
   linkedTo?: string;
+  classRef?: string;
   depth?: string;
   fixpoint?: boolean;
   outputDir?: string;
   stdout?: boolean;
 }): Promise<void> {
   const ids = requireExportSelectors("export markdown", options);
+  // --class seeds the bundle with the class's current members (class: uuid
+  // or title) — the natural "export this class" selector.
+  let seeds = ids;
+  if (options.classRef !== undefined) {
+    const klass = await resolveClassRef(ctx, options.classRef);
+    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
+      `/api/classes/${encodeURIComponent(klass.id)}`,
+    );
+    seeds = detail.members.map((member) => member.id);
+  }
   if (options.outputDir !== undefined && options.stdout === true) {
     failUsage("--output-dir and --stdout are mutually exclusive");
   }
@@ -676,7 +969,7 @@ async function exportMarkdown(ctx: CommandContext, options: {
   const depth = parseDepth(options);
   // Seeds + closure + children + reference names live in markdown-export.ts,
   // shared with the shell's export(ids) helper.
-  const bundle = await buildMarkdownBundle(ctx.client, { ids, linkedTo: options.linkedTo, depth });
+  const bundle = await buildMarkdownBundle(ctx.client, { ids: seeds, linkedTo: options.linkedTo, depth });
   const machine = { files: bundle.files.length, nodes: bundle.manifest.nodes };
   if (options.stdout === true) {
     const text = concatBundleMarkdown(bundle);
@@ -731,6 +1024,63 @@ async function setProperty(
     value,
     idx,
   });
+}
+
+const PROPERTY_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Property schema argument: a uuid is used verbatim; anything else resolves
+ * against the workspace's schema list by (case-insensitive) name. */
+async function resolvePropertySchemaRef(
+  ctx: CommandContext,
+  ref: string,
+): Promise<{ id: string; name: string }> {
+  if (PROPERTY_UUID_PATTERN.test(ref)) return { id: ref, name: ref };
+  const body = await ctx.client.getJson<{ propertySchemas: { id: string; name: string }[] }>(
+    "/api/property-schemas",
+  );
+  const wanted = ref.trim().toLowerCase();
+  const matches = body.propertySchemas.filter((schema) => schema.name.toLowerCase() === wanted);
+  if (matches.length === 0) failUsage(`no property schema named "${ref}" (pass a schema id, or one of the listed names)`);
+  if (matches.length > 1) failUsage(`property schema name "${ref}" is ambiguous — pass a schema id`);
+  return matches[0]!;
+}
+
+/** `notees object property set` — value parses as JSON when it can (numbers,
+ * booleans, {nodeId} refs for node-typed schemas), else stays a plain string. */
+async function objectPropertySet(
+  ctx: CommandContext,
+  id: string,
+  schemaRef: string,
+  value: string,
+  options: { idx?: string },
+): Promise<void> {
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const idx = Number.parseInt(options.idx ?? "0", 10);
+  if (!Number.isInteger(idx) || idx < 0) failUsage("--idx must be a non-negative integer");
+  let parsed: unknown = value;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    // Plain string value — the common case for text-ish schemas.
+  }
+  await setProperty(ctx, id, schema.id, parsed, idx);
+  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+  emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
+}
+
+/** `notees object property delete` — unsets one slot (idx) of a schema's value. */
+async function objectPropertyDelete(
+  ctx: CommandContext,
+  id: string,
+  schemaRef: string,
+  options: { idx?: string },
+): Promise<void> {
+  const schema = await resolvePropertySchemaRef(ctx, schemaRef);
+  const idx = Number.parseInt(options.idx ?? "0", 10);
+  if (!Number.isInteger(idx) || idx < 0) failUsage("--idx must be a non-negative integer");
+  await deleteProperty(ctx, id, schema.id, idx);
+  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+  emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
 }
 
 async function deleteProperty(
@@ -1136,9 +1486,16 @@ function buildProgram(): Command {
 
   const object = program.command("object").description("object operations");
   object
-    .command("get <id>")
-    .description("fetch an object")
-    .action(async (id: string, _options: object, command: Command) => {
+    .command("get [id]")
+    .description("fetch an object (--ids <uuid...> fetches many, in order)")
+    .addOption(new Option("--ids <uuid...>", "fetch several objects (mutually exclusive with the positional id)"))
+    .action(async (id: string | undefined, options: { ids?: string[] }, command: Command) => {
+      if (options.ids !== undefined && options.ids.length > 0) {
+        if (id !== undefined) failUsage("object get takes either an id or --ids, not both");
+        await objectGetMany(ctxOf(command), options.ids);
+        return;
+      }
+      if (id === undefined) failUsage("object get requires an id or --ids");
       await objectGet(ctxOf(command), id);
     });
   object
@@ -1153,9 +1510,59 @@ function buildProgram(): Command {
     .option("--name <name>", "object name")
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "parent object id")
+    .option("--icon <icon>", "icon (applied via a follow-up update — see object.update)")
+    .option("--color <color>", "color (applied via a follow-up update)")
     .option("--stdin", "read the object body as JSON from stdin")
-    .action(async (options: object, command: Command) => {
+    .option("--batch", "read a JSON array of create bodies from stdin and create them all (see --jobs)", false)
+    .option("--jobs <n>", "batch concurrency 1–32 (default 8; entries under one parent always stay in order)", "8")
+    .option("--stop-on-error", "batch: abort the remaining entries on the first failure", false)
+    .action(async (options: { batch?: boolean; stdin?: boolean; jobs?: string; stopOnError?: boolean } & object, command: Command) => {
+      if (options.batch === true) {
+        if (options.stdin === true) failUsage("--batch and --stdin are mutually exclusive");
+        await objectCreateBatch(ctxOf(command), options);
+        return;
+      }
       await objectCreate(ctxOf(command), options);
+    });
+  object
+    .command("restore <ids...>")
+    .description("restore trashed objects (whole-tree; descendants trashed independently stay trashed)")
+    .action(async (ids: string[], _options: object, command: Command) => {
+      await objectRestore(ctxOf(command), ids);
+    });
+  const property = object.command("property").description("typed property operations");
+  property
+    .command("set <id> <schema> <value>")
+    .description("set a property value (schema: uuid or name; value parses as JSON when possible, else string)", )
+    .option("--idx <n>", "slot index for multi-valued schemas", "0")
+    .action(async (id: string, schema: string, value: string, options: { idx?: string }, command: Command) => {
+      await objectPropertySet(ctxOf(command), id, schema, value, options);
+    });
+  property
+    .command("delete <id> <schema>")
+    .description("unset a property value (schema: uuid or name)")
+    .option("--idx <n>", "slot index for multi-valued schemas", "0")
+    .action(async (id: string, schema: string, options: { idx?: string }, command: Command) => {
+      await objectPropertyDelete(ctxOf(command), id, schema, options);
+    });
+  object
+    .command("children <id>")
+    .description("list an object's children in child-position order (main children and inline blocks)")
+    .action(async (id: string, _options: object, command: Command) => {
+      await objectChildren(ctxOf(command), id);
+    });
+  object
+    .command("upsert")
+    .description("find-or-create by exact title within --class/--parent scopes (prints the id; creates nothing when exactly one match exists)")
+    .option("--name <name>", "object title to find or create", "")
+    .option("--class <id>", "class id scope (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
+    .option("--parent <id>", "parent object id scope")
+    .addOption(
+      new Option("--presentAsMain", "create with the render bit set (main-children zone)").default(undefined),
+    )
+    .addOption(new Option("--no-presentAsMain", "create with the render bit unset (inline body)"))
+    .action(async (options: { name?: string; class?: string[]; parent?: string; presentAsMain?: boolean }, command: Command) => {
+      await objectUpsert(ctxOf(command), options);
     });
   object
     .command("update <id>")
@@ -1195,6 +1602,8 @@ function buildProgram(): Command {
       new Option("--no-presentAsMain", "filter: inline-body blocks (parented rows with the render bit unset)"),
     )
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
+    .option("--parent <id>", "filter: direct children of this object id")
+    .addOption(new Option("--trashed", "filter: trashed (inactive) rows — the trash listing").default(undefined))
     .option("--q <text>", "full-text filter")
     .option("--property <schemaId:value>", "exact-match property filter (value = everything after the first colon)")
     .option("--limit <n>", "page size")
@@ -1252,6 +1661,23 @@ function buildProgram(): Command {
     .option("--yes", "confirm the bulk remap", false)
     .action(async (fromRef: string, toRef: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
       await classRemap(ctxOf(command), fromRef, toRef, options);
+    });
+  klass
+    .command("empty <class>")
+    .description("unassign every member of a class (the nodes stay; class: uuid or title; idempotent)")
+    .action(async (classRef: string, _options: object, command: Command) => {
+      await classBulkMembers(ctxOf(command), classRef, "unassign", {});
+    });
+  klass
+    .command("delete-members <class>")
+    .description(
+      "trash every member node of a class (recoverable from the trash; class: uuid or title; " +
+        "requires --yes, preview without it, --dry-run to inspect)",
+    )
+    .option("--dry-run", "print what would be trashed and exit 0 without writing", false)
+    .option("--yes", "confirm the bulk trash", false)
+    .action(async (classRef: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
+      await classBulkMembers(ctxOf(command), classRef, "trash", options);
     });
 
   const auth = program.command("auth").description("sign in and store a credential for this server");
@@ -1336,6 +1762,7 @@ function buildProgram(): Command {
     .description("export objects as Markdown (<uuid>.md files + notees-manifest.json)")
     .addOption(new Option("--ids <uuid...>", "export exactly these object ids (no closure)"))
     .option("--linked-to <uuid>", "export the seed plus the pages that transitively link to it")
+    .option("--class <id|title>", "export the class's current members (seeds the bundle like --ids)")
     .addOption(
       new Option("--depth <n>", "closure hops beyond the seed's direct referrers (hops = depth + 1; default 3)").default("3"),
     )
@@ -1347,6 +1774,7 @@ function buildProgram(): Command {
         options: {
           ids?: string[];
           linkedTo?: string;
+          class?: string;
           depth?: string;
           fixpoint?: boolean;
           outputDir?: string;
@@ -1354,7 +1782,10 @@ function buildProgram(): Command {
         },
         command: Command,
       ) => {
-        await exportMarkdown(ctxOf(command), options);
+        await exportMarkdown(ctxOf(command), {
+          ...options,
+          ...(options.class !== undefined ? { classRef: options.class } : {}),
+        });
       },
     );
   exportCmd
