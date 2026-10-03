@@ -569,17 +569,16 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
   const classIds = new Map(classes.map((klass) => [klass.name.toLowerCase(), klass.id]));
   const schemaIds = new Map(propertySchemas.map((schema) => [schema.name.toLowerCase(), schema.id]));
 
-  // linked:<name> resolution: the search endpoint, exact-name match.
+  // linked:<name> resolution: the resolver endpoint (§34.30 C6 — the
+  // /api/search prefetch kludge it replaced could rank the match away).
   const nodeIds = new Map<string, string>();
   for (const name of extractLinkedNames(text)) {
     const wanted = name.toLowerCase();
     if (nodeIds.has(wanted)) continue;
-    const query = queryString({ q: name, limit: 50 });
-    const body = await ctx.client.getJson<{ results: { id: string; name: string | null }[] }>(
-      `/api/search${query}`,
+    const body = await ctx.client.getJson<{ id: string } | { error: string }>(
+      `/api/resolve${queryString({ name })}`,
     );
-    const hit = body.results.find((result) => (result.name ?? "").toLowerCase() === wanted);
-    if (hit !== undefined) nodeIds.set(wanted, hit.id);
+    if ("id" in body) nodeIds.set(wanted, body.id);
   }
 
   try {
