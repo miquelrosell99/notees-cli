@@ -24,7 +24,11 @@ import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_SPECS,
   SYSTEM_PROPERTY_UUIDS,
+  chainNodeIds,
   dateNodeId,
+  dateNodeLabel,
+  parseDateNodeId,
+  parseIsoDate,
   type SystemClassName,
   type SystemPropertyName,
 } from "@notees/domain";
@@ -1366,26 +1370,86 @@ async function findPersonByName(ctx: CommandContext, literal: string): Promise<s
   )?.id;
 }
 
-/** Ensure a year node exists (content-addressed id; the date chain's root).
- *  GET-then-create — the deterministic id makes the race converge on the
- *  loser's 409, which we treat as "already there" and re-read. */
-async function ensureYearNode(ctx: CommandContext, yearId: string, label: string): Promise<void> {
+/** Local midnight ISO (the CLI is a local client — never UTC, §34.28 #1). */
+function todayIsoLocal(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** Ensure a date-chain node exists (content-addressed id). GET-then-create —
+ *  the deterministic id makes the race converge on the loser's 409, which we
+ *  treat as "already there". */
+async function ensureChainNode(
+  ctx: CommandContext,
+  id: string,
+  label: string,
+  classId: string,
+  parentId: string | null,
+): Promise<void> {
   try {
-    await ctx.client.getJson(`/api/objects/${encodeURIComponent(yearId)}`);
+    await ctx.client.getJson(`/api/objects/${encodeURIComponent(id)}`);
     return;
   } catch {
     // Missing — create below.
   }
   try {
     await ctx.client.postJson("/api/objects", {
-      id: yearId,
+      id,
       presentAsMain: true,
-      classIds: [SYSTEM_CLASS_UUIDS.year],
+      ...(parentId !== null ? { parentId } : {}),
+      classIds: [classId],
       name: label,
     });
   } catch {
     // 409: another writer created it — the chain node exists either way.
   }
+}
+
+/** Ensure a year node exists (content-addressed id; the date chain's root). */
+async function ensureYearNode(ctx: CommandContext, yearId: string, label: string): Promise<void> {
+  await ensureChainNode(ctx, yearId, label, SYSTEM_CLASS_UUIDS.year, null);
+}
+
+/** §34.28 #13 — `notees today`: ensure the local date chain + the day page,
+ *  print the day object; --append adds a text block to it. */
+async function today(ctx: CommandContext, options: { append?: string }): Promise<void> {
+  const iso = todayIsoLocal();
+  const parts = parseIsoDate(iso);
+  const ids = chainNodeIds(iso);
+  await ensureChainNode(ctx, ids.year, dateNodeLabel(parts, "year"), SYSTEM_CLASS_UUIDS.year, null);
+  await ensureChainNode(ctx, ids.month, dateNodeLabel(parts, "month"), SYSTEM_CLASS_UUIDS.month, ids.year);
+  await ensureChainNode(ctx, ids.day, dateNodeLabel(parts, "day"), SYSTEM_CLASS_UUIDS.day, ids.month);
+  if (options.append !== undefined && options.append.trim() !== "") {
+    await ctx.client.postJson("/api/objects", {
+      parentId: ids.day,
+      contentAst: [{ type: "text", text: options.append }],
+    });
+  }
+  const day = await getFullObject(ctx, ids.day);
+  emit(ctx, `${JSON.stringify(day, null, 2)}\n`, day);
+}
+
+/** §34.28 #13 — `notees journal`: daily notes, newest first. */
+async function journal(ctx: CommandContext, options: { limit: string }): Promise<void> {
+  const limit = Number.parseInt(options.limit, 10);
+  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(
+    `/api/objects?class=${SYSTEM_CLASS_UUIDS.day}&limit=500`,
+  );
+  const days = body.objects
+    .map((object) => ({ object, parsed: parseDateNodeId(object.id) }))
+    .filter((entry): entry is { object: FullApiObject; parsed: NonNullable<typeof entry.parsed> } => entry.parsed !== null)
+    .sort((a, b) => (a.parsed.year - b.parsed.year) || (a.parsed.month - b.parsed.month) || (a.parsed.day - b.parsed.day))
+    .reverse()
+    .slice(0, Number.isFinite(limit) && limit > 0 ? limit : 20);
+  const machine = { days: days.map(({ object }) => ({ id: object.id, name: object.name })) };
+  emit(
+    ctx,
+    machine.days.map((day) => `${day.id}  ${day.name ?? ""}`).join("\n") + (machine.days.length > 0 ? "\n" : ""),
+    machine,
+  );
 }
 
 async function findOrCreatePerson(
@@ -1909,6 +1973,22 @@ function buildProgram(): Command {
     )
     .action(async (queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }, command: Command) => {
       await search(ctxOf(command), queryText, options);
+    });
+
+  program
+    .command("today")
+    .description("open today's daily note — ensures the local date chain and the day page, prints it")
+    .option("--append <text>", "append a text block to the daily note")
+    .action(async (options: { append?: string }, command: Command) => {
+      await today(ctxOf(command), options);
+    });
+
+  program
+    .command("journal")
+    .description("list daily notes, newest first")
+    .option("--limit <n>", "max entries", "20")
+    .action(async (options: { limit: string }, command: Command) => {
+      await journal(ctxOf(command), options);
     });
 
   const klass = program.command("class").description("class operations");

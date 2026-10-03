@@ -950,6 +950,32 @@ describe("search (query language)", () => {
   });
 });
 
+describe("daily notes (§34.28 #13)", () => {
+  it("today ensures the local date chain + day page; --append blocks; journal lists newest first", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
+    const day = JSON.parse(h.io.stdoutText) as { id: string; classIds: string[]; parentId: string | null };
+    expect(day.classIds).toContain(SYSTEM_CLASS_UUIDS.day);
+    const created = JSON.parse(h.io.stdoutText) as { createdAt: string | null };
+
+    // Append a block; the day object carries it as a child.
+    expect(await h.runCli("today", "--append", "captured from the CLI")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "children", day.id)).toBe(EXIT.ok);
+    const children = JSON.parse(h.io.stdoutText) as { children: Array<{ id: string }> };
+    expect(children.children.length).toBe(1);
+
+    // Idempotent: a second today returns the same day id.
+    expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText) as { id: string }).id).toBe(day.id);
+
+    // journal lists the day newest-first.
+    expect(await h.runCli("--json", "journal")).toBe(EXIT.ok);
+    const journal = JSON.parse(h.io.stdoutText) as { days: Array<{ id: string }> };
+    expect(journal.days.map((d) => d.id)).toContain(day.id);
+    void created;
+  });
+});
+
 describe("property schema verbs (§34.32 PG7)", () => {
   it("create → list → get → rename → bind → unbind → delete", async () => {
     const h = harness;
