@@ -14,7 +14,6 @@ import {
 
 import type { ApiClient } from "./client.js";
 import { CliError, EXIT } from "./exit-codes.js";
-import { queryString } from "./util.js";
 
 export interface ExportApiObject {
   id: string;
@@ -33,13 +32,6 @@ export interface ApiEdgeRow {
   target_id: string | null;
   type: string;
   verb: string | null;
-}
-
-interface ApiObjectStub {
-  id: string;
-  isClass: boolean;
-  presentAsMain: boolean;
-  parentId: string | null;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -212,29 +204,38 @@ export async function buildMarkdownBundle(
     depth: selection.depth,
   });
 
-  // Children map: the object API exposes no children endpoint (M1), so the
-  // parent→children map is derived from the paged object list filtered to
-  // the inline body (non-class rows with the render bit unset — id-ordered,
-  // so bullet order is id order, not child-position order; documented
-  // deviation), then each child is full-gotten for its contentAst.
+  // Children map: one position-ordered fetch per node that can appear in the
+  // bundle — the included set plus every inline-body descendant discovered
+  // below it (the exporter's childrenOf recurses through the map). Only
+  // inline-body children (non-class, render bit unset, parented) enter the
+  // map: child pages render as their own bundle files, never nested bullets.
   const childrenMap = new Map<string, ExportNode[]>();
-  const stubs: ApiObjectStub[] = [];
-  let cursor: string | undefined;
-  do {
-    const query = queryString({ isClass: false, presentAsMain: false, limit: 500, cursor });
-    const body = await client.getJson<{ objects: ApiObjectStub[]; nextCursor: string | null }>(
-      `/api/objects${query}`,
-    );
-    stubs.push(...body.objects);
-    cursor = body.nextCursor ?? undefined;
-  } while (cursor !== undefined);
-  for (const stub of stubs) {
-    if (stub.parentId === null) continue;
-    const child = await resolver.getObject(stub.id);
-    if (child === undefined) continue;
-    const list = childrenMap.get(stub.parentId);
-    if (list === undefined) childrenMap.set(stub.parentId, [child]);
-    else list.push(child);
+  const fetchedChildrenOf = new Set<string>();
+  const pending = [...included.keys()];
+  while (pending.length > 0) {
+    const id = pending.shift()!;
+    if (fetchedChildrenOf.has(id)) continue;
+    fetchedChildrenOf.add(id);
+    let rows: ExportApiObject[];
+    try {
+      const body = await client.getJson<{ children: ExportApiObject[] }>(
+        `/api/objects/${encodeURIComponent(id)}/children`,
+      );
+      rows = body.children;
+    } catch (error) {
+      // A node trashed between the closure pass and this fetch exports
+      // without children (its subtree is trashed with it) — the scan-era
+      // skip for vanished children, now per parent.
+      if (error instanceof CliError && error.exitCode === EXIT.domain) continue;
+      throw error;
+    }
+    const inline: ExportNode[] = [];
+    for (const child of rows) {
+      if (child.parentId === null || child.isClass || child.presentAsMain) continue;
+      inline.push(toExportNode(child));
+      pending.push(child.id);
+    }
+    if (inline.length > 0) childrenMap.set(id, inline);
   }
 
   // Pre-resolve every referenced id's current display name (rename-free:

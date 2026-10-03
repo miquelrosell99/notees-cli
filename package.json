@@ -14,10 +14,12 @@
   "dependencies": {
     "@notees/domain": "workspace:*",
     "@notees/export": "workspace:*",
+    "@notees/protocol": "workspace:*",
     "@notees/query": "workspace:*",
     "commander": "^12.1.0"
   },
   "devDependencies": {
+    "@notees/protocol": "workspace:*",
     "@notees/server": "workspace:*",
     "@types/node": "^20.14.0",
     "tsx": "^4.19.0",

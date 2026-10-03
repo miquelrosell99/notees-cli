@@ -3,14 +3,18 @@
  * `notees` — the Notees v2 CLI.
  *
  * Every command supports --json (stable machine output), --server <url> and
- * --key <nk_…> (env NOTEES_SERVER / NOTEES_API_KEY as fallbacks) and the
- * global --profile. Exit codes: 0 ok, 1 domain error, 2 usage, 3 auth,
- * 4 conflict, 5 network. Destructive commands require --yes: without it they
- * print a blast-radius preview and exit 2 (never an interactive prompt when
- * --json or non-tty).
+ * --key <credential> (env NOTEES_SERVER / NOTEES_API_KEY as fallbacks), the
+ * global --workspace <name|id> (env NOTEES_WORKSPACE) and --profile. The
+ * credential is whatever the server resolves: the operator key, a user API
+ * key, or an account session token — the client sends it verbatim and maps
+ * the server's 401; there is no client-side shape check. Exit codes: 0 ok,
+ * 1 domain error, 2 usage, 3 auth, 4 conflict, 5 network. Destructive
+ * commands require --yes: without it they print a blast-radius preview and
+ * exit 2 (never an interactive prompt when --json or non-tty).
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -34,6 +38,7 @@ import {
   serializeBibEntry,
   sourceClassOf,
 } from "@notees/export";
+import { OP_CATALOG, describeOp, newEnvelope, Clock } from "@notees/protocol";
 import {
   looksLikeQueryLanguage,
   parseQueryLanguage,
@@ -49,12 +54,9 @@ import {
   makeObjectResolver,
 } from "./markdown-export.js";
 import { runShell } from "./shell.js";
-import { defaultStatePath, serverState } from "./state.js";
-import { queryString, readStdin } from "./util.js";
-import { DEFAULT_WORKSPACE_ID } from "./uuid.js";
-
-// User API keys are nk_+40 base64url chars; operator keys nk_+32.
-const API_KEY_PATTERN = /^nk_[A-Za-z0-9_-]{32,40}$/;
+import { defaultStatePath, serverState, updateServerState, type StoredCredential } from "./state.js";
+import { formatTable, queryString, readStdin } from "./util.js";
+import { DEFAULT_WORKSPACE_ID, deriveUuid } from "./uuid.js";
 
 export interface CliIo {
   stdout: { write(chunk: string): unknown };
@@ -73,6 +75,7 @@ interface GlobalOptions {
   json?: boolean;
   server?: string;
   key?: string;
+  workspace?: string;
   profile?: string;
 }
 
@@ -81,6 +84,8 @@ interface CommandContext {
   opts: GlobalOptions;
   client: ApiClient;
   statePath: string;
+  /** `${profile}:${server}` — the state-file key for this invocation. */
+  stateKey: string;
 }
 
 function emit(ctx: CommandContext, human: string, machine: unknown): void {
@@ -95,19 +100,33 @@ function failUsage(message: string): never {
   throw new CliError(EXIT.usage, message);
 }
 
-function requireServerAndKey(opts: GlobalOptions): { server: string; apiKey: string } {
+function requireServer(opts: GlobalOptions): { server: string; workspace: string | undefined } {
   const server = opts.server ?? process.env.NOTEES_SERVER;
-  const apiKey = opts.key ?? process.env.NOTEES_API_KEY;
+  const workspace = opts.workspace ?? process.env.NOTEES_WORKSPACE;
   if (server === undefined || server.length === 0) {
     failUsage("server URL required: pass --server <url> or set NOTEES_SERVER");
   }
-  if (apiKey === undefined || apiKey.length === 0) {
-    failUsage("API key required: pass --key <nk_…> or set NOTEES_API_KEY");
-  }
-  if (!API_KEY_PATTERN.test(apiKey)) {
-    failUsage(`API key must match ${API_KEY_PATTERN} (got "${apiKey.slice(0, 8)}…")`);
-  }
-  return { server, apiKey };
+  return { server, workspace };
+}
+
+/**
+ * Credential resolution order: --key > NOTEES_API_KEY > the credential stored
+ * by `notees auth login` for this profile+server. No client-side shape check:
+ * the server resolves operator keys, user API keys, and session tokens, and
+ * answers 401 when invalid — a local regex can only reject valid credentials.
+ */
+function resolveKey(
+  opts: GlobalOptions,
+  statePath: string,
+  stateKey: string,
+  allowMissing: boolean,
+): { apiKey: string; stored: StoredCredential | undefined } {
+  const flag = opts.key ?? process.env.NOTEES_API_KEY;
+  if (flag !== undefined && flag.length > 0) return { apiKey: flag, stored: undefined };
+  const stored = serverState(statePath, stateKey).credential;
+  if (stored !== undefined && stored.token.length > 0) return { apiKey: stored.token, stored };
+  if (allowMissing) return { apiKey: "", stored: undefined };
+  failUsage("credential required: pass --key, set NOTEES_API_KEY, or run `notees auth login` for this server");
 }
 
 // --- command handlers --------------------------------------------------------
@@ -226,19 +245,44 @@ async function objectList(ctx: CommandContext, options: {
   property?: string;
   limit?: string;
   cursor?: string;
+  all?: boolean;
 }): Promise<void> {
   const classes = options.class ?? [];
-  const query = queryString({
+  // --all follows the pagination cursor to exhaustion (server page size,
+  // defaulting to its 500 max so big workspaces take few round trips).
+  const limit =
+    options.limit !== undefined
+      ? Number.parseInt(options.limit, 10)
+      : options.all === true
+        ? 500
+        : undefined;
+  const pageParams = {
     isClass: options.isClass,
     presentAsMain: options.presentAsMain,
     ...(classes.length === 1 ? { class: classes[0] } : {}),
     q: options.q,
     property: options.property,
-    limit: options.limit !== undefined ? Number.parseInt(options.limit, 10) : undefined,
-    cursor: options.cursor,
-  });
-  const body = await ctx.client.getJson<unknown>(`/api/objects${query}`);
-  emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
+    limit,
+  };
+  const objects: Array<Record<string, unknown>> = [];
+  let cursor = options.cursor;
+  let nextCursor: string | null | undefined;
+  do {
+    const query = queryString({ ...pageParams, cursor });
+    const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>>; nextCursor?: string | null }>(
+      `/api/objects${query}`,
+    );
+    objects.push(...body.objects);
+    nextCursor = body.nextCursor ?? null;
+    cursor = body.nextCursor ?? undefined;
+  } while (options.all === true && cursor !== undefined);
+  const machine = { objects, nextCursor: options.all === true ? null : (nextCursor ?? null) };
+  const rows = objects.map((object) => [
+    typeof object.name === "string" && object.name.length > 0 ? object.name : "(untitled)",
+    renderKindLabel(object as { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }),
+    String(object.id),
+  ]);
+  emit(ctx, `${formatTable([["NAME", "KIND", "ID"], ...rows])}\n`, machine);
 }
 
 async function search(ctx: CommandContext, queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }): Promise<void> {
@@ -325,8 +369,165 @@ function extractLinkedNames(text: string): string[] {
 }
 
 async function classList(ctx: CommandContext): Promise<void> {
-  const body = await ctx.client.getJson<unknown>("/api/classes");
-  emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
+  const body = await ctx.client.getJson<{
+    classes: Array<{ id: string; name: string; memberCount: number; parentClassIds: string[] }>;
+  }>("/api/classes");
+  const rows = body.classes.map((klass) => [
+    klass.name.length > 0 ? klass.name : "(untitled)",
+    String(klass.memberCount),
+    klass.id,
+  ]);
+  emit(ctx, `${formatTable([["NAME", "MEMBERS", "ID"], ...rows])}\n`, body);
+}
+
+/**
+ * `notees class remap <from> <to>` — the bulk membership migration verb: move
+ * every member of FROM to TO (assign + unassign, idempotent ops), remap
+ * extends edges pointing at FROM onto TO, leave the emptied FROM class in
+ * place (deletion is a separate, deliberate step). Preview-first like the
+ * destructive commands: without --yes it prints the blast radius and exits 2;
+ * --dry-run prints it and exits 0.
+ */
+async function classRemap(
+  ctx: CommandContext,
+  fromRef: string,
+  toRef: string,
+  options: { dryRun?: boolean; yes?: boolean },
+): Promise<void> {
+  const from = await resolveClassRef(ctx, fromRef);
+  const to = await resolveClassRef(ctx, toRef);
+  if (from.id === to.id) failUsage("class remap: from and to are the same class");
+  const fromDetail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
+    `/api/classes/${encodeURIComponent(from.id)}`,
+  );
+  const { classes } = await ctx.client.getJson<{
+    classes: Array<{ id: string; parentClassIds: string[] }>;
+  }>("/api/classes");
+  // An extender equal to the target is skipped: remap cannot make TO extend itself.
+  const extenders = classes.filter((c) => (c.parentClassIds ?? []).includes(from.id) && c.id !== to.id);
+  const plan = {
+    from: { id: from.id, name: from.name },
+    to: { id: to.id, name: to.name },
+    members: fromDetail.members.length,
+    extenders: extenders.length,
+  };
+  const preview = `${plan.members} members of "${from.name}" → "${to.name}", ${plan.extenders} extends edges remapped (the emptied class stays)`;
+  if (options.dryRun === true) {
+    emit(ctx, `dry run: ${preview}\n`, { ...plan, dryRun: true });
+    return;
+  }
+  if (options.yes !== true) {
+    ctx.io.stderr.write(`Refusing to remap: ${preview}.\nRe-run with --yes to proceed (or --dry-run to inspect).\n`);
+    throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
+  }
+  let moved = 0;
+  const failures: Array<{ id: string; error: string }> = [];
+  for (const member of fromDetail.members) {
+    try {
+      await ctx.client.putJson(`/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(to.id)}`);
+      await ctx.client.deleteJson(
+        `/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(from.id)}`,
+      );
+      moved += 1;
+    } catch (error) {
+      failures.push({ id: member.id, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  // Extends remap rides the op log — there is deliberately no REST surface
+  // for setExtends (configuration write; scripts use the same envelope path
+  // as every other client).
+  let extendsRemapped = 0;
+  if (extenders.length > 0) {
+    const clock = new Clock("notees-cli");
+    const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+    const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+    const envelopes = extenders.map((extender) =>
+      newEnvelope({
+        workspaceId,
+        actorId,
+        deviceId: "notees-cli",
+        client: "cli",
+        hlc: clock.now(),
+        affectedNodeIds: [extender.id],
+        opType: "class.setExtends",
+        payload: {
+          classId: extender.id,
+          parentClassIds: [...new Set(extender.parentClassIds.map((p) => (p === from.id ? to.id : p)))],
+        },
+      }),
+    );
+    const res = await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
+    extendsRemapped = res.savedCount;
+  }
+  emit(
+    ctx,
+    `remapped ${moved}/${plan.members} members (${failures.length} failures), ${extendsRemapped}/${plan.extenders} extends\n`,
+    { ...plan, moved, failures, extendsRemapped },
+  );
+}
+
+/**
+ * `notees ops [opType]` — the op catalog (from @notees/protocol's OP_CATALOG):
+ * the discovery layer for the shell's submitOp. No argument lists every op
+ * type with a one-line description; an argument prints the full entry.
+ */
+async function opsList(ctx: CommandContext, opType?: string): Promise<void> {
+  if (opType !== undefined) {
+    const entry = describeOp(opType);
+    if (entry === null) {
+      failUsage(`unknown op type "${opType}" — catalogued: ${OP_CATALOG.map((e) => e.opType).join(", ")}`);
+    }
+    emit(
+      ctx,
+      `${entry.opType}\n  ${entry.description}\n  affected: ${entry.affected}\n  example: ${JSON.stringify(entry.example)}\n`,
+      entry,
+    );
+    return;
+  }
+  const table = formatTable(
+    [["OP", "DESCRIPTION"], ...OP_CATALOG.map((entry) => [entry.opType, entry.description])],
+    110,
+  );
+  emit(ctx, `${table}\n`, { ops: OP_CATALOG });
+}
+
+const CLASS_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Class argument: a uuid is used verbatim; anything else resolves against
+ * the workspace's class list by (case-insensitive) title — the assign and
+ * unassign commands take "source", not just the system class's fixed id.
+ */
+async function resolveClassRef(ctx: CommandContext, ref: string): Promise<{ id: string; name: string }> {
+  if (CLASS_UUID_PATTERN.test(ref)) return { id: ref, name: ref };
+  const body = await ctx.client.getJson<{ classes: { id: string; name: string }[] }>("/api/classes");
+  const wanted = ref.trim().toLowerCase();
+  const matches = body.classes.filter((klass) => klass.name.toLowerCase() === wanted);
+  if (matches.length === 0) {
+    failUsage(`no class named "${ref}" (pass a class id, or one of the listed titles)`);
+  }
+  if (matches.length > 1) {
+    failUsage(`class name "${ref}" is ambiguous (${matches.length} classes share it) — pass a class id`);
+  }
+  return matches[0]!;
+}
+
+async function classMembership(
+  ctx: CommandContext,
+  objectId: string,
+  classRef: string,
+  action: "assign" | "unassign",
+): Promise<void> {
+  const klass = await resolveClassRef(ctx, classRef);
+  const url = `/api/objects/${encodeURIComponent(objectId)}/classes/${encodeURIComponent(klass.id)}`;
+  // Both ops are idempotent: assign re-adds (OR-Set add-wins), unassign
+  // tombstones (a no-op when the membership is already absent).
+  const body =
+    action === "assign"
+      ? await ctx.client.putJson<{ object: { classIds: string[] } }>(url)
+      : await ctx.client.deleteJson<{ object: { classIds: string[] } }>(url);
+  const machine = { objectId, classId: klass.id, className: klass.name, classIds: body.object.classIds };
+  emit(ctx, `${action}ed ${objectId} — classes now: ${machine.classIds.join(", ") || "(none)"}\n`, machine);
 }
 
 async function backlinks(ctx: CommandContext, id: string): Promise<void> {
@@ -360,15 +561,18 @@ async function assetGet(ctx: CommandContext, id: string, options: { output?: str
 }
 
 async function syncStatus(ctx: CommandContext): Promise<void> {
+  // --workspace names resolve through the account's listing; without one the
+  // relay stats address the same server default the object API would.
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
   const stats = await ctx.client.getJson<{ envelopeCount: number; restoreEpoch: number; maxHlc: { physical: number; logical: number } }>(
-    `/api/relay/v2/stats?workspaceId=${DEFAULT_WORKSPACE_ID}`,
+    `/api/relay/v2/stats?workspaceId=${workspaceId}`,
   );
   const stateKey = `${ctx.opts.profile ?? "default"}:${ctx.client.server}`;
   const local = serverState(ctx.statePath, stateKey);
   const cursorSeq = local.cursorSeq ?? 0;
   const machine = {
     server: ctx.client.server,
-    workspaceId: DEFAULT_WORKSPACE_ID,
+    workspaceId,
     envelopeCount: stats.envelopeCount,
     restoreEpoch: stats.restoreEpoch,
     maxHlc: stats.maxHlc,
@@ -395,10 +599,7 @@ async function doctor(ctx: CommandContext): Promise<void> {
   const server = ctx.opts.server ?? process.env.NOTEES_SERVER;
   const apiKey = ctx.opts.key ?? process.env.NOTEES_API_KEY;
   push("server configured", server !== undefined && server.length > 0, server ?? "missing (--server or NOTEES_SERVER)", EXIT.usage);
-  push("api key configured", apiKey !== undefined && apiKey.length > 0, apiKey !== undefined ? "present" : "missing (--key or NOTEES_API_KEY)", EXIT.usage);
-  if (apiKey !== undefined) {
-    push("api key shape", API_KEY_PATTERN.test(apiKey), API_KEY_PATTERN.test(apiKey) ? "nk_ + 32 chars" : "malformed", EXIT.usage);
-  }
+  push("credential configured", apiKey !== undefined && apiKey.length > 0, apiKey !== undefined ? "present" : "missing (--key or NOTEES_API_KEY)", EXIT.usage);
 
   if (server !== undefined && server.length > 0) {
     try {
@@ -411,10 +612,13 @@ async function doctor(ctx: CommandContext): Promise<void> {
         push("server reachable", false, String(error), EXIT.network);
       }
     }
-    if (apiKey !== undefined && API_KEY_PATTERN.test(apiKey)) {
+    if (apiKey !== undefined && apiKey.length > 0) {
+      // The probe sends the credential verbatim — the server resolves
+      // operator key, user API key, and session tokens alike.
       try {
-        await ctx.client.getJson<unknown>(`/api/relay/v2/stats?workspaceId=${DEFAULT_WORKSPACE_ID}`);
-        push("authentication", true, "API key accepted", EXIT.ok);
+        const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+        await ctx.client.getJson<unknown>(`/api/relay/v2/stats?workspaceId=${workspaceId}`);
+        push("authentication", true, "credential accepted", EXIT.ok);
       } catch (error) {
         if (error instanceof CliError) {
           push("authentication", false, error.message, error.exitCode);
@@ -797,16 +1001,124 @@ function rootOf(command: Command): Command {
 }
 
 /** Resolve the shared per-invocation context from the root program options. */
-function ctxOf(command: Command): CommandContext {
+function ctxOf(command: Command, options: { allowMissingKey?: boolean } = {}): CommandContext {
   const root = rootOf(command);
   const opts = root.opts<GlobalOptions>();
-  const { server, apiKey } = requireServerAndKey(opts);
+  const { server, workspace } = requireServer(opts);
+  const statePath = defaultStatePath();
+  const stateKey = `${opts.profile ?? "default"}:${server}`;
+  const { apiKey } = resolveKey(opts, statePath, stateKey, options.allowMissingKey === true);
   return {
     io: (root.getOptionValue("__io") as CliIo | undefined) ?? defaultIo,
     opts,
-    client: new ApiClient({ server, apiKey }),
-    statePath: defaultStatePath(),
+    client: new ApiClient({
+      server,
+      apiKey,
+      // exactOptionalPropertyTypes: omit rather than assign undefined.
+      ...(workspace !== undefined ? { workspace } : {}),
+      statePath,
+      stateKey,
+    }),
+    statePath,
+    stateKey,
   };
+}
+
+// --- auth --------------------------------------------------------------------
+
+/**
+ * `notees auth login` — email + password → session, then mint a dedicated CLI
+ * API key (revocable from the app, nk_-shaped for older clients) and store it
+ * per profile+server in the CLI state file (already mode 0600). Later
+ * invocations fall back to the stored credential, so scripts stop minting
+ * throwaway keys.
+ */
+async function authLogin(
+  ctx: CommandContext,
+  options: { email?: string; password?: string; passwordStdin?: boolean },
+): Promise<void> {
+  const email = options.email ?? process.env.NOTEES_EMAIL;
+  if (email === undefined || email.length === 0) {
+    failUsage("auth login requires --email <email> (or NOTEES_EMAIL)");
+  }
+  let password = options.password ?? process.env.NOTEES_PASSWORD;
+  if (options.passwordStdin === true) password = (await readStdin(ctx.io)).trim();
+  if (password === undefined || password.length === 0) {
+    failUsage("auth login requires a password: --password <pw>, NOTEES_PASSWORD, or --password-stdin");
+  }
+  const login = await ctx.client.postJson<{ token: string; user: { email: string } }>("/api/auth/login", {
+    email,
+    password,
+  });
+  const keyClient = new ApiClient({ server: ctx.client.server, apiKey: login.token });
+  const created = await keyClient.postJson<{ apiKey: { id: string }; token: string }>("/api/api-keys", {
+    name: `notees-cli @ ${hostname()} (${new Date().toISOString().slice(0, 10)})`,
+  });
+  const credential: StoredCredential = {
+    kind: "apiKey",
+    token: created.token,
+    keyId: created.apiKey.id,
+    email: login.user.email,
+    createdAt: new Date().toISOString(),
+  };
+  updateServerState(ctx.statePath, ctx.stateKey, (current) => ({ ...current, credential }));
+  const profile = ctx.opts.profile ?? "default";
+  emit(
+    ctx,
+    `logged in as ${email} — CLI API key stored for ${ctx.client.server} (profile ${profile})\n`,
+    { email, server: ctx.client.server, profile, keyId: created.apiKey.id },
+  );
+}
+
+/** `notees auth logout` — revoke the stored key server-side, then clear it. */
+async function authLogout(ctx: CommandContext): Promise<void> {
+  const stored = serverState(ctx.statePath, ctx.stateKey).credential;
+  if (stored === undefined) {
+    failUsage(`no stored credential for ${ctx.client.server} (profile ${ctx.opts.profile ?? "default"})`);
+  }
+  if (stored.kind === "apiKey" && stored.keyId !== undefined && stored.token.length > 0) {
+    // The key may authenticate its own revocation.
+    const keyClient = new ApiClient({ server: ctx.client.server, apiKey: stored.token });
+    await keyClient.deleteJson(`/api/api-keys/${encodeURIComponent(stored.keyId)}`);
+  }
+  updateServerState(ctx.statePath, ctx.stateKey, (current) => {
+    const next = { ...current };
+    delete next.credential;
+    return next;
+  });
+  emit(ctx, `logged out — stored credential removed (server key revoked)\n`, { revoked: stored.kind === "apiKey" });
+}
+
+/** `notees auth status` — is a stored credential present, and does it still work? */
+async function authStatus(ctx: CommandContext): Promise<void> {
+  const stored = serverState(ctx.statePath, ctx.stateKey).credential;
+  if (stored === undefined) {
+    emit(ctx, `not logged in — no stored credential for ${ctx.client.server}\n`, { loggedIn: false });
+    return;
+  }
+  const machine: Record<string, unknown> = {
+    loggedIn: true,
+    server: ctx.client.server,
+    profile: ctx.opts.profile ?? "default",
+    kind: stored.kind,
+    email: stored.email ?? null,
+    createdAt: stored.createdAt,
+    valid: false,
+  };
+  let detail = "invalid or expired";
+  try {
+    await new ApiClient({ server: ctx.client.server, apiKey: stored.token }).getJson("/api/classes");
+    machine.valid = true;
+    detail = "valid";
+  } catch (error) {
+    detail = error instanceof Error ? error.message : String(error);
+  }
+  machine.detail = detail;
+  emit(
+    ctx,
+    `logged in as ${stored.email ?? "(unknown)"} — ${stored.kind} stored ${stored.createdAt.slice(0, 10)}, ${detail}\n`,
+    machine,
+  );
 }
 
 function buildProgram(): Command {
@@ -817,7 +1129,8 @@ function buildProgram(): Command {
     .version("2.0.0-m1")
     .option("--json", "stable machine-readable output")
     .option("--server <url>", "server base URL (env NOTEES_SERVER)")
-    .option("--key <nk_…>", "API key (env NOTEES_API_KEY)")
+    .option("--key <credential>", "operator key, user API key, or session token (env NOTEES_API_KEY)")
+    .option("--workspace <name|id>", "workspace for the object API (env NOTEES_WORKSPACE; default: the server's default workspace)", undefined)
     .option("--profile <name>", "profile name for local state", "default")
     .exitOverride();
 
@@ -886,6 +1199,7 @@ function buildProgram(): Command {
     .option("--property <schemaId:value>", "exact-match property filter (value = everything after the first colon)")
     .option("--limit <n>", "page size")
     .option("--cursor <id>", "pagination cursor")
+    .option("--all", "fetch every page (follows the cursor to exhaustion; --limit becomes the page size)", false)
     .action(async (options: object, command: Command) => {
       await objectList(ctxOf(command), options);
     });
@@ -915,6 +1229,59 @@ function buildProgram(): Command {
     .description("list classes")
     .action(async (_options: object, command: Command) => {
       await classList(ctxOf(command));
+    });
+  klass
+    .command("assign <objectId> <class>")
+    .description("assign an object to a class (class: uuid or title; idempotent)")
+    .action(async (objectId: string, classRef: string, _options: object, command: Command) => {
+      await classMembership(ctxOf(command), objectId, classRef, "assign");
+    });
+  klass
+    .command("unassign <objectId> <class>")
+    .description("remove an object's class membership (class: uuid or title; idempotent)")
+    .action(async (objectId: string, classRef: string, _options: object, command: Command) => {
+      await classMembership(ctxOf(command), objectId, classRef, "unassign");
+    });
+  klass
+    .command("remap <from> <to>")
+    .description(
+      "move every member of a class to another class and remap extends edges (from/to: uuid or title; " +
+        "the emptied class stays; requires --yes, preview without it, --dry-run to inspect)",
+    )
+    .option("--dry-run", "print what would move and exit 0 without writing", false)
+    .option("--yes", "confirm the bulk remap", false)
+    .action(async (fromRef: string, toRef: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
+      await classRemap(ctxOf(command), fromRef, toRef, options);
+    });
+
+  const auth = program.command("auth").description("sign in and store a credential for this server");
+  auth
+    .command("login")
+    .description("log in with email + password and store a CLI API key (per profile)")
+    .option("--email <email>", "account email (env NOTEES_EMAIL)")
+    .option("--password <pw>", "account password (env NOTEES_PASSWORD) — prefer --password-stdin to keep it out of shell history")
+    .option("--password-stdin", "read the password from stdin", false)
+    .action(async (options: { email?: string; password?: string; passwordStdin?: boolean }, command: Command) => {
+      await authLogin(ctxOf(command, { allowMissingKey: true }), options);
+    });
+  auth
+    .command("logout")
+    .description("revoke the stored CLI API key and remove it from the state file")
+    .action(async (_options: object, command: Command) => {
+      await authLogout(ctxOf(command, { allowMissingKey: true }));
+    });
+  auth
+    .command("status")
+    .description("is a stored credential present for this server, and does it still authenticate?")
+    .action(async (_options: object, command: Command) => {
+      await authStatus(ctxOf(command, { allowMissingKey: true }));
+    });
+
+  program
+    .command("ops [opType]")
+    .description("list the operation catalog (or one op's description, example payload, and affected-node shape)")
+    .action(async (opType: string | undefined, _options: object, command: Command) => {
+      await opsList(ctxOf(command), opType);
     });
 
   program

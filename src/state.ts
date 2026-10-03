@@ -8,10 +8,24 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+/** Stored credential from `notees auth login` (the state file is mode 0600). */
+export interface StoredCredential {
+  kind: "apiKey" | "session";
+  token: string;
+  /** The api-keys row id — `notees auth logout` revokes it server-side. */
+  keyId?: string;
+  email?: string;
+  createdAt: string;
+}
+
 export interface ServerState {
   workspaceId?: string;
   cursorSeq?: number;
   updatedAt?: string;
+  /** Resolved --workspace name → workspace id (per server + profile). */
+  workspaces?: Record<string, string>;
+  /** Credential for this server+profile (set by `notees auth login`). */
+  credential?: StoredCredential;
 }
 
 export interface CliState {

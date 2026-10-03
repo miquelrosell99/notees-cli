@@ -13,13 +13,16 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 // Generous timeouts kept as a bounded safety margin.
 vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
 
+import { newEnvelope } from "@notees/protocol";
 import { SYSTEM_CLASS_UUIDS, SYSTEM_PROPERTY_UUIDS } from "@notees/domain";
 import { bibToCsl, parseBibtex } from "@notees/export";
 
-import { buildServer } from "@notees/server";
+import { buildServer, defaultWorkspaceId } from "@notees/server";
 
 import { run, type CliIo } from "../src/cli.js";
+import { ApiClient } from "../src/client.js";
 import { EXIT } from "../src/exit-codes.js";
+import { buildMarkdownBundle } from "../src/markdown-export.js";
 
 const API_KEY = `nk_${"c".repeat(32)}`;
 type App = Awaited<ReturnType<typeof buildServer>>["app"];
@@ -66,6 +69,7 @@ async function bootServer(): Promise<Harness> {
       globalRequestsPerMinute: 10_000,
       maxMediaBytes: 50 * 1024 * 1024,
       maxDocumentBytes: 100 * 1024 * 1024,
+      loginPerMinute: 10,
       corsOrigins: [],
     },
     { logger: false },
@@ -343,13 +347,14 @@ describe("export markdown", () => {
     const manifest = JSON.parse(readFileSync(join(dir, "notees-manifest.json"), "utf8")) as {
       format: string;
       version: number;
-      nodes: { id: string; name: string; isClass: boolean; presentAsMain: boolean }[];
+      nodes: { id: string; name: string; type: string; isClass: boolean; presentAsMain: boolean }[];
     };
     expect(manifest.format).toBe("notees-markdown");
-    expect(manifest.version).toBe(1);
+    expect(manifest.version).toBe(2);
     expect(manifest.nodes).toHaveLength(2);
     expect(manifest.nodes.find((n) => n.id === a)).toMatchObject({
       name: "expm-file-a",
+      type: "page",
       isClass: false,
       presentAsMain: true,
     });
@@ -390,6 +395,146 @@ describe("export markdown", () => {
     expect(await h.runCli("export", "markdown", "--ids", pageId, "--stdout")).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("parent body");
     expect(h.io.stdoutText).toContain("- child bullet body");
+  });
+
+  it("children come from the position-ordered children endpoint, not the paged object scan", async () => {
+    // Fake transport over a real ApiClient: the children endpoint answers in
+    // a deliberate non-id order; the bundle must preserve it, recurse into
+    // discovered inline children, skip child pages, and never touch the
+    // paged /api/objects list.
+    const pageId = "11111111-1111-4111-8111-111111111111";
+    const childA = "aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa"; // id order: A, B, G
+    const childB = "bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb"; // endpoint order: B, A
+    const grand = "cccccccc-3333-4ccc-8ccc-cccccccccccc";
+    const childPage = "dddddddd-4444-4ddd-8ddd-dddddddddddd";
+
+    const objectFixture = (
+      id: string,
+      overrides: Record<string, unknown>,
+    ): Record<string, unknown> => ({
+      id,
+      isClass: false,
+      presentAsMain: false,
+      parentId: pageId,
+      classIds: [],
+      name: null,
+      contentAst: [],
+      properties: [],
+      ...overrides,
+    });
+    const objects = new Map<string, Record<string, unknown>>([
+      [pageId, objectFixture(pageId, {
+        presentAsMain: true,
+        parentId: null,
+        name: "fake page",
+        contentAst: [{ type: "text", text: "fake page" }],
+      })],
+      [childA, objectFixture(childA, { contentAst: [{ type: "text", text: "alpha body" }] })],
+      [childB, objectFixture(childB, { contentAst: [{ type: "text", text: "beta body" }] })],
+      [grand, objectFixture(grand, { parentId: childB, contentAst: [{ type: "text", text: "grand body" }] })],
+      [childPage, objectFixture(childPage, {
+        presentAsMain: true,
+        contentAst: [{ type: "text", text: "child page body" }],
+      })],
+    ]);
+    const childrenFixtures = new Map<string, unknown[]>([
+      [pageId, [objects.get(childB), objects.get(childA), objects.get(childPage)]],
+      [childB, [objects.get(grand)]],
+    ]);
+
+    const requested: string[] = [];
+    const jsonResponse = (body: unknown, status = 200): Response =>
+      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = new URL(String(input));
+      requested.push(url.pathname + url.search);
+      const objectMatch = /^\/api\/objects\/([^/]+)\/children$/.exec(url.pathname);
+      if (objectMatch !== null) {
+        return jsonResponse({ children: childrenFixtures.get(decodeURIComponent(objectMatch[1]!)) ?? [] });
+      }
+      const singleMatch = /^\/api\/objects\/([^/]+)$/.exec(url.pathname);
+      if (singleMatch !== null) {
+        const object = objects.get(decodeURIComponent(singleMatch[1]!));
+        return object === undefined
+          ? jsonResponse({ error: { code: "not_found", message: "missing" } }, 404)
+          : jsonResponse({ object });
+      }
+      if (url.pathname === "/api/objects") {
+        // A regressed paged scan gets a valid empty page so the URL
+        // assertion below carries the failure, not the empty bundle.
+        return jsonResponse({ objects: [], nextCursor: null });
+      }
+      return jsonResponse({ error: { code: "unexpected", message: url.pathname } }, 500);
+    };
+    const client = new ApiClient({ server: "http://export-test.local", apiKey: "k", fetchImpl });
+
+    const bundle = await buildMarkdownBundle(client, { ids: [pageId], depth: 0 });
+
+    const file = bundle.files.find((entry) => entry.path === `${pageId}.md`);
+    expect(file).toBeDefined();
+    // Endpoint order wins over id order.
+    expect(file!.content.indexOf("beta body")).toBeLessThan(file!.content.indexOf("alpha body"));
+    // The discovered inline child is itself queried (nested bullets recurse).
+    expect(file!.content).toContain("grand body");
+    // A child page is its own bundle file, never a nested bullet.
+    expect(file!.content).not.toContain("child page body");
+    expect(requested.filter((path) => path.endsWith("/children"))).toEqual([
+      `/api/objects/${pageId}/children`,
+      `/api/objects/${childB}/children`,
+      `/api/objects/${childA}/children`,
+      `/api/objects/${grand}/children`,
+    ]);
+    expect(requested.some((path) => path.startsWith("/api/objects?"))).toBe(false);
+  });
+
+  it("children render in child-position order (endpoint order, not id order)", async () => {
+    const h = harness;
+    const pageId = await h.createPage("expm-order-parent", []);
+    const mkChild = async (text: string): Promise<string> => {
+      const code = await h.runCliWithStdin(
+        JSON.stringify({ presentAsMain: false, parentId: pageId, contentAst: [{ type: "text", text }] }),
+        "--json", "object", "create", "--stdin",
+      );
+      if (code !== EXIT.ok) throw new Error(`mkChild ${text} failed: ${h.io.stderrText}`);
+      return (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    };
+    const a = await mkChild("order-first");
+    const b = await mkChild("order-second");
+    const c = await mkChild("order-third");
+    // A main child: exported as its own file when selected, never a bullet.
+    await h.runCliWithStdin(
+      JSON.stringify({ presentAsMain: true, parentId: pageId, contentAst: [{ type: "text", text: "order-main-child-body" }] }),
+      "--json", "object", "create", "--stdin",
+    );
+
+    // Invert the position order through the relay write path (ids stay
+    // creation-ordered, so child order and id order genuinely differ). The
+    // crafted HLC runs ahead of the server-stamped creates.
+    const move = newEnvelope({
+      workspaceId: defaultWorkspaceId(),
+      actorId: "99999999-8888-4777-8666-555555555555",
+      deviceId: "test",
+      hlc: { physical: Date.now() + 1000, logical: 0 },
+      opType: "object.move",
+      payload: { objectId: c, parentId: pageId, beforeId: a },
+    });
+    const res = await fetch(`${h.baseUrl}/api/relay/v2/batch`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ envelopes: [move] }),
+    });
+    expect(res.status).toBe(200);
+
+    expect(await h.runCli("export", "markdown", "--ids", pageId, "--stdout")).toBe(EXIT.ok);
+    const first = h.io.stdoutText.indexOf("- order-first");
+    const second = h.io.stdoutText.indexOf("- order-second");
+    const third = h.io.stdoutText.indexOf("- order-third");
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(second).toBeGreaterThanOrEqual(0);
+    expect(third).toBeGreaterThanOrEqual(0);
+    expect(third).toBeLessThan(first);
+    expect(first).toBeLessThan(second);
+    expect(h.io.stdoutText).not.toContain("order-main-child-body");
   });
 
   it("--fixpoint expands until no new pages are found", async () => {
@@ -887,5 +1032,295 @@ describe("shell (scripted mode)", () => {
     expect(code).toBe(EXIT.auth);
     expect(io.stderrText).toContain("authentication failed");
     io.stdin = undefined;
+  });
+});
+
+describe("workspace selection (--workspace)", () => {
+  it("--workspace <name> resolves via the account listing and addresses that workspace", async () => {
+    const h = harness;
+    // Name resolution is account-scoped: provision the first account, create
+    // a named workspace, and mint a user API key (the operator key cannot
+    // list workspaces).
+    const setup = await h.app.inject({
+      method: "POST",
+      url: "/api/setup",
+      headers: { "content-type": "application/json" },
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    expect(setup.statusCode).toBe(201);
+    const session = setup.json().token as string;
+    const authHeaders = { "x-api-key": session, "content-type": "application/json" };
+
+    const workspace = (
+      await h.app.inject({ method: "POST", url: "/api/workspaces", headers: authHeaders, payload: { name: "Notas-CLI-Test" } })
+    ).json();
+    const workspaceId = workspace.id as string;
+    const userKey = (
+      await h.app.inject({ method: "POST", url: "/api/api-keys", headers: authHeaders, payload: { name: "cli-test" } })
+    ).json().token as string;
+
+    const io = new Capture();
+    const code = await run(
+      ["--server", h.baseUrl, "--key", userKey, "--workspace", "Notas-CLI-Test", "--json", "object", "create", "--name", "ws-target"],
+      io,
+    );
+    expect(code).toBe(EXIT.ok);
+    const { id } = JSON.parse(io.stdoutText);
+
+    // The object lives in the named workspace (operator key reads anywhere)…
+    const inNamed = await h.app.inject({
+      method: "GET",
+      url: `/api/objects/${id}`,
+      headers: { "x-api-key": API_KEY, "x-workspace-id": workspaceId },
+    });
+    expect(inNamed.statusCode).toBe(200);
+    // …and NOT in the server default.
+    const inDefault = await h.app.inject({ method: "GET", url: `/api/objects/${id}`, headers: { "x-api-key": API_KEY } });
+    expect(inDefault.statusCode).toBe(404);
+
+    // The name→id mapping is cached per profile in the CLI state file.
+    const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { workspaces?: Record<string, string> }>;
+    };
+    const cached = Object.values(state.servers).find((entry) => entry.workspaces?.["notas-cli-test"]);
+    expect(cached).toBeDefined();
+  });
+
+  it("operator key cannot resolve names (account-scoped listing) — the error says to pass an id", async () => {
+    const h = harness;
+    const code = await h.runCli("--workspace", "whatever", "object", "list");
+    expect(code).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("needs an account credential");
+  });
+
+  it("unknown workspace name fails with a usage error listing the available names", async () => {
+    const h = harness;
+    // The account from the first test exists now — log in for a session token.
+    const login = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { "content-type": "application/json" },
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    expect(login.statusCode).toBe(200);
+    const session = login.json().token as string;
+
+    const io = new Capture();
+    const code = await run(["--server", h.baseUrl, "--key", session, "--workspace", "no-such-ws", "object", "list"], io);
+    expect(code).toBe(EXIT.usage);
+    expect(io.stderrText).toContain('workspace "no-such-ws" not found');
+  });
+});
+
+describe("class assign/unassign", () => {
+  it("assigns and unassigns by class title (idempotent ops)", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "genre-test")).toBe(EXIT.ok);
+    const classId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "object", "create", "--name", "member-candidate")).toBe(EXIT.ok);
+    const objectId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    expect(await h.runCli("--json", "class", "assign", objectId, "genre-test")).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText)).toMatchObject({ objectId, classId, className: "genre-test" });
+    expect((JSON.parse(h.io.stdoutText) as { classIds: string[] }).classIds).toEqual([classId]);
+
+    expect(await h.runCli("--json", "class", "unassign", objectId, "genre-test")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText) as { classIds: string[] }).classIds).toEqual([]);
+  });
+
+  it("unknown class title is a usage error", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--name", "whatever")).toBe(EXIT.ok);
+    const objectId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("class", "assign", objectId, "no-such-class")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain('no class named "no-such-class"');
+  });
+});
+
+describe("credential handling", () => {
+  it("non-nk-shaped credentials are sent verbatim (server 401 → exit 3, not a local usage error)", async () => {
+    const h = harness;
+    const io = new Capture();
+    const code = await run(["--server", h.baseUrl, "--key", "a-session-token-shape-value", "doctor"], io);
+    expect(code).toBe(EXIT.auth);
+    expect(io.stderrText).not.toContain("must match");
+  });
+});
+
+describe("shell op submission", () => {
+  it("submitOp sends an op through the relay batch path and it applies", async () => {
+    const h = harness;
+    const script = `
+      const p = await create({ presentAsMain: true, contentAst: [{ type: "text", text: "submitop-target" }] });
+      const res = await submitOp("object.update", { objectId: p.id, contentAst: [{ type: "text", text: "submitop-renamed" }] }, [p.id]);
+      console.log("saved " + res.savedCount);
+      const after = await get(p.id);
+      console.log("name " + after.name);
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("saved 1");
+    expect(h.io.stdoutText).toContain("name submitop-renamed");
+  });
+});
+
+describe("auth (stored credentials)", () => {
+  it("login stores a CLI API key; later commands use it without --key; logout revokes and clears", async () => {
+    const h = harness;
+    // The account from the workspace-selection describe exists; log in with it.
+    // (runCli always injects --key, so drive `run` directly for the no-flag cases.)
+    const loginIo = new Capture();
+    const loginCode = await run(
+      [
+        "--server", h.baseUrl,
+        "auth", "login",
+        "--email", "cli-ws@example.test",
+        "--password", "correct horse battery staple",
+      ],
+      loginIo,
+    );
+    expect(loginCode).toBe(EXIT.ok);
+    expect(loginIo.stdoutText).toContain("logged in as cli-ws@example.test");
+
+    // A command with no --key and no env falls back to the stored credential.
+    const createIo = new Capture();
+    const createCode = await run(["--server", h.baseUrl, "--json", "object", "create", "--name", "auth-stored-key"], createIo);
+    expect(createCode).toBe(EXIT.ok);
+    const created = JSON.parse(createIo.stdoutText) as { id: string };
+
+    const statusIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "auth", "status"], statusIo)).toBe(EXIT.ok);
+    expect(statusIo.stdoutText).toContain("valid");
+
+    const logoutIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "auth", "logout"], logoutIo)).toBe(EXIT.ok);
+
+    // After logout the stored credential is gone: commands fail as usage errors again.
+    const afterIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "object", "get", created.id], afterIo)).toBe(EXIT.usage);
+    expect(afterIo.stderrText).toContain("auth login");
+  });
+});
+
+describe("tabular human output", () => {
+  it("class list and object list render compact tables in human mode", async () => {
+    const h = harness;
+    expect(await h.runCli("class", "list")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("NAME");
+    expect(h.io.stdoutText).toContain("MEMBERS");
+    expect(h.io.stdoutText).toContain("source");
+
+    expect(await h.runCli("object", "create", "--name", "table-output-probe")).toBe(EXIT.ok);
+    expect(await h.runCli("object", "list", "--q", "table-output-probe")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("KIND");
+    expect(h.io.stdoutText).toContain("table-output-probe");
+  });
+});
+
+describe("class remap", () => {
+  it("preview without --yes (exit 2), --dry-run changes nothing, --yes moves members and remaps extends", async () => {
+    const h = harness;
+    // from-class, to-class, two members, and an extender of from.
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "remap-from")).toBe(EXIT.ok);
+    const fromId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "remap-to")).toBe(EXIT.ok);
+    const toId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "remap-extender")).toBe(EXIT.ok);
+    const extenderId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    for (const name of ["remap-m1", "remap-m2"]) {
+      expect(await h.runCli("--json", "object", "create", "--name", name, "--class", fromId)).toBe(EXIT.ok);
+    }
+    const setExtends = newEnvelope({
+      workspaceId: defaultWorkspaceId(),
+      actorId: "99999999-8888-4777-8666-555555555555",
+      deviceId: "test",
+      hlc: { physical: Date.now() + 1000, logical: 0 },
+      opType: "class.setExtends",
+      payload: { classId: extenderId, parentClassIds: [fromId] },
+    });
+    const ingestRes = await h.app.inject({
+      method: "POST",
+      url: "/api/relay/v2/batch",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      payload: { envelopes: [setExtends] },
+    });
+    expect(ingestRes.statusCode).toBe(200);
+
+    // Preview: no --yes → exit 2 with the blast radius, nothing written.
+    const memberCount = async (title: string): Promise<number | undefined> => {
+      expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
+      const row = (JSON.parse(h.io.stdoutText).classes as Array<{ name: string; memberCount: number }>).find(
+        (c) => c.name === title,
+      );
+      return row?.memberCount;
+    };
+    expect(await h.runCli("class", "remap", "remap-from", "remap-to")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("2 members");
+    expect(await memberCount("remap-from")).toBe(2);
+
+    // --dry-run: exit 0, still nothing written.
+    expect(await h.runCli("class", "remap", "remap-from", "remap-to", "--dry-run")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("dry run");
+    expect(await memberCount("remap-from")).toBe(2);
+
+    // --yes: members move, the extender now extends to.
+    expect(await h.runCli("--json", "class", "remap", "remap-from", "remap-to", "--yes")).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { moved: number; extenders: number; extendsRemapped: number; failures: unknown[] };
+    expect(machine.moved).toBe(2);
+    expect(machine.failures).toEqual([]);
+    expect(machine.extendsRemapped).toBe(1);
+
+    expect(await memberCount("remap-from")).toBe(0);
+    expect(await memberCount("remap-to")).toBe(2);
+    expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
+    const extenderRow = (JSON.parse(h.io.stdoutText).classes as Array<{ name: string; parentClassIds: string[] }>)
+      .find((c) => c.name === "remap-extender");
+    expect(extenderRow?.parentClassIds).toEqual([toId]);
+  });
+});
+
+describe("object list --all", () => {
+  it("follows the cursor to exhaustion", async () => {
+    const h = harness;
+    for (let i = 1; i <= 3; i += 1) {
+      expect(await h.runCli("object", "create", "--name", `all-probe-${i}`)).toBe(EXIT.ok);
+    }
+    // Page size 2 < 3 results: without --all the first page stops early.
+    expect(await h.runCli("--json", "object", "list", "--q", "all-probe", "--limit", "2")).toBe(EXIT.ok);
+    const paged = JSON.parse(h.io.stdoutText) as { objects: unknown[]; nextCursor: string | null };
+    expect(paged.objects.length).toBe(2);
+    expect(paged.nextCursor).not.toBeNull();
+
+    expect(await h.runCli("--json", "object", "list", "--q", "all-probe", "--limit", "2", "--all")).toBe(EXIT.ok);
+    const all = JSON.parse(h.io.stdoutText) as { objects: unknown[]; nextCursor: string | null };
+    expect(all.objects.length).toBe(3);
+    expect(all.nextCursor).toBeNull();
+  });
+});
+
+describe("ops catalog", () => {
+  it("notees ops lists the catalog; one op prints its entry", async () => {
+    const h = harness;
+    expect(await h.runCli("ops")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("object.create");
+    expect(h.io.stdoutText).toContain("class.unassign");
+
+    expect(await h.runCli("ops", "class.unassign")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("OR-Set remove");
+    expect(h.io.stdoutText).toContain("example");
+
+    expect(await h.runCli("ops", "no.such.op")).toBe(EXIT.usage);
+  });
+
+  it("shell opHelp returns the entry and ops() the full list", async () => {
+    const h = harness;
+    const script = `
+      const move = await opHelp("object.move");
+      console.log("affected " + move.affected);
+      console.log("count " + ops().length);
+    `;
+    expect(await h.runCliWithStdin(script, "shell")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("affected objectId");
+    expect(h.io.stdoutText).toMatch(/count 2[0-9]/);
   });
 });

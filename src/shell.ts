@@ -23,11 +23,13 @@ import { format } from "node:util";
 import vm from "node:vm";
 
 import { concatBundleMarkdown } from "@notees/export";
+import { Clock, describeOp, newEnvelope, OP_CATALOG, type Envelope } from "@notees/protocol";
 
 import type { ApiClient } from "./client.js";
 import { CliError, EXIT } from "./exit-codes.js";
 import { buildMarkdownBundle } from "./markdown-export.js";
 import { queryString, readStdin } from "./util.js";
+import { DEFAULT_WORKSPACE_ID, deriveUuid } from "./uuid.js";
 
 export interface ShellIo {
   stdout: { write(chunk: string): unknown };
@@ -89,6 +91,17 @@ export interface ShellHelpers {
    * in the REPL. */
   export(ids: string[]): Promise<string>;
   exportMd(ids: string[]): Promise<string>;
+  /** Build one envelope-v3 op (HLC-stamped, uuidv7 id, workspace + actor
+   * derived from the client's --workspace/--key). Not submitted. */
+  makeOp(opType: string, payload: Record<string, unknown>, affectedNodeIds?: string[]): Promise<Envelope>;
+  /** Submit one op through the relay batch endpoint (the one write path). */
+  submitOp(opType: string, payload: Record<string, unknown>, affectedNodeIds?: string[]): Promise<{ savedCount: number; savedIds: string[] }>;
+  /** Submit prebuilt envelopes (from makeOp) through the relay batch endpoint. */
+  submitOps(envelopes: Envelope[]): Promise<{ savedCount: number; savedIds: string[] }>;
+  /** The op catalog: opType + one-line description per registered op (the submitOp discovery layer). */
+  ops(): Array<{ opType: string; description: string }>;
+  /** One catalog entry (description, example payload, affected-node shape); throws on unknown op types. */
+  opHelp(opType: string): { opType: string; description: string; example: Record<string, unknown>; affected: string };
 }
 
 const HELP_TEXT = `notees shell helpers (object API, top-level await works):
@@ -107,6 +120,11 @@ const HELP_TEXT = `notees shell helpers (object API, top-level await works):
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   upload(filePath)                           upload a file from disk -> asset id
   exportMd(ids) (alias: export)              markdown bundle text for the given object ids
+  makeOp(opType, payload, affected?)         build an envelope-v3 op (HLC-stamped; NOT submitted)
+  submitOp(opType, payload, affected?)       submit one op via the relay batch endpoint -> {savedCount, savedIds}
+  submitOps(envelopes)                       submit makeOp-built envelopes via the relay batch endpoint
+  ops()                                      the op catalog: opType + one-liner per registered op
+  opHelp(opType)                             one op's description, example payload, affected-node shape
 Type .help to see this again, .exit (or Ctrl-D) to quit.`;
 
 function errorMessage(error: unknown): string {
@@ -121,6 +139,25 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     const bundle = await buildMarkdownBundle(client, { ids, depth: 3 });
     return concatBundleMarkdown(bundle);
   };
+  // Envelope stamping for the op-submission helpers: one monotonic HLC per
+  // shell run, the workspace from --workspace (server default otherwise),
+  // and an actor derived deterministically from the credential — the same
+  // philosophy as the server's actorIdForKey.
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${client.apiKey}`);
+  const makeOp: ShellHelpers["makeOp"] = async (opType, payload, affectedNodeIds) =>
+    newEnvelope({
+      workspaceId: (await client.workspaceId()) ?? DEFAULT_WORKSPACE_ID,
+      actorId,
+      deviceId: "notees-cli",
+      client: "cli",
+      hlc: clock.now(),
+      affectedNodeIds: affectedNodeIds ?? [],
+      opType,
+      payload,
+    });
+  const submitOps: ShellHelpers["submitOps"] = (envelopes) =>
+    client.postJson<{ savedCount: number; savedIds: string[] }>("/api/relay/v2/batch", { envelopes });
   return {
     api: client,
     get: async (id) => (await client.getJson<{ object: unknown }>(objectUrl(id))).object,
@@ -186,6 +223,21 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     },
     export: exportMarkdown,
     exportMd: exportMarkdown,
+    makeOp,
+    submitOp: async (opType, payload, affectedNodeIds) =>
+      submitOps([await makeOp(opType, payload, affectedNodeIds)]),
+    submitOps,
+    ops: () => OP_CATALOG.map((entry) => ({ opType: entry.opType, description: entry.description })),
+    opHelp: (opType) => {
+      const entry = describeOp(opType);
+      if (entry === null) {
+        throw new CliError(
+          EXIT.usage,
+          `unknown op type "${opType}" — catalogued: ${OP_CATALOG.map((e) => e.opType).join(", ")}`,
+        );
+      }
+      return entry;
+    },
   };
 }
 
