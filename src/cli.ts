@@ -24,6 +24,7 @@ import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_SPECS,
   SYSTEM_PROPERTY_UUIDS,
+  dateNodeId,
   type SystemClassName,
   type SystemPropertyName,
 } from "@notees/domain";
@@ -37,6 +38,7 @@ import {
   parseBibtex,
   serializeBibEntry,
   sourceClassOf,
+  yearFromDate,
 } from "@notees/export";
 import { OP_CATALOG, describeOp, newEnvelope, Clock } from "@notees/protocol";
 import {
@@ -1199,6 +1201,28 @@ async function findPersonByName(ctx: CommandContext, literal: string): Promise<s
   )?.id;
 }
 
+/** Ensure a year node exists (content-addressed id; the date chain's root).
+ *  GET-then-create — the deterministic id makes the race converge on the
+ *  loser's 409, which we treat as "already there" and re-read. */
+async function ensureYearNode(ctx: CommandContext, yearId: string, label: string): Promise<void> {
+  try {
+    await ctx.client.getJson(`/api/objects/${encodeURIComponent(yearId)}`);
+    return;
+  } catch {
+    // Missing — create below.
+  }
+  try {
+    await ctx.client.postJson("/api/objects", {
+      id: yearId,
+      presentAsMain: true,
+      classIds: [SYSTEM_CLASS_UUIDS.year],
+      name: label,
+    });
+  } catch {
+    // 409: another writer created it — the chain node exists either way.
+  }
+}
+
 async function findOrCreatePerson(
   ctx: CommandContext,
   literal: string,
@@ -1265,7 +1289,17 @@ async function upsertSourceByCitekey(
   if (spec.url !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.url, spec.url);
   if (spec.publisher !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.publisher, spec.publisher);
   if (spec.publicationDate !== undefined) {
-    await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
+    // Date-chain ref, not a bare string (§34.28 #19): the year node
+    // backlinks everything dated that year. The year node's id is
+    // content-addressed (deterministic), so ensure-then-link is idempotent.
+    const year = yearFromDate(spec.publicationDate);
+    if (year !== undefined) {
+      const yearId = dateNodeId(`${year}-01-01`, "year");
+      await ensureYearNode(ctx, yearId, String(year));
+      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, { nodeId: yearId });
+    } else {
+      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
+    }
   }
   // Authors: node-typed list, replace wholesale — set the new {nodeId} refs,
   // unset the stale tail.
@@ -1299,8 +1333,10 @@ async function exportBibtex(ctx: CommandContext, options: {
 
   // The `authors` property is node-typed ({nodeId} refs, agent-filtered) —
   // resolve every referenced author to its current display name up front,
-  // batched through the objects API (the resolver caches per id).
+  // batched through the objects API (the resolver caches per id). Date-node
+  // refs (publicationDate, §34.28 #19) resolve through the same batch.
   const authorIds = new Set<string>();
+  const dateRefIds = new Set<string>();
   for (const node of included.values()) {
     if (sourceClassOf(node.classIds) === undefined) continue;
     for (const property of node.properties) {
@@ -1309,6 +1345,10 @@ async function exportBibtex(ctx: CommandContext, options: {
         authorIds.add(property.value.nodeId);
       }
     }
+    const pub = node.properties.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate);
+    if (pub !== undefined && isRecord(pub.value) && typeof pub.value.nodeId === "string") {
+      dateRefIds.add(pub.value.nodeId);
+    }
   }
   const authorNames = new Map<string, string>();
   for (const authorId of authorIds) {
@@ -1316,6 +1356,13 @@ async function exportBibtex(ctx: CommandContext, options: {
     if (authorNode === undefined) continue;
     const displayName = deriveDisplayName(authorNode) || authorNode.name?.trim() || "";
     if (displayName.length > 0) authorNames.set(authorId, displayName);
+  }
+  const dateNames = new Map<string, string>();
+  for (const refId of dateRefIds) {
+    const refNode = await resolver.getObject(refId);
+    if (refNode === undefined) continue;
+    const displayName = deriveDisplayName(refNode) || refNode.name?.trim() || "";
+    if (displayName.length > 0) dateNames.set(refId, displayName);
   }
 
   for (const node of included.values()) {
@@ -1331,7 +1378,11 @@ async function exportBibtex(ctx: CommandContext, options: {
           : undefined,
       )
       .filter((name): name is string => name !== undefined);
-    rendered.push(serializeBibEntry(cslToBib(nodeToCsl(node, node.properties, authors))));
+    rendered.push(
+      serializeBibEntry(
+        cslToBib(nodeToCsl(node, node.properties, authors, (refId) => dateNames.get(refId))),
+      ),
+    );
     entryIds.push(node.id);
   }
 

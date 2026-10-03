@@ -603,7 +603,16 @@ describe("bibliography round-trip (bibtex)", () => {
     expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publisher)?.value).toBe(
       "University of Chicago Press",
     );
-    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value).toBe("1962");
+    // publicationDate is a date-chain ref since §34.28 #19: a {nodeId} link
+    // to the content-addressed year node, which backlinks everything dated
+    // that year.
+    const pubRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value as {
+      nodeId: string;
+    };
+    expect(pubRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
+    await h.runCli("--json", "object", "get", pubRef.nodeId);
+    expect(JSON.parse(h.io.stdoutText).object.classIds).toContain(SYSTEM_CLASS_UUIDS.year);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("1962");
     // Authors are the node-typed property — {nodeId} refs to agent nodes, one per author.
     const authorRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as {
       nodeId: string;
@@ -676,7 +685,10 @@ describe("bibliography round-trip (bibtex)", () => {
     expect(book.name).toBe("The Structure of Scientific Revolutions, 2nd ed.");
     const props = book.properties as { schemaId: string; value: unknown }[];
     expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9780226458083");
-    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value).toBe("1970");
+    const pubRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value as {
+      nodeId: string;
+    };
+    expect(pubRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it("export bibtex --ids renders entries; CSL round-trip keeps title/author/year/doi stable", async () => {
