@@ -889,7 +889,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "3.1.3";
+const CLI_VERSION = "3.1.4";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
