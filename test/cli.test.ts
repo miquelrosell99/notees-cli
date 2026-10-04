@@ -1736,6 +1736,107 @@ describe("export markdown --class", () => {
   });
 });
 
+describe("export json (§34.59 JSON archive)", () => {
+  interface ArchiveNode {
+    id: string;
+    isClass: boolean;
+    presentAsMain: boolean;
+    parentId: string | null;
+    displayName: string;
+    contentAst: unknown[];
+    classIds: string[];
+    properties: unknown[];
+    children: string[];
+    edges: Array<Record<string, unknown>>;
+  }
+  interface Archive {
+    format: string;
+    version: number;
+    generatedAt: string;
+    nodes: ArchiveNode[];
+  }
+
+  it("--ids --stdout emits the versioned envelope with verbatim payloads, child ids, and edges", async () => {
+    const h = harness;
+    const target = await h.createPage("expj-target", [{ type: "text", text: "target body" }]);
+    const referrer = await h.createPage("expj-referrer", [
+      { type: "mention", targetNodeId: target, text: "expj-target" },
+      { type: "text", text: " links out" },
+    ]);
+
+    expect(await h.runCli("export", "json", "--ids", referrer)).toBe(EXIT.ok);
+    const archive = JSON.parse(h.io.stdoutText) as Archive;
+    expect(archive.format).toBe("notees-json-archive");
+    expect(archive.version).toBe(1);
+    expect(typeof archive.generatedAt).toBe("string");
+    expect(archive.nodes).toHaveLength(1);
+    const node = archive.nodes[0]!;
+    expect(node.id).toBe(referrer);
+    expect(node.isClass).toBe(false);
+    expect(node.presentAsMain).toBe(true);
+    expect(node.parentId).toBeNull();
+    // Title-is-content: the page's own stream IS its title; the mention block
+    // created by the helper rides as a child id (blocks are not in an
+    // --ids slice, exactly like the markdown bundle).
+    expect(node.displayName).toContain("expj-referrer");
+    expect(node.contentAst).toEqual([{ type: "text", text: "expj-referrer" }]);
+    expect(node.children).toHaveLength(1);
+    expect(node.edges).toEqual([]);
+  });
+
+  it("records child ids (inline body + main zone) in position order", async () => {
+    const h = harness;
+    const pageId = await h.createPage("expj-parent", [{ type: "text", text: "inline block" }]);
+    await h.runCliWithStdin(
+      JSON.stringify({
+        presentAsMain: true,
+        parentId: pageId,
+        contentAst: [{ type: "text", text: "child page" }],
+      }),
+      "--json", "object", "create", "--stdin",
+    );
+    expect(await h.runCli("export", "json", "--ids", pageId)).toBe(EXIT.ok);
+    const archive = JSON.parse(h.io.stdoutText) as Archive;
+    // One inline block + one main child page: both child ids recorded.
+    expect(archive.nodes[0]!.children).toHaveLength(2);
+  });
+
+  it("--output writes the archive file; --json reports the machine summary", async () => {
+    const h = harness;
+    const a = await h.createPage("expj-file-a", []);
+    const b = await h.createPage("expj-file-b", []);
+    const file = join(h.dataDir, "expj-archive.json");
+
+    expect(await h.runCli("--json", "export", "json", "--ids", a, b, "--output", file)).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { format: string; version: number; nodes: number };
+    expect(machine).toEqual({ format: "notees-json-archive", version: 1, nodes: 2 });
+
+    const archive = JSON.parse(readFileSync(file, "utf8")) as Archive;
+    expect(archive.format).toBe("notees-json-archive");
+    expect(archive.version).toBe(1);
+    expect(archive.nodes.map((node) => node.id).sort()).toEqual([a, b].sort());
+  });
+
+  it("--class seeds the archive with the class's members; selectors stay mutually exclusive", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "expj-klass")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("object", "create", "--name", "expj-member", "--class", klassId)).toBe(EXIT.ok);
+
+    expect(await h.runCli("export", "json", "--class", "expj-klass")).toBe(EXIT.ok);
+    const archive = JSON.parse(h.io.stdoutText) as Archive;
+    expect(archive.nodes).toHaveLength(1);
+    expect(archive.nodes[0]!.displayName).toContain("expj-member");
+    // Membership rides the classIds field (verbatim); content chips would
+    // mine as edges — the member's title-only stream has none.
+    expect(archive.nodes[0]!.classIds).toContain(klassId);
+    expect(archive.nodes[0]!.edges).toEqual([]);
+
+    expect(await h.runCli("export", "json", "--class", "expj-klass", "--ids", klassId)).toBe(EXIT.usage);
+    expect(await h.runCli("export", "json")).toBe(EXIT.usage);
+  });
+});
+
 describe("object get --ids and create --icon/--color", () => {
   it("multi-get returns objects in argument order", async () => {
     const h = harness;
@@ -1768,5 +1869,115 @@ describe("object get --ids and create --icon/--color", () => {
     expect((JSON.parse(h.io.stdoutText).object as { color: string | null }).color).toBeNull();
     // Garbage is rejected server-side (strict color grammar) — 422 → domain exit.
     expect(await h.runCli("--json", "object", "update", id, "--color", "var(--color-preset-red)")).toBe(EXIT.domain);
+  });
+});
+
+describe("covers (one-gesture cover)", () => {
+  // 1x1 transparent PNG — the server sniffs content, magic bytes suffice.
+  const PNG = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const COVER_PROP = "00000000-0000-0000-0000-000000000005";
+  const COVER_CLASS = "00000000-0000-0000-0001-000000000042";
+  const ASSET_CLASS = "00000000-0000-0000-0001-000000000009";
+
+  async function pngFile(h: Harness, name: string): Promise<string> {
+    const path = join(h.dataDir, name);
+    writeFileSync(path, PNG);
+    return path;
+  }
+  const coverOf = (object: { properties?: Array<{ schemaId: string; value: unknown }> }) =>
+    (object.properties ?? []).find((p) => p.schemaId === COVER_PROP)?.value as { nodeId: string } | undefined;
+
+  it("cover set <file> → get → skip-existing → replace → clear, with class hygiene", async () => {
+    const h = harness;
+    const page = await h.createPage("cover-probe", []);
+    const file = await pngFile(h, "cover.png");
+
+    // set from file: one call, asset node created + classed + attached.
+    expect(await h.runCli("--json", "cover", "set", page, file)).toBe(EXIT.ok);
+    const first = JSON.parse(h.io.stdoutText) as { assetId: string; replaced: string | null };
+    expect(first.replaced).toBeNull();
+    expect(await h.runCli("--json", "object", "get", first.assetId)).toBe(EXIT.ok);
+    const asset = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
+    expect(asset.classIds).toContain(ASSET_CLASS);
+    expect(asset.classIds).toContain(COVER_CLASS);
+
+    // get resolves the same asset.
+    expect(await h.runCli("cover", "get", page)).toBe(EXIT.ok);
+    expect(h.io.stdoutText.trim()).toBe(first.assetId);
+
+    // skip-existing: same id, no writes.
+    expect(await h.runCli("--json", "cover", "set", page, file, "--skip-existing")).toBe(EXIT.ok);
+    const skipped = JSON.parse(h.io.stdoutText) as { assetId: string; created: boolean; replaced: string | null };
+    expect(skipped).toMatchObject({ assetId: first.assetId, created: false, replaced: false });
+
+    // replace: new asset, old one's cover class drops (unused), property repoints.
+    expect(await h.runCli("--json", "cover", "set", page, file)).toBe(EXIT.ok);
+    const second = JSON.parse(h.io.stdoutText) as { assetId: string; replaced: string | null };
+    expect(second.assetId).not.toBe(first.assetId);
+    expect(second.replaced).toBe(first.assetId);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    expect(coverOf(JSON.parse(h.io.stdoutText).object)?.nodeId).toBe(second.assetId);
+    expect(await h.runCli("--json", "object", "get", first.assetId)).toBe(EXIT.ok);
+    const stale = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
+    expect(stale.classIds).toContain(ASSET_CLASS);
+    expect(stale.classIds).not.toContain(COVER_CLASS);
+
+    // clear: property gone.
+    expect(await h.runCli("cover", "clear", page)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    expect(coverOf(JSON.parse(h.io.stdoutText).object)).toBeUndefined();
+  });
+
+  it("cover set --asset reuses an existing asset node; clear keeps the class while shared", async () => {
+    const h = harness;
+    const pageA = await h.createPage("cover-share-a", []);
+    const pageB = await h.createPage("cover-share-b", []);
+    const file = await pngFile(h, "shared.png");
+    expect(await h.runCli("cover", "set", pageA, file)).toBe(EXIT.ok);
+    const assetId = h.io.stdoutText.trim();
+
+    expect(await h.runCli("cover", "set", pageB, "--asset", assetId)).toBe(EXIT.ok);
+    expect(h.io.stdoutText.trim()).toBe(assetId);
+
+    // Clearing A leaves the cover class: B still covers with the asset.
+    expect(await h.runCli("cover", "clear", pageA)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", assetId)).toBe(EXIT.ok);
+    const shared = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
+    expect(shared.classIds).toContain(COVER_CLASS);
+
+    // Usage errors: neither/both sources, get/clear on a coverless node.
+    expect(await h.runCli("cover", "set", pageB)).toBe(EXIT.usage);
+    expect(await h.runCli("cover", "set", pageB, file, "--asset", assetId)).toBe(EXIT.usage);
+    expect(await h.runCli("cover", "get", pageA)).toBe(EXIT.usage);
+  });
+
+  it("search exists-arm counts nodes with a property (prop:cover:)", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "cover-klass")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const withCover = await h.createPage("cover-k-with", []);
+    const bare = await h.createPage("cover-k-bare", []);
+    for (const id of [withCover, bare]) {
+      expect(await h.runCli("class", "assign", id, klassId)).toBe(EXIT.ok);
+    }
+    expect(await h.runCli("cover", "set", withCover, await pngFile(h, "exists.png"))).toBe(EXIT.ok);
+
+    expect(await h.runCli("--json", "search", "class:cover-klass prop:cover:")).toBe(EXIT.ok);
+    const rows = JSON.parse(h.io.stdoutText).rows as Array<{ id: string }>;
+    expect(rows.map((r) => r.id)).toEqual([withCover]);
+    expect(await h.runCli("--json", "search", "class:cover-klass")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).rows as unknown[]).length).toBe(2);
+  });
+
+  it("doctor reports the cli/server drift check", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "doctor")).toBe(EXIT.ok);
+    const checks = JSON.parse(h.io.stdoutText).checks as Array<{ check: string; ok: boolean; detail: string }>;
+    const drift = checks.find((c) => c.check === "cli/server version drift");
+    expect(drift).toBeDefined();
+    expect(drift!.ok).toBe(true); // test server builds from the same tree
   });
 });

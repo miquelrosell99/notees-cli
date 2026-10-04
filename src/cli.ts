@@ -40,6 +40,7 @@ import {
   deriveDisplayName,
   nodeToCsl,
   parseBibtex,
+  renderJsonArchive,
   serializeBibEntry,
   sourceClassOf,
   yearFromDate,
@@ -59,6 +60,7 @@ import {
   isRecord,
   makeObjectResolver,
 } from "./markdown-export.js";
+import { buildJsonArchiveDocument } from "./json-export.js";
 import { runShell } from "./shell.js";
 import { defaultStatePath, serverState, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
@@ -828,7 +830,8 @@ async function backlinks(ctx: CommandContext, id: string): Promise<void> {
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
-async function assetAdd(ctx: CommandContext, filePath: string, options: { object?: string }): Promise<void> {
+/** Upload bytes (optionally attaching to a node) — returns the CAS asset id, no output. */
+async function uploadAsset(ctx: CommandContext, filePath: string, objectId?: string): Promise<string> {
   let bytes: Buffer;
   try {
     bytes = readFileSync(filePath);
@@ -837,9 +840,14 @@ async function assetAdd(ctx: CommandContext, filePath: string, options: { object
   }
   const form = new FormData();
   form.append("file", new Blob([bytes]), basename(filePath));
-  if (options.object !== undefined) form.append("objectId", options.object);
+  if (objectId !== undefined) form.append("objectId", objectId);
   const body = await ctx.client.postMultipart<{ assetId: string }>("/api/assets", form);
-  emit(ctx, `${body.assetId}\n`, body);
+  return body.assetId;
+}
+
+async function assetAdd(ctx: CommandContext, filePath: string, options: { object?: string }): Promise<void> {
+  const assetId = await uploadAsset(ctx, filePath, options.object);
+  emit(ctx, `${assetId}\n`, { assetId });
 }
 
 async function assetGet(ctx: CommandContext, id: string, options: { output?: string }): Promise<void> {
@@ -880,6 +888,25 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
   );
 }
 
+/** CLI release version — aligned with the server release train. */
+const CLI_VERSION = "3.0.0";
+
+/** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
+function versionMajorMinor(version: string): [number, number] {
+  const match = /^(\d+)\.(\d+)/.exec(version.trim());
+  return match === null ? [0, 0] : [Number(match[1]), Number(match[2])];
+}
+
+/** True when the server version is AHEAD of the CLI (major or minor) — the
+ * CLI composes server responses by field name, so a newer server can rename
+ * shapes and silently degrade display output (observed: `schemaId` rename
+ * after 3.0.0). Advisory only — commands keep working. */
+function isVersionAhead(server: string, cli: string): boolean {
+  const [sMajor, sMinor] = versionMajorMinor(server);
+  const [cMajor, cMinor] = versionMajorMinor(cli);
+  return sMajor > cMajor || (sMajor === cMajor && sMinor > cMinor);
+}
+
 async function doctor(ctx: CommandContext): Promise<void> {
   const report: { check: string; ok: boolean; detail: string }[] = [];
   let worst: number = EXIT.ok;
@@ -898,6 +925,14 @@ async function doctor(ctx: CommandContext): Promise<void> {
     try {
       const version = await ctx.client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/version");
       push("server reachable", true, `${version.name} ${version.version} (protocol v${version.protocolVersion})`, EXIT.ok);
+      push(
+        "cli/server version drift",
+        !isVersionAhead(version.version, CLI_VERSION),
+        isVersionAhead(version.version, CLI_VERSION)
+          ? `WARN server ${version.version} is ahead of cli ${CLI_VERSION} — rebuild the CLI (response shapes may be stale)`
+          : `cli ${CLI_VERSION} in step with server ${version.version}`,
+        EXIT.ok, // advisory — never fails the probe
+      );
     } catch (error) {
       if (error instanceof CliError) {
         push("server reachable", false, error.message, error.exitCode);
@@ -990,6 +1025,41 @@ async function exportMarkdown(ctx: CommandContext, options: {
   for (const file of bundle.files) writeFileSync(join(dir, file.path), file.content);
   writeFileSync(join(dir, "notees-manifest.json"), `${JSON.stringify(bundle.manifest, null, 2)}\n`);
   emit(ctx, `wrote ${bundle.files.length} files to ${dir}\n`, machine);
+}
+
+async function exportJson(ctx: CommandContext, options: {
+  ids?: string[];
+  linkedTo?: string;
+  classRef?: string;
+  depth?: string;
+  fixpoint?: boolean;
+  output?: string;
+}): Promise<void> {
+  const ids = requireExportSelectors("export json", options);
+  // --class seeds the archive with the class's current members, mirroring
+  // the markdown selector.
+  let seeds = ids;
+  if (options.classRef !== undefined) {
+    const klass = await resolveClassRef(ctx, options.classRef);
+    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
+      `/api/classes/${encodeURIComponent(klass.id)}`,
+    );
+    seeds = detail.members.map((member) => member.id);
+  }
+  const depth = parseDepth(options);
+  const archive = await buildJsonArchiveDocument(ctx.client, {
+    ids: seeds,
+    linkedTo: options.linkedTo,
+    depth,
+  });
+  const text = renderJsonArchive(archive);
+  const machine = { format: archive.format, version: archive.version, nodes: archive.nodes.length };
+  if (options.output !== undefined) {
+    writeFileSync(options.output, text, "utf8");
+    emit(ctx, `wrote ${archive.nodes.length} nodes to ${options.output}\n`, machine);
+    return;
+  }
+  emit(ctx, text, machine);
 }
 
 // --- bibliography round-trip (BibTeX import/export) -------------------------------
@@ -1089,6 +1159,230 @@ async function objectPropertyDelete(
   await deleteProperty(ctx, id, schema.id, idx);
   const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
+}
+
+// --- covers --------------------------------------------------------------------
+
+/**
+ * Fixed ids of the cover family (§34.56): `cover` extends `asset`; the cover
+ * property (type image) binds to `source`. The property VALUE stays the
+ * authority — the classes are identity/chrome, exactly like the web client's
+ * coverProperty.ts flows.
+ */
+const ASSET_CLASS_ID = "00000000-0000-0000-0001-000000000009";
+const SOURCE_CLASS_ID = "00000000-0000-0000-0001-000000000023";
+const COVER_CLASS_ID = "00000000-0000-0000-0001-000000000042";
+const COVER_PROPERTY_ID = "00000000-0000-0000-0000-000000000005";
+
+interface FullObject {
+  id: string;
+  properties?: Array<{ schemaId: string; idx?: number; value: unknown }>;
+  classIds?: string[];
+  [key: string]: unknown;
+}
+
+async function getObject(ctx: CommandContext, id: string): Promise<FullObject> {
+  const body = await ctx.client.getJson<{ object: FullObject }>(`/api/objects/${encodeURIComponent(id)}`);
+  return body.object;
+}
+
+/** The cover property's asset target on a node (null = no cover). */
+function coverAssetOf(object: FullObject): string | null {
+  const cover = (object.properties ?? []).find(
+    (property) => property.schemaId === COVER_PROPERTY_ID && (property.idx ?? 0) === 0,
+  );
+  const target = cover?.value as { nodeId?: unknown } | undefined;
+  return typeof target?.nodeId === "string" ? target.nodeId : null;
+}
+
+/**
+ * Author the cover family when missing (idempotent, mirroring the web
+ * self-heal): the asset/source/cover class roots at their fixed ids, the
+ * cover→asset extends edge, the image-typed cover schema, and the
+ * source-class binding. Class/extends/binding writes ride the relay batch
+ * (configuration ops have no REST surface); the schema uses the property
+ * schemas endpoint. Binding assumption: an existing cover schema implies the
+ * binding (the web self-heal authors both together; the v1 migration too) —
+ * the binding envelope is written only alongside a schema this call created.
+ */
+async function ensureCoverFamily(ctx: CommandContext): Promise<void> {
+  const { classes } = await ctx.client.getJson<{ classes: Array<{ id: string; parentClassIds?: string[] }> }>(
+    "/api/classes",
+  );
+  const byId = new Map(classes.map((klass) => [klass.id, klass]));
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const envelopes = [];
+  const missingRoots = [
+    ["asset", ASSET_CLASS_ID, "mdiPaperclip"],
+    ["source", SOURCE_CLASS_ID, "mdiBookshelf"],
+    ["cover", COVER_CLASS_ID, "mdiImageArea"],
+  ].filter(([, id]) => !byId.has(id as string));
+  for (const [name, id, icon] of missingRoots) {
+    envelopes.push(
+      newEnvelope({
+        workspaceId,
+        actorId,
+        deviceId: "notees-cli",
+        client: "cli",
+        hlc: clock.now(),
+        affectedNodeIds: [id as string],
+        opType: "class.create",
+        payload: { classId: id, contentAst: [{ type: "text", text: name }], icon },
+      }),
+    );
+  }
+  const coverParents = byId.get(COVER_CLASS_ID)?.parentClassIds ?? [];
+  if (byId.has(COVER_CLASS_ID) && !coverParents.includes(ASSET_CLASS_ID)) {
+    envelopes.push(
+      newEnvelope({
+        workspaceId,
+        actorId,
+        deviceId: "notees-cli",
+        client: "cli",
+        hlc: clock.now(),
+        affectedNodeIds: [COVER_CLASS_ID],
+        opType: "class.setExtends",
+        payload: { classId: COVER_CLASS_ID, parentClassIds: [ASSET_CLASS_ID] },
+      }),
+    );
+  }
+  let createdSchema = false;
+  try {
+    await ctx.client.getJson(`/api/property-schemas/${COVER_PROPERTY_ID}`);
+  } catch (error) {
+    if (!(error instanceof CliError) || error.exitCode !== EXIT.domain) throw error;
+    await ctx.client.postJson("/api/property-schemas", {
+      propertySchemaId: COVER_PROPERTY_ID,
+      name: "cover",
+      type: "image",
+      multi: false,
+      scope: "class",
+    });
+    createdSchema = true;
+  }
+  if (createdSchema || missingRoots.length > 0) {
+    envelopes.push(
+      newEnvelope({
+        workspaceId,
+        actorId,
+        deviceId: "notees-cli",
+        client: "cli",
+        hlc: clock.now(),
+        affectedNodeIds: [SOURCE_CLASS_ID],
+        opType: "class.property.set",
+        payload: { classId: SOURCE_CLASS_ID, propertySchemaId: COVER_PROPERTY_ID, sequence: 7 },
+      }),
+    );
+  }
+  if (envelopes.length > 0) {
+    await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
+  }
+}
+
+/**
+ * True when any node OTHER than `excludeNodeId` covers with `assetId`
+ * (property-ref backlinks: type "property", verb = the cover schema).
+ */
+async function coverAssetStillUsed(ctx: CommandContext, assetId: string, excludeNodeId: string): Promise<boolean> {
+  const body = await ctx.client.getJson<{
+    backlinks: Array<{ source_id: string; type: string; verb: string | null }>;
+  }>(`/api/objects/${encodeURIComponent(assetId)}/backlinks`);
+  return (body.backlinks ?? []).some(
+    (edge) => edge.type === "property" && edge.verb === COVER_PROPERTY_ID && edge.source_id !== excludeNodeId,
+  );
+}
+
+async function coverClearValue(ctx: CommandContext, nodeId: string, object: FullObject): Promise<string | null> {
+  const assetId = coverAssetOf(object);
+  if (assetId === null) return null;
+  await deleteProperty(ctx, nodeId, COVER_PROPERTY_ID, 0);
+  if (!(await coverAssetStillUsed(ctx, assetId, nodeId))) {
+    await ctx.client.deleteJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(COVER_CLASS_ID)}`);
+  }
+  return assetId;
+}
+
+/**
+ * `notees cover set <nodeId> <file>` / `--asset <assetNodeId>` — the one-gesture
+ * cover: ensure family → (file: asset node + upload/attach | --asset: reuse a
+ * node) → cover property → cover class. Replaces an existing cover by
+ * default (the old asset node survives, unassigned when unused);
+ * --skip-existing makes scripts re-runnable (prints the existing asset id, no
+ * writes).
+ */
+async function coverSet(
+  ctx: CommandContext,
+  nodeId: string,
+  file: string | undefined,
+  options: { asset?: string; skipExisting?: boolean },
+): Promise<void> {
+  const fromFile = file !== undefined;
+  const fromAsset = options.asset !== undefined;
+  if (fromFile === fromAsset) failUsage("cover set takes exactly one of <file> or --asset <assetNodeId>");
+  await ensureCoverFamily(ctx);
+  const object = await getObject(ctx, nodeId);
+
+  const existing = coverAssetOf(object);
+  if (existing !== null && options.skipExisting === true) {
+    emit(ctx, `${existing}\n`, { pageId: nodeId, assetId: existing, created: false, replaced: false });
+    return;
+  }
+  let replaced: string | null = null;
+  if (existing !== null) {
+    replaced = await coverClearValue(ctx, nodeId, object);
+  }
+
+  let assetId: string;
+  if (fromAsset) {
+    assetId = options.asset!;
+    const assetNode = await getObject(ctx, assetId);
+    const classes = assetNode.classIds ?? [];
+    for (const classId of [ASSET_CLASS_ID, COVER_CLASS_ID]) {
+      if (!classes.includes(classId)) {
+        await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(classId)}`);
+      }
+    }
+  } else {
+    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
+      name: basename(file!),
+      presentAsMain: true,
+      classIds: [ASSET_CLASS_ID],
+    });
+    assetId = created.id;
+    await uploadAsset(ctx, file!, assetId);
+    await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(COVER_CLASS_ID)}`);
+  }
+  await setProperty(ctx, nodeId, COVER_PROPERTY_ID, { nodeId: assetId }, 0);
+  emit(ctx, `${assetId}\n`, { pageId: nodeId, assetId, created: true, replaced });
+}
+
+/** `notees cover get <nodeId>` — resolve the cover to its asset node id. */
+async function coverGet(ctx: CommandContext, nodeId: string): Promise<void> {
+  const object = await getObject(ctx, nodeId);
+  const assetId = coverAssetOf(object);
+  if (assetId === null) failUsage("node has no cover");
+  let asset: FullObject | null = null;
+  try {
+    asset = await getObject(ctx, assetId);
+  } catch {
+    asset = null; // dangling reference — report the id, flag the asset.
+  }
+  emit(
+    ctx,
+    `${assetId}\n`,
+    { pageId: nodeId, assetId, asset: asset === null ? null : { id: asset.id, name: asset.name ?? null } },
+  );
+}
+
+/** `notees cover clear <nodeId>` — unset the cover; the asset node survives
+ * (its cover class goes only when no other node covers with it). */
+async function coverClear(ctx: CommandContext, nodeId: string): Promise<void> {
+  const object = await getObject(ctx, nodeId);
+  const cleared = await coverClearValue(ctx, nodeId, object);
+  if (cleared === null) failUsage("node has no cover");
+  emit(ctx, `${cleared}\n`, { pageId: nodeId, cleared: true, assetId: cleared });
 }
 
 async function deleteProperty(
@@ -1758,7 +2052,7 @@ function buildProgram(): Command {
   program
     .name("notees")
     .description("Notees v2 CLI")
-    .version("2.0.0-m1")
+    .version(CLI_VERSION)
     .option("--json", "stable machine-readable output")
     .option("--server <url>", "server base URL (env NOTEES_SERVER)")
     .option("--key <credential>", "operator key, user API key, or session token (env NOTEES_API_KEY)")
@@ -1826,6 +2120,28 @@ function buildProgram(): Command {
     .option("--idx <n>", "slot index for multi-valued schemas", "0")
     .action(async (id: string, schema: string, options: { idx?: string }, command: Command) => {
       await objectPropertyDelete(ctxOf(command), id, schema, options);
+    });
+
+  const cover = program.command("cover").description("node covers — the one-gesture image cover (family ensure + asset node + property + classes)");
+  cover
+    .command("set <nodeId> [file]")
+    .description("set a node's cover from a file (or --asset <assetNodeId>); replaces by default, --skip-existing for re-runnable scripts")
+    .option("--asset <assetNodeId>", "point the cover at an existing asset node instead of uploading")
+    .option("--skip-existing", "when a cover is already set, print its asset id and change nothing", false)
+    .action(async (nodeId: string, file: string | undefined, options: { asset?: string; skipExisting?: boolean }, command: Command) => {
+      await coverSet(ctxOf(command), nodeId, file, options);
+    });
+  cover
+    .command("get <nodeId>")
+    .description("print the cover's asset node id")
+    .action(async (nodeId: string, _options: object, command: Command) => {
+      await coverGet(ctxOf(command), nodeId);
+    });
+  cover
+    .command("clear <nodeId>")
+    .description("remove the cover (the asset node survives; its cover class goes only when unused)")
+    .action(async (nodeId: string, _options: object, command: Command) => {
+      await coverClear(ctxOf(command), nodeId);
     });
 
   const schemaCmd = program.command("property").description("property schema operations (§34.32 PG7)");
@@ -2141,6 +2457,37 @@ function buildProgram(): Command {
         command: Command,
       ) => {
         await exportMarkdown(ctxOf(command), {
+          ...options,
+          ...(options.class !== undefined ? { classRef: options.class } : {}),
+        });
+      },
+    );
+  exportCmd
+    .command("json")
+    .description(
+      "export objects as a JSON archive (notees-json-archive v1: nodes with contentAst, classIds, properties, child ids, edges)",
+    )
+    .addOption(new Option("--ids <uuid...>", "export exactly these object ids (no closure)"))
+    .option("--linked-to <uuid>", "export the seed plus the pages that transitively link to it")
+    .option("--class <id|title>", "export the class's current members (seeds the archive like --ids)")
+    .addOption(
+      new Option("--depth <n>", "closure hops beyond the seed's direct referrers (hops = depth + 1; default 3)").default("3"),
+    )
+    .option("--fixpoint", "expand the closure until no new pages are found", false)
+    .option("--output <file>", "write the archive to this file instead of stdout")
+    .action(
+      async (
+        options: {
+          ids?: string[];
+          linkedTo?: string;
+          class?: string;
+          depth?: string;
+          fixpoint?: boolean;
+          output?: string;
+        },
+        command: Command,
+      ) => {
+        await exportJson(ctxOf(command), {
           ...options,
           ...(options.class !== undefined ? { classRef: options.class } : {}),
         });
