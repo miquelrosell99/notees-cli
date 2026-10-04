@@ -889,7 +889,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "3.1.1";
+const CLI_VERSION = "3.1.3";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
@@ -1164,14 +1164,14 @@ async function objectPropertyDelete(
 // --- covers --------------------------------------------------------------------
 
 /**
- * Fixed ids of the cover family (§34.56): `cover` extends `asset`; the cover
- * property (type image) binds to `source`. The property VALUE stays the
- * authority — the classes are identity/chrome, exactly like the web client's
- * coverProperty.ts flows.
+ * Fixed ids of the cover family (§34.74): the cover property (type image)
+ * binds to `source`; the cover target is an ordinary asset-classed node —
+ * the `cover` system class was withdrawn the day it shipped (it duplicated
+ * the property's meaning). The property VALUE stays the authority, exactly
+ * like the web client's coverProperty.ts flows.
  */
 const ASSET_CLASS_ID = "00000000-0000-0000-0001-000000000009";
 const SOURCE_CLASS_ID = "00000000-0000-0000-0001-000000000023";
-const COVER_CLASS_ID = "00000000-0000-0000-0001-000000000042";
 const COVER_PROPERTY_ID = "00000000-0000-0000-0000-000000000005";
 
 interface FullObject {
@@ -1197,16 +1197,16 @@ function coverAssetOf(object: FullObject): string | null {
 
 /**
  * Author the cover family when missing (idempotent, mirroring the web
- * self-heal): the asset/source/cover class roots at their fixed ids, the
- * cover→asset extends edge, the image-typed cover schema, and the
- * source-class binding. Class/extends/binding writes ride the relay batch
- * (configuration ops have no REST surface); the schema uses the property
- * schemas endpoint. Binding assumption: an existing cover schema implies the
- * binding (the web self-heal authors both together; the v1 migration too) —
- * the binding envelope is written only alongside a schema this call created.
+ * self-heal): the asset/source class roots at their fixed ids, the
+ * image-typed cover schema, and the source-class binding. Class writes ride
+ * the relay batch (configuration ops have no REST surface); the schema uses
+ * the property schemas endpoint. Binding assumption: an existing cover
+ * schema implies the binding (the web self-heal authors both together; the
+ * v1 migration too) — the binding envelope is written only alongside a
+ * schema this call created. No cover class (§34.74 — withdrawn same-day).
  */
-async function ensureCoverFamily(ctx: CommandContext): Promise<void> {
-  const { classes } = await ctx.client.getJson<{ classes: Array<{ id: string; parentClassIds?: string[] }> }>(
+async function ensureCoverProperty(ctx: CommandContext): Promise<void> {
+  const { classes } = await ctx.client.getJson<{ classes: Array<{ id: string }> }>(
     "/api/classes",
   );
   const byId = new Map(classes.map((klass) => [klass.id, klass]));
@@ -1217,7 +1217,6 @@ async function ensureCoverFamily(ctx: CommandContext): Promise<void> {
   const missingRoots = [
     ["asset", ASSET_CLASS_ID, "mdiPaperclip"],
     ["source", SOURCE_CLASS_ID, "mdiBookshelf"],
-    ["cover", COVER_CLASS_ID, "mdiImageArea"],
   ].filter(([, id]) => !byId.has(id as string));
   for (const [name, id, icon] of missingRoots) {
     envelopes.push(
@@ -1230,21 +1229,6 @@ async function ensureCoverFamily(ctx: CommandContext): Promise<void> {
         affectedNodeIds: [id as string],
         opType: "class.create",
         payload: { classId: id, contentAst: [{ type: "text", text: name }], icon },
-      }),
-    );
-  }
-  const coverParents = byId.get(COVER_CLASS_ID)?.parentClassIds ?? [];
-  if (byId.has(COVER_CLASS_ID) && !coverParents.includes(ASSET_CLASS_ID)) {
-    envelopes.push(
-      newEnvelope({
-        workspaceId,
-        actorId,
-        deviceId: "notees-cli",
-        client: "cli",
-        hlc: clock.now(),
-        affectedNodeIds: [COVER_CLASS_ID],
-        opType: "class.setExtends",
-        payload: { classId: COVER_CLASS_ID, parentClassIds: [ASSET_CLASS_ID] },
       }),
     );
   }
@@ -1281,36 +1265,19 @@ async function ensureCoverFamily(ctx: CommandContext): Promise<void> {
   }
 }
 
-/**
- * True when any node OTHER than `excludeNodeId` covers with `assetId`
- * (property-ref backlinks: type "property", verb = the cover schema).
- */
-async function coverAssetStillUsed(ctx: CommandContext, assetId: string, excludeNodeId: string): Promise<boolean> {
-  const body = await ctx.client.getJson<{
-    backlinks: Array<{ source_id: string; type: string; verb: string | null }>;
-  }>(`/api/objects/${encodeURIComponent(assetId)}/backlinks`);
-  return (body.backlinks ?? []).some(
-    (edge) => edge.type === "property" && edge.verb === COVER_PROPERTY_ID && edge.source_id !== excludeNodeId,
-  );
-}
-
 async function coverClearValue(ctx: CommandContext, nodeId: string, object: FullObject): Promise<string | null> {
   const assetId = coverAssetOf(object);
   if (assetId === null) return null;
   await deleteProperty(ctx, nodeId, COVER_PROPERTY_ID, 0);
-  if (!(await coverAssetStillUsed(ctx, assetId, nodeId))) {
-    await ctx.client.deleteJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(COVER_CLASS_ID)}`);
-  }
   return assetId;
 }
 
 /**
  * `notees cover set <nodeId> <file>` / `--asset <assetNodeId>` — the one-gesture
  * cover: ensure family → (file: asset node + upload/attach | --asset: reuse a
- * node) → cover property → cover class. Replaces an existing cover by
- * default (the old asset node survives, unassigned when unused);
- * --skip-existing makes scripts re-runnable (prints the existing asset id, no
- * writes).
+ * node) → cover property + the asset class. Replaces an existing cover by
+ * default (the old asset node survives as an asset); --skip-existing makes
+ * scripts re-runnable (prints the existing asset id, no writes).
  */
 async function coverSet(
   ctx: CommandContext,
@@ -1321,7 +1288,7 @@ async function coverSet(
   const fromFile = file !== undefined;
   const fromAsset = options.asset !== undefined;
   if (fromFile === fromAsset) failUsage("cover set takes exactly one of <file> or --asset <assetNodeId>");
-  await ensureCoverFamily(ctx);
+  await ensureCoverProperty(ctx);
   const object = await getObject(ctx, nodeId);
 
   const existing = coverAssetOf(object);
@@ -1339,10 +1306,8 @@ async function coverSet(
     assetId = options.asset!;
     const assetNode = await getObject(ctx, assetId);
     const classes = assetNode.classIds ?? [];
-    for (const classId of [ASSET_CLASS_ID, COVER_CLASS_ID]) {
-      if (!classes.includes(classId)) {
-        await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(classId)}`);
-      }
+    if (!classes.includes(ASSET_CLASS_ID)) {
+      await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(ASSET_CLASS_ID)}`);
     }
   } else {
     const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
@@ -1352,7 +1317,6 @@ async function coverSet(
     });
     assetId = created.id;
     await uploadAsset(ctx, file!, assetId);
-    await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(COVER_CLASS_ID)}`);
   }
   await setProperty(ctx, nodeId, COVER_PROPERTY_ID, { nodeId: assetId }, 0);
   emit(ctx, `${assetId}\n`, { pageId: nodeId, assetId, created: true, replaced });
@@ -1377,7 +1341,7 @@ async function coverGet(ctx: CommandContext, nodeId: string): Promise<void> {
 }
 
 /** `notees cover clear <nodeId>` — unset the cover; the asset node survives
- * (its cover class goes only when no other node covers with it). */
+ * (it stays an ordinary asset). */
 async function coverClear(ctx: CommandContext, nodeId: string): Promise<void> {
   const object = await getObject(ctx, nodeId);
   const cleared = await coverClearValue(ctx, nodeId, object);
@@ -2122,7 +2086,7 @@ function buildProgram(): Command {
       await objectPropertyDelete(ctxOf(command), id, schema, options);
     });
 
-  const cover = program.command("cover").description("node covers — the one-gesture image cover (family ensure + asset node + property + classes)");
+  const cover = program.command("cover").description("node covers — the one-gesture image cover (family ensure + asset node + property)");
   cover
     .command("set <nodeId> [file]")
     .description("set a node's cover from a file (or --asset <assetNodeId>); replaces by default, --skip-existing for re-runnable scripts")
@@ -2139,7 +2103,7 @@ function buildProgram(): Command {
     });
   cover
     .command("clear <nodeId>")
-    .description("remove the cover (the asset node survives; its cover class goes only when unused)")
+    .description("remove the cover (the asset node survives — it stays an ordinary asset)")
     .action(async (nodeId: string, _options: object, command: Command) => {
       await coverClear(ctxOf(command), nodeId);
     });

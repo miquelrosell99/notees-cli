@@ -1879,7 +1879,6 @@ describe("covers (one-gesture cover)", () => {
     "base64",
   );
   const COVER_PROP = "00000000-0000-0000-0000-000000000005";
-  const COVER_CLASS = "00000000-0000-0000-0001-000000000042";
   const ASSET_CLASS = "00000000-0000-0000-0001-000000000009";
 
   async function pngFile(h: Harness, name: string): Promise<string> {
@@ -1902,7 +1901,6 @@ describe("covers (one-gesture cover)", () => {
     expect(await h.runCli("--json", "object", "get", first.assetId)).toBe(EXIT.ok);
     const asset = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
     expect(asset.classIds).toContain(ASSET_CLASS);
-    expect(asset.classIds).toContain(COVER_CLASS);
 
     // get resolves the same asset.
     expect(await h.runCli("cover", "get", page)).toBe(EXIT.ok);
@@ -1913,7 +1911,7 @@ describe("covers (one-gesture cover)", () => {
     const skipped = JSON.parse(h.io.stdoutText) as { assetId: string; created: boolean; replaced: string | null };
     expect(skipped).toMatchObject({ assetId: first.assetId, created: false, replaced: false });
 
-    // replace: new asset, old one's cover class drops (unused), property repoints.
+    // replace: new asset, old one stays an asset, property repoints.
     expect(await h.runCli("--json", "cover", "set", page, file)).toBe(EXIT.ok);
     const second = JSON.parse(h.io.stdoutText) as { assetId: string; replaced: string | null };
     expect(second.assetId).not.toBe(first.assetId);
@@ -1923,7 +1921,6 @@ describe("covers (one-gesture cover)", () => {
     expect(await h.runCli("--json", "object", "get", first.assetId)).toBe(EXIT.ok);
     const stale = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
     expect(stale.classIds).toContain(ASSET_CLASS);
-    expect(stale.classIds).not.toContain(COVER_CLASS);
 
     // clear: property gone.
     expect(await h.runCli("cover", "clear", page)).toBe(EXIT.ok);
@@ -1931,7 +1928,7 @@ describe("covers (one-gesture cover)", () => {
     expect(coverOf(JSON.parse(h.io.stdoutText).object)).toBeUndefined();
   });
 
-  it("cover set --asset reuses an existing asset node; clear keeps the class while shared", async () => {
+  it("cover set --asset reuses an existing asset node and classes it", async () => {
     const h = harness;
     const pageA = await h.createPage("cover-share-a", []);
     const pageB = await h.createPage("cover-share-b", []);
@@ -1941,12 +1938,15 @@ describe("covers (one-gesture cover)", () => {
 
     expect(await h.runCli("cover", "set", pageB, "--asset", assetId)).toBe(EXIT.ok);
     expect(h.io.stdoutText.trim()).toBe(assetId);
-
-    // Clearing A leaves the cover class: B still covers with the asset.
-    expect(await h.runCli("cover", "clear", pageA)).toBe(EXIT.ok);
     expect(await h.runCli("--json", "object", "get", assetId)).toBe(EXIT.ok);
     const shared = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
-    expect(shared.classIds).toContain(COVER_CLASS);
+    expect(shared.classIds).toContain(ASSET_CLASS);
+
+    // Clearing A leaves the asset untouched (it stays an asset; B still covers with it).
+    expect(await h.runCli("cover", "clear", pageA)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", assetId)).toBe(EXIT.ok);
+    const afterClear = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
+    expect(afterClear.classIds).toContain(ASSET_CLASS);
 
     // Usage errors: neither/both sources, get/clear on a coverless node.
     expect(await h.runCli("cover", "set", pageB)).toBe(EXIT.usage);
