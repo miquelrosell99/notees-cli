@@ -1,0 +1,7 @@
+# Standalone workspace for the Notees CLI. The protocol/domain/store/export/
+# query (and server, for the test-suite's live server) packages are consumed
+# from a pinned checkout of the main monorepo — see vendor/notees (git
+# submodule) and README.md "Syncing the vendored packages".
+packages:
+  - "vendor/notees/packages/*"
+  - "vendor/notees/apps/server"

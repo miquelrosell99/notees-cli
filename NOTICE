@@ -1,0 +1,57 @@
+Third-Party Notices
+
+This project bundles or redistributes the following third-party assets and
+libraries. Their respective licenses apply to those components, separate from
+the AGPL-3.0 license that covers the Notees source code.
+
+---
+
+Material Design Icons
+
+  Source: https://github.com/Templarian/MaterialDesign
+  License: Apache-2.0
+  Used in: frontend/public/mdi-sprite.svg, frontend/src/utils/mdiIconList.ts
+
+The Material Design Icons sprite sheet is generated from the @mdi/svg package
+and is used under the Apache License, Version 2.0.
+
+---
+
+Vite logo
+
+  Source: https://github.com/vitejs/vite
+  License: MIT
+  Used in: frontend/public/vite.svg
+
+---
+
+KaTeX
+
+  Source: https://github.com/KaTeX/KaTeX
+  License: MIT
+  Used in: frontend rendering of LaTeX math expressions
+
+---
+
+sql.js / SQLite WASM
+
+  Source: https://github.com/sql-js/sql.js
+  License: MIT
+  Used in: frontend/public/sql-wasm.wasm
+
+---
+
+Fonts (Export/PDF rendering)
+
+  The following font files in app/static/export/fonts/ are used under the
+  SIL Open Font License, Version 1.1:
+
+    - Inter        (https://github.com/rsms/inter)
+    - JetBrains Mono (https://github.com/JetBrains/JetBrainsMono)
+    - EB Garamond  (https://github.com/octaviopardo/EBGaramond12)
+    - Source Serif 4 (https://github.com/adobe-fonts/source-serif)
+
+---
+
+For the full text of each license, see the upstream project repositories linked
+above or the standard license texts at https://opensource.org/licenses/.

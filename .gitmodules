@@ -1,0 +1,4 @@
+[submodule "vendor/notees"]
+	path = vendor/notees
+	url = git@github.com:miquelrosell99/notees.git
+	branch = main
