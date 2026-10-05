@@ -1981,3 +1981,30 @@ describe("covers (one-gesture cover)", () => {
     expect(drift!.ok).toBe(true); // test server builds from the same tree
   });
 });
+
+describe("property number formats", () => {
+  it("create carries --pad/--decimals/--rounding; rejects them off-number", async () => {
+    const h = harness;
+    expect(
+      await h.runCli("--json", "property", "create", "fmt-probe", "--type", "number", "--pad", "4", "--decimals", "1", "--rounding", "floor"),
+    ).toBe(EXIT.ok);
+    const created = JSON.parse(h.io.stdoutText).propertySchema as {
+      id: string;
+      numberPad: number | null;
+      numberDecimals: number | null;
+      numberRounding: string | null;
+    };
+    expect(created.numberPad).toBe(4);
+    expect(created.numberDecimals).toBe(1);
+    expect(created.numberRounding).toBe("floor");
+    expect(await h.runCli("--json", "property", "get", created.id)).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).propertySchema as { numberPad: number }).numberPad).toBe(4);
+
+    // Formatting flags on a non-number schema are a usage error.
+    expect(await h.runCli("property", "create", "bad-fmt", "--type", "text", "--pad", "4")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("require --type number");
+    // Bad rounding mode and out-of-range decimals fail loud.
+    expect(await h.runCli("property", "create", "bad-round", "--type", "number", "--rounding", "sideways")).toBe(EXIT.usage);
+    expect(await h.runCli("property", "create", "bad-dec", "--type", "number", "--decimals", "42")).toBe(EXIT.usage);
+  });
+});

@@ -889,7 +889,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "3.1.4";
+const CLI_VERSION = "3.1.5";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
@@ -1415,11 +1415,35 @@ async function propertyGet(ctx: CommandContext, schemaRef: string): Promise<void
 async function propertyCreate(
   ctx: CommandContext,
   name: string,
-  options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[] },
+  options: {
+    type?: string;
+    multi?: boolean;
+    option?: string[];
+    targetClass?: string[];
+    pad?: string;
+    decimals?: string;
+    rounding?: string;
+  },
 ): Promise<void> {
   const type = options.type ?? "text";
   if (!(PROPERTY_TYPES as readonly string[]).includes(type)) {
     failUsage(`unknown property type "${type}" — one of: ${PROPERTY_TYPES.join(", ")}`);
+  }
+  const formats = options.pad !== undefined || options.decimals !== undefined || options.rounding !== undefined;
+  if (formats && type !== "number") {
+    failUsage("number formatting flags (--pad/--decimals/--rounding) require --type number");
+  }
+  const parseIntFlag = (label: string, raw: string | undefined, min: number, max: number): number | undefined => {
+    if (raw === undefined) return undefined;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isInteger(parsed) || parsed < min || parsed > max) failUsage(`${label} must be an integer ${min}–${max}`);
+    return parsed;
+  };
+  const numberPad = parseIntFlag("--pad", options.pad, 1, 20);
+  const numberDecimals = parseIntFlag("--decimals", options.decimals, 0, 10);
+  const numberRounding = options.rounding as "round" | "floor" | "ceil" | "truncate" | undefined;
+  if (options.rounding !== undefined && !["round", "floor", "ceil", "truncate"].includes(options.rounding)) {
+    failUsage("--rounding must be one of: round, floor, ceil, truncate");
   }
   const propertySchemaId = uuidv7();
   const targetClassFilter: string[] = [];
@@ -1441,6 +1465,9 @@ async function propertyCreate(
         }
       : {}),
     ...(targetClassFilter.length > 0 ? { targetClassFilter } : {}),
+    ...(numberPad !== undefined ? { numberPad } : {}),
+    ...(numberDecimals !== undefined ? { numberDecimals } : {}),
+    ...(numberRounding !== undefined ? { numberRounding } : {}),
   });
   emit(ctx, `${body.propertySchema.id}\n`, body);
 }
@@ -2128,7 +2155,10 @@ function buildProgram(): Command {
     .option("--multi", "allow multiple values", false)
     .option("--option <label>", "select option label (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--targetClass <ref>", "constrain node-typed targets to this class (repeatable; uuid or title)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
-    .action(async (name: string, options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[] }, command: Command) => {
+    .option("--pad <n>", "number schemas: zero-pad the integer part to N digits (display only)")
+    .option("--decimals <n>", "number schemas: digits after the point 0-10 (display only)")
+    .option("--rounding <mode>", "number schemas: round | floor | ceil | truncate (display only)")
+    .action(async (name: string, options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[]; pad?: string; decimals?: string; rounding?: string }, command: Command) => {
       await propertyCreate(ctxOf(command), name, options);
     });
   schemaCmd
