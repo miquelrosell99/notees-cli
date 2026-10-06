@@ -196,7 +196,7 @@ describe("object lifecycle (json mode)", () => {
     const h = harness;
     await h.runCli("--json", "class", "list");
     const classes = JSON.parse(h.io.stdoutText).classes as { id: string; name: string }[];
-    const taskClass = classes.find((c) => c.name === "task")!;
+    const taskClass = classes.find((c) => c.name === "Task")!;
     expect(taskClass).toBeDefined();
 
     const code = await h.runCli("--json", "object", "create", "--presentAsMain", "--name", "t3-task-page", "--class", taskClass.id);
@@ -283,8 +283,8 @@ describe("assets, classes, sync", () => {
     const h = harness;
     expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
     const names = (JSON.parse(h.io.stdoutText).classes as { name: string }[]).map((c) => c.name);
-    expect(names).toContain("task");
-    expect(names).toContain("source");
+    expect(names).toContain("Task");
+    expect(names).toContain("Source");
   });
 
   it("sync status reports server stats and the local cursor", async () => {
@@ -1095,11 +1095,11 @@ describe("shell (scripted mode)", () => {
       });
       await setProperty(p.id, "${SYSTEM_PROPERTY_UUIDS.citekey}", "shellt2key");
       const mine = await props(p.id);
-      console.log("citekey " + mine.find((x) => x.schemaName === "citekey").value);
+      console.log("citekey " + mine.find((x) => x.schemaName === "Citekey").value);
       const found = await list({ property: "${SYSTEM_PROPERTY_UUIDS.citekey}:shellt2key" });
       console.log("found " + found.map((o) => o.id).join(","));
       const klasses = await classes();
-      const person = klasses.find((c) => c.name === "person");
+      const person = klasses.find((c) => c.name === "Person");
       const info = await classInfo(person.id);
       console.log("class " + info.name + " members=" + info.members.length);
       console.log("backlinks " + (await backlinks(p.id)).length);
@@ -1112,7 +1112,7 @@ describe("shell (scripted mode)", () => {
     expect(h.io.stdoutText).toContain("citekey shellt2key");
     expect(h.io.stdoutText).toMatch(/found [0-9a-f-]{36}/);
     // The person class already has members from the bibtex tests above.
-    expect(h.io.stdoutText).toMatch(/class person members=\d+/);
+    expect(h.io.stdoutText).toMatch(/class Person members=\d+/);
     expect(h.io.stdoutText).toContain("backlinks 0");
     expect(h.io.stdoutText).toMatch(/asset [0-9a-f-]{36}/);
     expect(h.io.stdoutText).toContain("export true");
@@ -1137,7 +1137,7 @@ describe("shell (scripted mode)", () => {
       const one = await propertySchema(schema.id);
       console.log("got " + one.name);
       const klasses = await classes();
-      const source = klasses.find((c) => c.name === "source");
+      const source = klasses.find((c) => c.name === "Source");
       const binding = await setClassProperty(source.id, schema.id, { sequence: 99, defaultValue: "shell-def" });
       console.log("bound " + binding.sequence + " " + binding.defaultValue);
       const obj = await create({ presentAsMain: true, name: "shell-pg7-src", classIds: [source.id] });
@@ -1361,7 +1361,7 @@ describe("tabular human output", () => {
     expect(await h.runCli("class", "list")).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("NAME");
     expect(h.io.stdoutText).toContain("MEMBERS");
-    expect(h.io.stdoutText).toContain("source");
+    expect(h.io.stdoutText).toContain("Source");
 
     expect(await h.runCli("object", "create", "--name", "table-output-probe")).toBe(EXIT.ok);
     expect(await h.runCli("object", "list", "--q", "table-output-probe")).toBe(EXIT.ok);
