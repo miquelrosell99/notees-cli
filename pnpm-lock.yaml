@@ -137,10 +137,10 @@ importers:
       docx:
         specifier: ^9.8.1
         version: 9.8.1
-    devDependencies:
       fflate:
         specifier: ^0.8.2
         version: 0.8.3
+    devDependencies:
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
