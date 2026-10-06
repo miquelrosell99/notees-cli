@@ -1,5 +1,5 @@
 /**
- * `notees shell` — the Odoo-shell equivalent for Notees v2: a Node REPL with
+ * `notees shell` — the Odoo-shell equivalent for Notees: a Node REPL with
  * the object API preloaded for arbitrary graph scripting.
  *
  * Two modes, chosen by stdin:

@@ -1,6 +1,6 @@
 /**
  * CLI exit-code contract: 0 ok, 1 domain error, 2 usage, 3 auth,
- * 4 conflict, 5 network. Wire errors (the §3 envelope) map onto these codes.
+ * 4 conflict, 5 network. Wire errors (the envelope) map onto these codes.
  */
 
 export const EXIT = {

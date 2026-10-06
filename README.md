@@ -1,6 +1,6 @@
 # Notees CLI
 
-The `notees` command-line client for [Notees](https://github.com/miquelrosell99/notees) — the object/property/search surface over the server's public API. Split out of the main monorepo (`apps/cli`, §34.82 of the main repo's plan) to live alongside the other first-class clients ([GTK](https://github.com/miquelrosell99/notees-gtk), [Flutter](https://github.com/miquelrosell99/notees-flutter)).
+The `notees` command-line client for [Notees](https://github.com/miquelrosell99/notees) — the object/property/search surface over the server's public API. Split out of the main monorepo (`apps/cli`) to live alongside the other first-class clients ([GTK](https://github.com/miquelrosell99/notees-gtk), [Flutter](https://github.com/miquelrosell99/notees-flutter)).
 
 The CLI talks to a running `notees-sync` server over HTTP. It holds no state of its own beyond a session credential.
 
@@ -14,7 +14,7 @@ notees-cli/
 └── pnpm-workspace.yaml  # consumes @notees/* from the submodule checkout
 ```
 
-The CLI imports the TypeScript protocol packages (`@notees/protocol`, `@notees/domain`, `@notees/query`, `@notees/export`) and uses `@notees/server` in tests to boot a real server. They are consumed from the `vendor/notees` submodule as pnpm workspace packages — no npm publishing involved (the SDK-publish track is archived; see the main repo's plan).
+The CLI imports the TypeScript protocol packages (`@notees/protocol`, `@notees/domain`, `@notees/query`, `@notees/export`) and uses `@notees/server` in tests to boot a real server. They are consumed from the `vendor/notees` submodule as pnpm workspace packages — no npm publishing involved (the SDK-publish track is archived in the main repo).
 
 ## Getting started
 

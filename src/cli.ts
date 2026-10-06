@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `notees` — the Notees v2 CLI.
+ * `notees` — the Notees CLI.
  *
  * Every command supports --json (stable machine output), --server <url> and
  * --key <credential> (env NOTEES_SERVER / NOTEES_API_KEY as fallbacks), the
@@ -571,7 +571,7 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
   const classIds = new Map(classes.map((klass) => [klass.name.toLowerCase(), klass.id]));
   const schemaIds = new Map(propertySchemas.map((schema) => [schema.name.toLowerCase(), schema.id]));
 
-  // linked:<name> resolution: the resolver endpoint (§34.30 C6 — the
+  // linked:<name> resolution: the resolver endpoint (the
   // /api/search prefetch kludge it replaced could rank the match away).
   const nodeIds = new Map<string, string>();
   for (const name of extractLinkedNames(text)) {
@@ -967,7 +967,7 @@ async function doctor(ctx: CommandContext): Promise<void> {
 // --- export --------------------------------------------------------------------
 
 /** Closure depth: depth N follows N+1 backlink hops (depth 0 = the seed's
- * direct referrers only), per §34.16.3; default 3. */
+ * direct referrers only); default 3. */
 function parseDepth(options: { depth?: string; fixpoint?: boolean }): number {
   if (options.fixpoint === true) return Number.POSITIVE_INFINITY;
   const parsed = Number.parseInt(options.depth ?? "3", 10);
@@ -1164,7 +1164,7 @@ async function objectPropertyDelete(
 // --- covers --------------------------------------------------------------------
 
 /**
- * Fixed ids of the cover family (§34.74): the cover property (type image)
+ * Fixed ids of the cover family: the cover property (type image)
  * binds to `source`; the cover target is an ordinary asset-classed node —
  * the `cover` system class was withdrawn the day it shipped (it duplicated
  * the property's meaning). The property VALUE stays the authority, exactly
@@ -1202,8 +1202,8 @@ function coverAssetOf(object: FullObject): string | null {
  * the relay batch (configuration ops have no REST surface); the schema uses
  * the property schemas endpoint. Binding assumption: an existing cover
  * schema implies the binding (the web self-heal authors both together; the
- * v1 migration too) — the binding envelope is written only alongside a
- * schema this call created. No cover class (§34.74 — withdrawn same-day).
+ * migration too) — the binding envelope is written only alongside a
+ * schema this call created. No cover class (withdrawn same-day).
  */
 async function ensureCoverProperty(ctx: CommandContext): Promise<void> {
   const { classes } = await ctx.client.getJson<{ classes: Array<{ id: string }> }>(
@@ -1360,7 +1360,7 @@ async function deleteProperty(
   );
 }
 
-// --- property schema verbs (§34.32 PG7) ------------------------------------------
+// --- property schema verbs -----------------------------------------------------
 
 const PROPERTY_TYPES = [
   "text",
@@ -1557,10 +1557,10 @@ async function propertyUnbind(ctx: CommandContext, classRef: string, schemaRef: 
  * converge on the same ids). Seeded workspaces already carry the
  * bibliographic schemas, so the create path only fires for unseeded ones.
  *
- * M1 drift note (no migration): workspaces seeded during the brief
+ * Drift note (no migration): workspaces seeded during the brief
  * 2026-09-27 text-authors window carry `authors` as text-multi from that
  * seed spec. The fixed UUID matches, so this get-or-create is a no-op
- * there and the stored row keeps its old type (throwaway M1 data).
+ * there and the stored row keeps its old type (throwaway data).
  */
 async function ensurePropertySchema(ctx: CommandContext, name: SystemPropertyName): Promise<void> {
   const propertySchemaId = SYSTEM_PROPERTY_UUIDS[name];
@@ -1642,7 +1642,7 @@ async function importBibtex(ctx: CommandContext, filePath: string): Promise<void
   );
 }
 
-/** M1 person match: exact display name via the objects?q= title search. */
+/** Person match: exact display name via the objects?q= title search. */
 async function findPersonByName(ctx: CommandContext, literal: string): Promise<string | undefined> {
   const query = queryString({ q: literal });
   const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/objects${query}`);
@@ -1654,7 +1654,7 @@ async function findPersonByName(ctx: CommandContext, literal: string): Promise<s
   )?.id;
 }
 
-/** Local midnight ISO (the CLI is a local client — never UTC, §34.28 #1). */
+/** Local midnight ISO (the CLI is a local client — never UTC). */
 function todayIsoLocal(): string {
   const now = new Date();
   const y = now.getFullYear();
@@ -1697,7 +1697,7 @@ async function ensureYearNode(ctx: CommandContext, yearId: string, label: string
   await ensureChainNode(ctx, yearId, label, SYSTEM_CLASS_UUIDS.year, null);
 }
 
-/** §34.28 #13 — `notees today`: ensure the local date chain + the day page,
+/** `notees today`: ensure the local date chain + the day page,
  *  print the day object; --append adds a text block to it. */
 async function today(ctx: CommandContext, options: { append?: string }): Promise<void> {
   const iso = todayIsoLocal();
@@ -1716,7 +1716,7 @@ async function today(ctx: CommandContext, options: { append?: string }): Promise
   emit(ctx, `${JSON.stringify(day, null, 2)}\n`, day);
 }
 
-/** §34.28 #13 — `notees journal`: daily notes, newest first. */
+/** `notees journal`: daily notes, newest first. */
 async function journal(ctx: CommandContext, options: { limit: string }): Promise<void> {
   const limit = Number.parseInt(options.limit, 10);
   const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(
@@ -1802,7 +1802,7 @@ async function upsertSourceByCitekey(
   if (spec.url !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.url, spec.url);
   if (spec.publisher !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.publisher, spec.publisher);
   if (spec.publicationDate !== undefined) {
-    // Date-chain ref, not a bare string (§34.28 #19): the year node
+    // Date-chain ref, not a bare string: the year node
     // backlinks everything dated that year. The year node's id is
     // content-addressed (deterministic), so ensure-then-link is idempotent.
     const year = yearFromDate(spec.publicationDate);
@@ -1847,7 +1847,7 @@ async function exportBibtex(ctx: CommandContext, options: {
   // The `authors` property is node-typed ({nodeId} refs, agent-filtered) —
   // resolve every referenced author to its current display name up front,
   // batched through the objects API (the resolver caches per id). Date-node
-  // refs (publicationDate, §34.28 #19) resolve through the same batch.
+  // refs (publicationDate) resolve through the same batch.
   const authorIds = new Set<string>();
   const dateRefIds = new Set<string>();
   for (const node of included.values()) {
@@ -2042,7 +2042,7 @@ function buildProgram(): Command {
   const program = new Command();
   program
     .name("notees")
-    .description("Notees v2 CLI")
+    .description("Notees CLI")
     .version(CLI_VERSION)
     .option("--json", "stable machine-readable output")
     .option("--server <url>", "server base URL (env NOTEES_SERVER)")
@@ -2135,7 +2135,7 @@ function buildProgram(): Command {
       await coverClear(ctxOf(command), nodeId);
     });
 
-  const schemaCmd = program.command("property").description("property schema operations (§34.32 PG7)");
+  const schemaCmd = program.command("property").description("property schema operations");
   schemaCmd
     .command("list")
     .description("list property schemas")

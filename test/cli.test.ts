@@ -542,7 +542,7 @@ describe("export markdown", () => {
 
   it("--fixpoint expands until no new pages are found", async () => {
     const h = harness;
-    // NB: a true mention cycle cannot be authored through the M1 CLI (object
+    // NB: a true mention cycle cannot be authored through the CLI (object
     // update carries no content flag and ids are server-generated), so the
     // fixpoint path is exercised with a referrer chain instead.
     const a = await h.createPage("expm-fp-a", []);
@@ -606,7 +606,7 @@ describe("bibliography round-trip (bibtex)", () => {
     expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publisher)?.value).toBe(
       "University of Chicago Press",
     );
-    // publicationDate is a date-chain ref since §34.28 #19: a {nodeId} link
+    // publicationDate is a date-chain ref: a {nodeId} link
     // to the content-addressed year node, which backlinks everything dated
     // that year.
     const pubRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value as {
@@ -950,7 +950,7 @@ describe("search (query language)", () => {
   });
 });
 
-describe("daily notes (§34.28 #13)", () => {
+describe("daily notes", () => {
   it("today ensures the local date chain + day page; --append blocks; journal lists newest first", async () => {
     const h = harness;
     expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
@@ -976,7 +976,7 @@ describe("daily notes (§34.28 #13)", () => {
   });
 });
 
-describe("property schema verbs (§34.32 PG7)", () => {
+describe("property schema verbs", () => {
   it("create → list → get → rename → bind → unbind → delete", async () => {
     const h = harness;
 
@@ -1736,7 +1736,7 @@ describe("export markdown --class", () => {
   });
 });
 
-describe("export json (§34.59 JSON archive)", () => {
+describe("export json", () => {
   interface ArchiveNode {
     id: string;
     isClass: boolean;
@@ -1864,7 +1864,7 @@ describe("object get --ids and create --icon/--color", () => {
     // Preset token rides the wire as-is.
     expect(await h.runCli("--json", "object", "update", id, "--color", "sky")).toBe(EXIT.ok);
     expect((JSON.parse(h.io.stdoutText).object as { color: string | null }).color).toBe("sky");
-    // 'none' clears (object.update color: null — §34.43 grammar).
+    // 'none' clears (object.update color: null).
     expect(await h.runCli("--json", "object", "update", id, "--color", "none")).toBe(EXIT.ok);
     expect((JSON.parse(h.io.stdoutText).object as { color: string | null }).color).toBeNull();
     // Garbage is rejected server-side (strict color grammar) — 422 → domain exit.

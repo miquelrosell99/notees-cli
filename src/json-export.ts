@@ -1,6 +1,6 @@
 /**
- * Shared JSON-archive export machinery (§34.24 parked row "JSON archive",
- * 2026-10-04): seeds + closure + position-ordered child ids → the
+ * Shared JSON-archive export machinery (2026-10-04): seeds + closure +
+ * position-ordered child ids → the
  * `notees-json-archive` envelope via @notees/export. Used by
  * `notees export json`; mirrors markdown-export.ts's selection/resolver
  * reuse so both exporters collect the same node set for identical
