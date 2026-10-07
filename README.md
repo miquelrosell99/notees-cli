@@ -50,7 +50,7 @@ Requirements: bash, curl, node ≥ 22. The bundle is standalone — no pnpm tool
 **On Arch (pacman):** `packaging/arch/PKGBUILD` builds an installable package from the same release assets — checksum-verified by pacman itself:
 
 ```bash
-git clone --depth 1 --branch v3.2.2 https://github.com/miquelrosell99/notees-cli.git
+git clone --depth 1 --branch v3.2.3 https://github.com/miquelrosell99/notees-cli.git
 cd notees-cli/packaging/arch
 makepkg -si        # installs notees-cli + its nodejs>=22 dependency
 ```

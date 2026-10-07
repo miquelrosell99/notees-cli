@@ -8,6 +8,13 @@ history.
 
 ## 2026-10-07
 
+- **fix(release): the pacman package installs the bundle executable.**
+  `install -Dm644` in the PKGBUILD left `/usr/lib/notees-cli/cli.mjs`
+  non-executable; `/usr/bin/notees` symlinks straight at it, so the packaged
+  CLI died with "Permission denied" (exit 126) — caught by the new
+  `pacman-smoke` job on the v3.2.2 tag (its release assets are unaffected;
+  install.sh there works fine). Fixed mode 0755. Per the never-re-tag law
+  the correction rides the next patch tag, v3.2.3.
 - **feat(release): pacman packaging — `packaging/arch/PKGBUILD` + release.yml
   checksum gate + Arch smoke job.** Every tag now also feeds a pacman
   package: the PKGBUILD builds from the tag's release assets (`cli.mjs` +
