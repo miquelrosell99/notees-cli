@@ -10,6 +10,8 @@ The CLI talks to a running `notees-sync` server over HTTP. It holds no state of 
 notees-cli/
 ├── src/                 # the CLI (commander; `notees` bin)
 ├── test/                # vitest suite (boots a real server from @notees/server)
+├── scripts/install.sh   # release-bundle installer (curl | bash)
+├── packaging/arch/      # PKGBUILD for pacman (Arch; built from the release assets)
 ├── vendor/notees/       # git submodule → miquelrosell99/notees (pinned commit)
 └── pnpm-workspace.yaml  # consumes @notees/* from the submodule checkout
 ```
@@ -44,6 +46,16 @@ curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/main/scri
 ```
 
 Requirements: bash, curl, node ≥ 22. The bundle is standalone — no pnpm toolchain, no `vendor/` checkout. Installing from source (above) is the other supported path; there is no npm or docker distribution.
+
+**On Arch (pacman):** `packaging/arch/PKGBUILD` builds an installable package from the same release assets — checksum-verified by pacman itself:
+
+```bash
+git clone --depth 1 --branch v3.2.2 https://github.com/miquelrosell99/notees-cli.git
+cd notees-cli/packaging/arch
+makepkg -si        # installs notees-cli + its nodejs>=22 dependency
+```
+
+Every tag's `pacman-smoke` CI job build-installs this exact PKGBUILD on Arch before the release is trusted. AUR publication is deliberately deferred — the in-repo PKGBUILD is the supported way to build the package.
 
 ## Syncing the vendored packages
 

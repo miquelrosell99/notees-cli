@@ -8,6 +8,28 @@ history.
 
 ## 2026-10-07
 
+- **feat(release): pacman packaging — `packaging/arch/PKGBUILD` + release.yml
+  checksum gate + Arch smoke job.** Every tag now also feeds a pacman
+  package: the PKGBUILD builds from the tag's release assets (`cli.mjs` +
+  sha256 sidecar, LICENSE from the tag; `depends nodejs>=22`; AGPL-3.0-or-later;
+  `/usr/bin/notees → /usr/lib/notees-cli/cli.mjs`). The workflow greps the
+  staged bundle's sha256 into the PKGBUILD before publishing (a stale
+  checksum fails the release), and a `pacman-smoke` job build-installs the
+  package on an `archlinux` container via `makepkg` and runs the packaged
+  binary. AUR publication is deliberately deferred — the in-repo PKGBUILD is
+  the supported build. Docs: README Installing (pacman subsection + layout
+  tree), the operations skill (mechanism + cutting steps), AGENTS.md. The
+  fleet host runs Debian, so this tier targets Arch workstations; install.sh
+  stays the fleet path. Part of v3.2.2, the first tag released through the
+  workflow.
+- **fix(cli): the direct-execution guard follows symlinks.** The
+  `invokedDirectly` check compared `import.meta.url` (resolved realpath)
+  against `argv[1]` as typed, so invoking the CLI through a symlink — what
+  `install.sh` creates (`notees → notees.mjs`) and what the pacman package
+  creates under `/usr/bin` — silently no-opped with exit 0. Both spellings
+  are now compared; `install.sh`'s sanity check requires a version-shaped
+  `--version` output (a bare exit code also passes when the binary no-ops).
+  Found by testing the installed symlink against the live server.
 - **feat(release): tags carry an installable bundle — `release.yml` workflow
   + `scripts/install.sh`.** A `v*` tag push now builds `dist/cli.js` in CI
   (vendored build + typecheck + test + bundle, mirroring the release gate)

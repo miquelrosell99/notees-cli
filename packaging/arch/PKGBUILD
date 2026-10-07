@@ -1,0 +1,37 @@
+# Maintainer: the notees-cli authors (https://github.com/miquelrosell99/notees-cli)
+#
+# Pacman packaging for the Notees CLI release bundle. Build with:
+#   makepkg -si
+# in this directory (any distro with pacman; on the fleet host the
+# install.sh bundle is the supported path — this host runs Debian).
+#
+# Release bookkeeping (cutting-a-release in the operations skill):
+# pkgver and sha256sums[0] must match the tag's release assets — release.yml
+# refuses to publish a bundle whose checksum is not recorded here, and the
+# pacman-smoke job build-installs this exact PKGBUILD on every tag.
+# AUR publication is deliberately deferred (no account/secret decision); this
+# file is the supported way to build the package yourself.
+
+pkgname=notees-cli
+pkgver=3.2.2
+pkgrel=1
+pkgdesc="The notees command-line client for Notees (object/property/search surface over the server's API)"
+arch=('any')
+url="https://github.com/miquelrosell99/notees-cli"
+license=('AGPL-3.0-or-later')
+depends=('nodejs>=22')
+source=("$url/releases/download/v$pkgver/cli.mjs"
+        "$url/releases/download/v$pkgver/cli.mjs.sha256"
+        "https://raw.githubusercontent.com/miquelrosell99/notees-cli/v$pkgver/LICENSE")
+sha256sums=('ea37e472f8a65bf3f25fa3d7041a18f4cbb2875706e34febd09a76fc695f9f48'
+            'SKIP'
+            'SKIP')
+
+package() {
+  install -Dm644 "$srcdir/cli.mjs" "$pkgdir/usr/lib/$pkgname/cli.mjs"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -dm755 "$pkgdir/usr/bin"
+  # Absolute symlink: node resolves the realpath (.mjs) for module typing, so
+  # the CLI runs as ESM regardless of how the bin was invoked.
+  ln -s "/usr/lib/$pkgname/cli.mjs" "$pkgdir/usr/bin/notees"
+}

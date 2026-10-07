@@ -46,13 +46,18 @@ AGENTS.md
 - `test/` — vitest suite; boots a **real** server from `@notees/server`
   against a temp workspace (`vitest.config.ts` deliberately excludes the
   vendored packages' own suites)
+- `scripts/install.sh` — release-bundle installer (fetches a tag's `cli.mjs`
+  + checksum, links `notees` into `~/.local/bin`)
+- `packaging/arch/` — the pacman PKGBUILD (builds from the release assets;
+  release.yml verifies its checksum and smoke-builds it on Arch)
 - `vendor/notees/` — git submodule → the main repo (pinned commit);
   `pnpm-workspace.yaml` consumes its packages as workspace projects
 - `.github/workflows/ci.yml` — install (`--frozen-lockfile`,
   `submodules: recursive`) + build + test on push/PR;
-  `.github/workflows/release.yml` — on `v*` tags: gate + build, attach the
-  bundle (`cli.mjs` + sha256) to the tag's GitHub Release (consumed by
-  `scripts/install.sh`)
+  `.github/workflows/release.yml` — on `v*` tags: gate + build, check the
+  PKGBUILD checksum, attach the bundle (`cli.mjs` + sha256) to the tag's
+  GitHub Release (consumed by `scripts/install.sh`), and a `pacman-smoke`
+  job that build-installs `packaging/arch/` on Arch and runs `notees`
 
 ## Commands
 

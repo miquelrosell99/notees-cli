@@ -41,6 +41,12 @@ jobs:
           # as .mjs so the standalone artifact keeps its module type.
           cp dist/cli.js cli.mjs
           sha256sum cli.mjs > cli.mjs.sha256
+      - name: Check the PKGBUILD records this bundle's checksum
+        run: |
+          # packaging/arch/PKGBUILD is versioned with static checksums; the
+          # release must not publish a bundle the package would reject. The
+          # build is deterministic, so the tree's sha256sums entry must match.
+          grep -qF "$(sha256sum cli.mjs | cut -d' ' -f1)" packaging/arch/PKGBUILD
       - name: Attach the bundle to the tag's release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,3 +55,27 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes "Notees CLI $GITHUB_REF_NAME. Install: \`curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/$GITHUB_REF_NAME/scripts/install.sh | bash\` (or from source — see the README)." \
             cli.mjs cli.mjs.sha256
+
+  # Build the pacman package from the just-published assets on Arch, install
+  # it, and run the packaged binary — the PKGBUILD is only trustworthy if the
+  # real makepkg/pacman pipeline accepts it. (The checkout action is unusable
+  # here: the archlinux container has no node; the PKGBUILD comes from raw.)
+  pacman-smoke:
+    needs: bundle
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install the pacman toolchain
+        run: pacman -Sy --noconfirm --needed base-devel sudo curl
+      - name: Fetch the PKGBUILD from the tag
+        run: |
+          mkdir -p /tmp/pkg
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/packaging/arch/PKGBUILD" -o /tmp/pkg/PKGBUILD
+      - name: Build and install as an unprivileged user (makepkg refuses root)
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder /tmp/pkg
+          sudo -u builder bash -c 'cd /tmp/pkg && makepkg -si --noconfirm'
+      - name: The packaged binary runs
+        run: notees --version
