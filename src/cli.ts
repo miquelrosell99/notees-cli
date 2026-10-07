@@ -13,7 +13,7 @@
  * exit 2 (never an interactive prompt when --json or non-tty).
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -2715,8 +2715,23 @@ export async function run(argv: string[], io: CliIo = defaultIo): Promise<number
   }
 }
 
-const invokedDirectly =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Direct-execution guard: only run() when this file is the entry. argv[1] is
+// the path as invoked — which may be a symlink (install.sh links
+// `notees -> notees.mjs`, packages link /usr/bin/<name>) while import.meta.url
+// carries the resolved realpath, so compare both spellings; a plain equality
+// check silently no-ops when invoked through a symlink.
+const invokedDirectly = (() => {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  const asGiven = pathToFileURL(entry).href;
+  let resolved = asGiven;
+  try {
+    resolved = pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    // Unresolvable entry: keep the as-given spelling.
+  }
+  return import.meta.url === asGiven || import.meta.url === resolved;
+})();
 if (invokedDirectly) {
   run(process.argv.slice(2))
     .then((code) => {

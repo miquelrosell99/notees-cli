@@ -65,8 +65,14 @@ fi
 chmod 0755 "$INSTALL_DIR/notees.mjs"
 ln -sfn "notees.mjs" "$INSTALL_DIR/notees"
 
-# Sanity: the installed symlink must answer --help through node.
-"$INSTALL_DIR/notees" --help >/dev/null 2>&1 || die "installed binary failed to run — check node >= 22"
+# Sanity: the installed symlink must answer --version with a version string
+# (a bare exit-code check is not enough — a silently no-op'ing binary also
+# exits 0).
+installed_version="$("$INSTALL_DIR/notees" --version 2>/dev/null || true)"
+case "$installed_version" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) die "installed binary failed to run — check node >= 22" ;;
+esac
 
 log "installed notees $VERSION into $INSTALL_DIR (notees -> notees.mjs)"
 log "make sure $INSTALL_DIR is on PATH"
