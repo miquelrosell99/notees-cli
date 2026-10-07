@@ -178,10 +178,36 @@ function buildCreateBody(options: {
   return body;
 }
 
+/**
+ * `--content <json>`: a contentAst token array (mentions, external links,
+ * … — the server is the strict shape gate). The array-ness is validated
+ * client-side so a mistyped scalar fails as usage, not as a wire error.
+ */
+function parseContentAstOption(raw: string | undefined): unknown[] | undefined {
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CliError(EXIT.usage, "--content is not valid JSON");
+  }
+  if (!Array.isArray(parsed)) failUsage("--content expects a JSON array of content tokens (a contentAst)");
+  return parsed;
+}
+
+/** Flag value that must parse as a non-negative integer (undefined passes through). */
+function nonNegativeIntOption(raw: string | undefined, flag: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value < 0) failUsage(`${flag} must be a non-negative integer`);
+  return value;
+}
+
 async function objectCreate(ctx: CommandContext, options: {
   presentAsMain?: boolean;
   isClass?: boolean;
   name?: string;
+  content?: string;
   class?: string[];
   parent?: string;
   stdin?: boolean;
@@ -197,9 +223,15 @@ async function objectCreate(ctx: CommandContext, options: {
       throw new CliError(EXIT.usage, "--stdin body is not valid JSON");
     }
   }
+  // Title-is-content: --name IS single-token content, so a rich --content
+  // array and --name cannot combine (the server would see both shapes).
+  const contentAst = parseContentAstOption(options.content);
+  if (contentAst !== undefined && options.name !== undefined) {
+    failUsage("--name and --content are mutually exclusive (--name becomes one text token; --content carries the whole contentAst)");
+  }
   const created = await ctx.client.postJson<{ id: string; object: unknown }>(
     "/api/objects",
-    { ...body, ...buildCreateBody(options) },
+    { ...body, ...buildCreateBody(options), ...(contentAst !== undefined ? { contentAst } : {}) },
   );
   // icon/color ride a follow-up patch — the object.create op payload carries
   // no appearance fields (object.update does).
@@ -310,18 +342,77 @@ async function objectCreateBatch(ctx: CommandContext, options: {
 /**
  * `notees object children <id>` — direct children in child-position order
  * (both render zones: main children and inline body blocks), wrapping the
- * endpoint the editor's bullet renderer reads.
+ * endpoint the editor's bullet renderer reads. The endpoint returns the full
+ * child list in one response (it is unpaginated server-side), so the
+ * windowing flags slice client-side: `--offset`/`--limit` page the listing,
+ * `--count` prints just the cardinality, and `--fields` projects each row to
+ * the named keys (`id` is always kept). The machine surface reports `total`
+ * (the un-sliced count) alongside the window.
  */
-async function objectChildren(ctx: CommandContext, id: string): Promise<void> {
+async function objectChildren(ctx: CommandContext, id: string, options: {
+  limit?: string;
+  offset?: string;
+  count?: boolean;
+  fields?: string;
+}): Promise<void> {
   const body = await ctx.client.getJson<{ children: Array<Record<string, unknown>> }>(
     `/api/objects/${encodeURIComponent(id)}/children`,
   );
-  const rows = body.children.map((child) => [
+  const all = body.children;
+  if (options.count === true) {
+    emit(ctx, `${all.length}\n`, { id, count: all.length });
+    return;
+  }
+  const offset = nonNegativeIntOption(options.offset, "--offset") ?? 0;
+  const limit = nonNegativeIntOption(options.limit, "--limit");
+  let children = all.slice(offset);
+  if (limit !== undefined) children = children.slice(0, limit);
+
+  let fields: string[] | undefined;
+  if (options.fields !== undefined) {
+    const wanted = options.fields.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+    if (wanted.length === 0) failUsage("--fields expects a comma-separated list of keys");
+    fields = wanted;
+    children = children.map((child) => {
+      const projected: Record<string, unknown> = {};
+      for (const name of wanted) {
+        if (name in child) projected[name] = child[name];
+      }
+      if (!("id" in projected) && typeof child.id === "string") projected.id = child.id;
+      return projected;
+    });
+  }
+
+  const machine: Record<string, unknown> = {
+    children,
+    total: all.length,
+    ...(offset > 0 ? { offset } : {}),
+    ...(limit !== undefined ? { limit } : {}),
+  };
+
+  if (fields !== undefined) {
+    const header = fields.includes("id") ? fields : [...fields, "id"];
+    const cell = (value: unknown): string =>
+      value === null || value === undefined ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
+    const rows = children.map((child) => header.map((name) => cell(child[name])));
+    const suffix =
+      offset > 0 || limit !== undefined
+        ? `# showing ${children.length} of ${all.length} children (offset ${offset}${limit !== undefined ? `, limit ${limit}` : ""})\n`
+        : "";
+    emit(ctx, `${formatTable([header.map((name) => name.toUpperCase()), ...rows])}\n${suffix}`, machine);
+    return;
+  }
+
+  const rows = children.map((child) => [
     typeof child.name === "string" && child.name.length > 0 ? child.name : "(untitled)",
     renderKindLabel(child as { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }),
     String(child.id),
   ]);
-  emit(ctx, `${formatTable([["NAME", "KIND", "ID"], ...rows])}\n`, { children: body.children });
+  const suffix =
+    offset > 0 || limit !== undefined
+      ? `# showing ${children.length} of ${all.length} children (offset ${offset}${limit !== undefined ? `, limit ${limit}` : ""})\n`
+      : "";
+  emit(ctx, `${formatTable([["NAME", "KIND", "ID"], ...rows])}\n${suffix}`, machine);
 }
 
 /**
@@ -405,15 +496,21 @@ async function objectUpsert(ctx: CommandContext, options: {
 
 async function objectUpdate(ctx: CommandContext, id: string, options: {
   name?: string;
+  content?: string;
   presentAsMain?: boolean;
   icon?: string;
   color?: string;
 }): Promise<void> {
   const body: Record<string, unknown> = {};
+  const contentAst = parseContentAstOption(options.content);
+  if (contentAst !== undefined && options.name !== undefined) {
+    failUsage("--name and --content are mutually exclusive (--name becomes one text token; --content carries the whole contentAst)");
+  }
   // Title-is-content: --name rewrites the node's text content (its title).
   if (options.name !== undefined) {
     body.contentAst = [{ type: "text", text: options.name }];
   }
+  if (contentAst !== undefined) body.contentAst = contentAst;
   // Promotion/demotion: flip the render bit between the parent's
   // main-children zone (true) and the inline body (false).
   if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
@@ -423,7 +520,7 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
     body.color = options.color.toLowerCase() === "none" ? null : options.color;
   }
   if (Object.keys(body).length === 0) {
-    failUsage("object update requires at least one of --name, --presentAsMain, --icon, --color");
+    failUsage("object update requires at least one of --name, --content, --presentAsMain, --icon, --color");
   }
   const updated = await ctx.client.patchJson<{ object: unknown }>(
     `/api/objects/${encodeURIComponent(id)}`,
@@ -561,7 +658,9 @@ interface SearchRow {
  * and property-schemas listings, and `linked:` node names via the search
  * endpoint (prefetched — the parser's resolver interface is synchronous). The
  * query compiler is TypeScript, so the compile happens here; execution needs
- * the derived-store runtime, which lives server-side.
+ * the derived-store runtime, which lives server-side. Resolvers also pass
+ * uuids through verbatim (name-or-uuid refs, like the object's own --class
+ * filter), so scripts can query by id without knowing display names.
  */
 async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<QueryAst> {
   const [{ classes }, { propertySchemas }] = await Promise.all([
@@ -573,10 +672,11 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
 
   // linked:<name> resolution: the resolver endpoint (the
   // /api/search prefetch kludge it replaced could rank the match away).
+  // Uuid refs resolve by passthrough — no name lookup needed (or possible).
   const nodeIds = new Map<string, string>();
   for (const name of extractLinkedNames(text)) {
     const wanted = name.toLowerCase();
-    if (nodeIds.has(wanted)) continue;
+    if (nodeIds.has(wanted) || CLASS_UUID_PATTERN.test(name)) continue;
     const body = await ctx.client.getJson<{ id: string } | { error: string }>(
       `/api/resolve${queryString({ name })}`,
     );
@@ -586,9 +686,10 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
   try {
     return parseQueryLanguage(text, {
       resolvers: {
-        resolveClass: (name) => classIds.get(name.toLowerCase()),
-        resolvePropertySchema: (name) => schemaIds.get(name.toLowerCase()),
-        resolveNode: (name) => nodeIds.get(name.toLowerCase()),
+        resolveClass: (name) => classIds.get(name.toLowerCase()) ?? (CLASS_UUID_PATTERN.test(name) ? name : undefined),
+        resolvePropertySchema: (name) =>
+          schemaIds.get(name.toLowerCase()) ?? (PROPERTY_UUID_PATTERN.test(name) ? name : undefined),
+        resolveNode: (name) => nodeIds.get(name.toLowerCase()) ?? (CLASS_UUID_PATTERN.test(name) ? name : undefined),
       },
       knownFields: propertySchemas.map((schema) => schema.name),
     });
@@ -622,25 +723,54 @@ async function classList(ctx: CommandContext): Promise<void> {
 }
 
 /**
+ * Membership listing behind remap/empty/delete-members. Without a parent
+ * scope it is the class detail's member list; `--parent` re-queries through
+ * the objects endpoint (class × parent filter, cursor-followed) because the
+ * class detail payload carries no parent ids. Both read the same derived
+ * projection (present OR-Set rows, active nodes).
+ */
+async function classMembers(ctx: CommandContext, classId: string, parentId?: string): Promise<Array<{ id: string }>> {
+  if (parentId === undefined) {
+    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
+      `/api/classes/${encodeURIComponent(classId)}`,
+    );
+    return detail.members;
+  }
+  const members: Array<{ id: string }> = [];
+  let cursor: string | undefined;
+  do {
+    const page = await ctx.client.getJson<{ objects: Array<{ id: string }>; nextCursor?: string | null }>(
+      `/api/objects${queryString({ class: classId, parent: parentId, limit: 500, cursor })}`,
+    );
+    members.push(...page.objects);
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  return members;
+}
+
+/**
  * `notees class remap <from> <to>` — the bulk membership migration verb: move
  * every member of FROM to TO (assign + unassign, idempotent ops), remap
  * extends edges pointing at FROM onto TO, leave the emptied FROM class in
  * place (deletion is a separate, deliberate step). Preview-first like the
  * destructive commands: without --yes it prints the blast radius and exits 2;
- * --dry-run prints it and exits 0.
+ * --dry-run prints it and exits 0. `--parent` scopes the move to members whose
+ * direct parent is the given node (direct-children scope — subtree-wide
+ * scoping rides the query language); `--jobs` parallelizes the per-member
+ * moves (membership is an OR-Set, so moves are order-free).
  */
 async function classRemap(
   ctx: CommandContext,
   fromRef: string,
   toRef: string,
-  options: { dryRun?: boolean; yes?: boolean },
+  options: { dryRun?: boolean; yes?: boolean; parent?: string; jobs?: string },
 ): Promise<void> {
   const from = await resolveClassRef(ctx, fromRef);
   const to = await resolveClassRef(ctx, toRef);
   if (from.id === to.id) failUsage("class remap: from and to are the same class");
-  const fromDetail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
-    `/api/classes/${encodeURIComponent(from.id)}`,
-  );
+  const jobs = Number.parseInt(options.jobs ?? "8", 10);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32) failUsage("--jobs must be an integer between 1 and 32");
+  const members = await classMembers(ctx, from.id, options.parent);
   const { classes } = await ctx.client.getJson<{
     classes: Array<{ id: string; parentClassIds: string[] }>;
   }>("/api/classes");
@@ -649,10 +779,12 @@ async function classRemap(
   const plan = {
     from: { id: from.id, name: from.name },
     to: { id: to.id, name: to.name },
-    members: fromDetail.members.length,
+    ...(options.parent !== undefined ? { parent: options.parent } : {}),
+    members: members.length,
     extenders: extenders.length,
   };
-  const preview = `${plan.members} members of "${from.name}" → "${to.name}", ${plan.extenders} extends edges remapped (the emptied class stays)`;
+  const scope = options.parent !== undefined ? ` (under parent ${options.parent})` : "";
+  const preview = `${plan.members} members of "${from.name}"${scope} → "${to.name}", ${plan.extenders} extends edges remapped (the emptied class stays)`;
   if (options.dryRun === true) {
     emit(ctx, `dry run: ${preview}\n`, { ...plan, dryRun: true });
     return;
@@ -663,17 +795,22 @@ async function classRemap(
   }
   let moved = 0;
   const failures: Array<{ id: string; error: string }> = [];
-  for (const member of fromDetail.members) {
-    try {
-      await ctx.client.putJson(`/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(to.id)}`);
-      await ctx.client.deleteJson(
-        `/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(from.id)}`,
-      );
-      moved += 1;
-    } catch (error) {
-      failures.push({ id: member.id, error: error instanceof Error ? error.message : String(error) });
-    }
-  }
+  const queue = members.map((member) => member.id);
+  await Promise.all(
+    Array.from({ length: Math.min(jobs, queue.length) }, async () => {
+      for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+        try {
+          await ctx.client.putJson(`/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(to.id)}`);
+          await ctx.client.deleteJson(
+            `/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(from.id)}`,
+          );
+          moved += 1;
+        } catch (error) {
+          failures.push({ id, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    }),
+  );
   // Extends remap rides the op log — there is deliberately no REST surface
   // for setExtends (configuration write; scripts use the same envelope path
   // as every other client).
@@ -782,17 +919,21 @@ async function classBulkMembers(
   ctx: CommandContext,
   classRef: string,
   action: "unassign" | "trash",
-  options: { dryRun?: boolean; yes?: boolean },
+  options: { dryRun?: boolean; yes?: boolean; parent?: string },
 ): Promise<void> {
   const klass = await resolveClassRef(ctx, classRef);
-  const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
-    `/api/classes/${encodeURIComponent(klass.id)}`,
-  );
-  const plan = { class: { id: klass.id, name: klass.name }, members: detail.members.length, action };
+  const members = await classMembers(ctx, klass.id, options.parent);
+  const plan = {
+    class: { id: klass.id, name: klass.name },
+    ...(options.parent !== undefined ? { parent: options.parent } : {}),
+    members: members.length,
+    action,
+  };
+  const scope = options.parent !== undefined ? ` under parent ${options.parent}` : "";
   const preview =
     action === "unassign"
-      ? `unassign ${plan.members} members from "${klass.name}" (the nodes stay, only the membership goes)`
-      : `trash ${plan.members} member nodes of "${klass.name}" (recoverable from the trash)`;
+      ? `unassign ${plan.members} members from "${klass.name}"${scope} (the nodes stay, only the membership goes)`
+      : `trash ${plan.members} member nodes of "${klass.name}"${scope} (recoverable from the trash)`;
   if (options.dryRun === true) {
     emit(ctx, `dry run: ${preview}\n`, { ...plan, dryRun: true });
     return;
@@ -803,7 +944,7 @@ async function classBulkMembers(
   }
   let done = 0;
   const failures: Array<{ id: string; error: string }> = [];
-  for (const member of detail.members) {
+  for (const member of members) {
     try {
       if (action === "unassign") {
         await ctx.client.deleteJson(
@@ -2075,6 +2216,10 @@ function buildProgram(): Command {
       undefined,
     )
     .option("--name <name>", "object name")
+    .option(
+      "--content <json>",
+      "contentAst token array for rich content (mentions, external links, …; mutually exclusive with --name)",
+    )
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "parent object id")
     .option("--icon <icon>", "icon (applied via a follow-up update — see object.update)")
@@ -2100,7 +2245,10 @@ function buildProgram(): Command {
   const property = object.command("property").description("typed property operations");
   property
     .command("set <id> <schema> <value>")
-    .description("set a property value (schema: uuid or name; value parses as JSON when possible, else string)", )
+    .description(
+      "set a property value (schema: uuid or name; value parses as JSON when possible, else string; " +
+        "text values may be a string or a {\"nodeId\":\"…\"} carrier-block ref)",
+    )
     .option("--idx <n>", "slot index for multi-valued schemas", "0")
     .action(async (id: string, schema: string, value: string, options: { idx?: string }, command: Command) => {
       await objectPropertySet(ctxOf(command), id, schema, value, options);
@@ -2199,9 +2347,16 @@ function buildProgram(): Command {
     });
   object
     .command("children <id>")
-    .description("list an object's children in child-position order (main children and inline blocks)")
-    .action(async (id: string, _options: object, command: Command) => {
-      await objectChildren(ctxOf(command), id);
+    .description(
+      "list an object's children in child-position order (main children and inline blocks; " +
+        "the endpoint is unpaginated — --offset/--limit window client-side, --count prints just the number, --fields projects rows)",
+    )
+    .option("--offset <n>", "skip the first n children", undefined)
+    .option("--limit <n>", "return at most n children", undefined)
+    .option("--count", "print only the child count", false)
+    .option("--fields <a,b,c>", "project each row to these keys (id is always kept)", undefined)
+    .action(async (id: string, options: { offset?: string; limit?: string; count?: boolean; fields?: string }, command: Command) => {
+      await objectChildren(ctxOf(command), id, options);
     });
   object
     .command("upsert")
@@ -2220,6 +2375,10 @@ function buildProgram(): Command {
     .command("update <id>")
     .description("update an object")
     .option("--name <name>", "new name")
+    .option(
+      "--content <json>",
+      "replace the node's content with this contentAst token array (mentions, external links, …; mutually exclusive with --name)",
+    )
     .addOption(
       new Option("--presentAsMain", "promote: render the node in its parent's main-children zone").default(
         undefined,
@@ -2268,9 +2427,9 @@ function buildProgram(): Command {
   program
     .command("search <query>")
     .description(
-      "search — plain text (FTS) or the query language: class:Name, isClass:true|false, presentAsMain:true|false, " +
-        "prop:name:<op>value (:= != :> :>= :< :<=, bare : = contains, no value = exists), " +
-        "bare schema fields (year:>2010), text:term, linked:Name, \"quoted phrases\", AND OR NOT, ( )",
+      "search — plain text (FTS) or the query language: class:Name (name or uuid), isClass:true|false, presentAsMain:true|false, " +
+        "prop:name:<op>value (:= != :> :>= :< :<=, bare : = contains, no value = exists; schema by name or uuid), " +
+        "bare schema fields (year:>2010), text:term, linked:Name (name or uuid), \"quoted phrases\", AND OR NOT, ( )",
     )
     .addOption(new Option("--isClass", "filter: class nodes only (plain-text search only)").default(undefined))
     .addOption(new Option("--no-isClass", "filter: non-class nodes only (plain-text search only)"))
@@ -2323,28 +2482,32 @@ function buildProgram(): Command {
     .command("remap <from> <to>")
     .description(
       "move every member of a class to another class and remap extends edges (from/to: uuid or title; " +
-        "the emptied class stays; requires --yes, preview without it, --dry-run to inspect)",
+        "the emptied class stays; --parent scopes to members under one parent; requires --yes, preview without it, --dry-run to inspect)",
     )
     .option("--dry-run", "print what would move and exit 0 without writing", false)
     .option("--yes", "confirm the bulk remap", false)
-    .action(async (fromRef: string, toRef: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
+    .option("--parent <id>", "scope: only members whose direct parent is this object id", undefined)
+    .option("--jobs <n>", "member-move concurrency 1–32 (default 8; membership is order-free)", "8")
+    .action(async (fromRef: string, toRef: string, options: { dryRun?: boolean; yes?: boolean; parent?: string; jobs?: string }, command: Command) => {
       await classRemap(ctxOf(command), fromRef, toRef, options);
     });
   klass
     .command("empty <class>")
-    .description("unassign every member of a class (the nodes stay; class: uuid or title; idempotent)")
-    .action(async (classRef: string, _options: object, command: Command) => {
-      await classBulkMembers(ctxOf(command), classRef, "unassign", {});
+    .description("unassign every member of a class (the nodes stay; class: uuid or title; --parent scopes to one parent's members; idempotent)")
+    .option("--parent <id>", "scope: only members whose direct parent is this object id", undefined)
+    .action(async (classRef: string, options: { parent?: string }, command: Command) => {
+      await classBulkMembers(ctxOf(command), classRef, "unassign", options);
     });
   klass
     .command("delete-members <class>")
     .description(
-      "trash every member node of a class (recoverable from the trash; class: uuid or title; " +
+      "trash every member node of a class (recoverable from the trash; class: uuid or title; --parent scopes to one parent's members; " +
         "requires --yes, preview without it, --dry-run to inspect)",
     )
     .option("--dry-run", "print what would be trashed and exit 0 without writing", false)
     .option("--yes", "confirm the bulk trash", false)
-    .action(async (classRef: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
+    .option("--parent <id>", "scope: only members whose direct parent is this object id", undefined)
+    .action(async (classRef: string, options: { dryRun?: boolean; yes?: boolean; parent?: string }, command: Command) => {
       await classBulkMembers(ctxOf(command), classRef, "trash", options);
     });
 
@@ -2417,11 +2580,17 @@ function buildProgram(): Command {
     });
 
   program
-    .command("shell")
-    .description("interactive object-API shell (Node REPL with helpers; piped stdin runs as a script)")
-    .action(async (_options: object, command: Command) => {
+    .command("shell [script]")
+    .description("interactive object-API shell (Node REPL with helpers; a script file argument or piped stdin runs as a one-shot script)")
+    .action(async (script: string | undefined, _options: object, command: Command) => {
       const ctx = ctxOf(command);
-      await runShell({ client: ctx.client, io: ctx.io, json: ctx.opts.json === true, stdin: ctx.io.stdin });
+      await runShell({
+        client: ctx.client,
+        io: ctx.io,
+        json: ctx.opts.json === true,
+        stdin: ctx.io.stdin,
+        ...(script !== undefined ? { scriptFile: script } : {}),
+      });
     });
 
   const exportCmd = program.command("export").description("export operations");

@@ -2008,3 +2008,216 @@ describe("property number formats", () => {
     expect(await h.runCli("property", "create", "bad-dec", "--type", "number", "--decimals", "42")).toBe(EXIT.usage);
   });
 });
+
+
+describe("object create/update --content", () => {
+  it("create --content stores a rich contentAst (mention + external link tokens)", async () => {
+    const h = harness;
+    const target = await h.createPage("content-target", []);
+    const holder = await h.createPage("content-holder", []);
+    // Rich tokens survive on parented blocks; a root's content flattens to
+    // text-only by the page/class invariant.
+    const ast = JSON.stringify([
+      { type: "text", text: "See " },
+      { type: "mention", targetNodeId: target, text: "content-target" },
+      { type: "external_link", href: "https://example.com", text: "the example" },
+    ]);
+    expect(await h.runCli("--json", "object", "create", "--parent", holder, "--content", ast)).toBe(EXIT.ok);
+    const id = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    expect(await h.runCli("--json", "object", "get", id)).toBe(EXIT.ok);
+    const got = JSON.parse(h.io.stdoutText).object as { contentAst: Array<Record<string, unknown>> };
+    expect(got.contentAst).toEqual([
+      { type: "text", text: "See " },
+      { type: "mention", targetNodeId: target, text: "content-target" },
+      { type: "external_link", href: "https://example.com", text: "the example" },
+    ]);
+  });
+
+  it("update --content replaces the content; --name and --content conflict (exit 2)", async () => {
+    const h = harness;
+    const page = await h.createPage("content-update-probe", []);
+    const ast = JSON.stringify([{ type: "text", text: "rewritten" }]);
+    expect(await h.runCli("--json", "object", "update", page, "--content", ast)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).object as { contentAst: unknown[] }).contentAst).toEqual([
+      { type: "text", text: "rewritten" },
+    ]);
+
+    // Both flags write the same field — the combination is a usage error.
+    expect(await h.runCli("object", "update", page, "--name", "x", "--content", ast)).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("mutually exclusive");
+    expect(await h.runCli("object", "create", "--name", "x", "--content", ast)).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("mutually exclusive");
+
+    // Non-array content and unparseable JSON fail as usage, not wire errors.
+    expect(await h.runCli("object", "create", "--content", '{"type":"text"}')).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("JSON array");
+    expect(await h.runCli("object", "create", "--content", "not json")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("not valid JSON");
+  });
+});
+
+describe("object children windowing", () => {
+  it("--count, --offset/--limit windowing with totals, and --fields projection", async () => {
+    const h = harness;
+    const parent = await h.createPage("children-window-probe", []);
+    const ids: string[] = [];
+    for (const name of ["cw-1", "cw-2", "cw-3", "cw-4", "cw-5"]) {
+      expect(await h.runCli("object", "create", "--name", name, "--parent", parent)).toBe(EXIT.ok);
+      ids.push(h.io.stdoutText.trim());
+    }
+
+    expect(await h.runCli("--json", "object", "children", parent, "--count")).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText)).toEqual({ id: parent, count: 5 });
+
+    expect(await h.runCli("--json", "object", "children", parent, "--offset", "1", "--limit", "2")).toBe(EXIT.ok);
+    const window = JSON.parse(h.io.stdoutText) as {
+      children: Array<{ id: string }>;
+      total: number;
+      offset: number;
+      limit: number;
+    };
+    expect(window.children.map((c) => c.id)).toEqual([ids[1], ids[2]]);
+    expect(window.total).toBe(5);
+    expect(window.offset).toBe(1);
+    expect(window.limit).toBe(2);
+
+    // Human mode notes the window; --fields projects rows (id always kept).
+    expect(await h.runCli("object", "children", parent, "--limit", "2")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("showing 2 of 5 children");
+
+    expect(await h.runCli("--json", "object", "children", parent, "--fields", "name")).toBe(EXIT.ok);
+    const projected = JSON.parse(h.io.stdoutText).children as Array<Record<string, unknown>>;
+    expect(projected[0]).toEqual({ name: "cw-1", id: ids[0] });
+    expect(projected[0]!.contentAst).toBeUndefined();
+
+    // Bad window values fail loud.
+    expect(await h.runCli("object", "children", parent, "--offset", "-1")).toBe(EXIT.usage);
+    expect(await h.runCli("object", "children", parent, "--limit", "nope")).toBe(EXIT.usage);
+  });
+});
+
+describe("class remap --parent", () => {
+  it("scopes the move to members under one parent; --jobs stays correct", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "scoped-from")).toBe(EXIT.ok);
+    const fromId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "scoped-to")).toBe(EXIT.ok);
+    const toId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const parentA = await h.createPage("scoped-parent-a", []);
+    const parentB = await h.createPage("scoped-parent-b", []);
+    for (const [parent, name] of [
+      [parentA, "scoped-a1"],
+      [parentA, "scoped-a2"],
+      [parentB, "scoped-b1"],
+    ] as const) {
+      expect(await h.runCli("object", "create", "--name", name, "--parent", parent, "--class", fromId)).toBe(EXIT.ok);
+    }
+
+    // Preview counts only the scoped members.
+    expect(await h.runCli("class", "remap", "scoped-from", "scoped-to", "--parent", parentA)).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("2 members");
+    expect(h.io.stderrText).toContain(parentA);
+
+    expect(await h.runCli("--json", "class", "remap", "scoped-from", "scoped-to", "--parent", parentA, "--yes", "--jobs", "4")).toBe(
+      EXIT.ok,
+    );
+    const machine = JSON.parse(h.io.stdoutText) as { moved: number; parent: string; failures: unknown[] };
+    expect(machine.moved).toBe(2);
+    expect(machine.parent).toBe(parentA);
+    expect(machine.failures).toEqual([]);
+
+    // Under parent A the membership moved; parent B's member stays put.
+    expect(await h.runCli("--json", "object", "list", "--parent", parentA)).toBe(EXIT.ok);
+    const aClasses = (JSON.parse(h.io.stdoutText).objects as Array<{ classIds: string[] }>).flatMap((o) => o.classIds);
+    expect(aClasses).toContain(toId);
+    expect(aClasses).not.toContain(fromId);
+    expect(await h.runCli("--json", "object", "list", "--parent", parentB)).toBe(EXIT.ok);
+    const bClasses = (JSON.parse(h.io.stdoutText).objects as Array<{ classIds: string[] }>).flatMap((o) => o.classIds);
+    expect(bClasses).toContain(fromId);
+    expect(bClasses).not.toContain(toId);
+
+    // --jobs out of range fails loud.
+    expect(await h.runCli("class", "remap", "scoped-from", "scoped-to", "--yes", "--jobs", "64")).toBe(EXIT.usage);
+  });
+});
+
+describe("class empty --parent", () => {
+  it("unassigns only the members under one parent", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "empty-scoped")).toBe(EXIT.ok);
+    const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const parentA = await h.createPage("empty-parent-a", []);
+    const parentB = await h.createPage("empty-parent-b", []);
+    expect(await h.runCli("object", "create", "--name", "es-a1", "--parent", parentA, "--class", klassId)).toBe(EXIT.ok);
+    expect(await h.runCli("object", "create", "--name", "es-b1", "--parent", parentB, "--class", klassId)).toBe(EXIT.ok);
+    const bId = h.io.stdoutText.trim();
+
+    expect(await h.runCli("--json", "class", "empty", "empty-scoped", "--parent", parentA)).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { done: number; parent: string };
+    expect(machine.done).toBe(1);
+    expect(machine.parent).toBe(parentA);
+
+    // The scoped membership is gone; the other parent's member keeps it.
+    expect(await h.runCli("--json", "object", "get", bId)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.classIds as string[]).toContain(klassId);
+  });
+});
+
+describe("search by uuid", () => {
+  it("class:/prop:/linked: accept uuids verbatim, no name resolution needed", async () => {
+    const h = harness;
+    // Seeded system classes carry fixed uuids — query one by id.
+    const paperId = SYSTEM_CLASS_UUIDS.paper;
+    expect(await h.runCli("--json", "search", `class:${paperId}`)).toBe(EXIT.ok);
+    const byClassId = JSON.parse(h.io.stdoutText).ids as string[];
+    expect(byClassId.length).toBeGreaterThan(0);
+
+    // Schema by uuid: the description system property exists on every row
+    // only when set — assert the query compiles and runs, not the count.
+    expect(
+      await h.runCli("--json", "search", `class:${paperId} AND prop:${SYSTEM_PROPERTY_UUIDS.description}:=x`),
+    ).toBe(EXIT.ok);
+
+    // linked:<uuid> matches the referring block without a name lookup (the
+    // mention rides on a child block, like every rich-content block).
+    const target = await h.createPage("uuid-link-target", []);
+    const notes = await h.createPage("uuid-link-notes", []);
+    expect(
+      await h.runCliWithStdin(
+        JSON.stringify({
+          presentAsMain: false,
+          parentId: notes,
+          contentAst: [{ type: "mention", targetNodeId: target, text: "uuid-link-target" }],
+        }),
+        "--json", "object", "create", "--stdin",
+      ),
+    ).toBe(EXIT.ok);
+    const notesBlock = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(await h.runCli("--json", "search", `linked:${target}`)).toBe(EXIT.ok);
+    const referrers = JSON.parse(h.io.stdoutText).ids as string[];
+    expect(referrers).toContain(notesBlock);
+  });
+});
+
+describe("shell script file", () => {
+  it("runs a script file argument (exit 0); a missing file is a usage error", async () => {
+    const h = harness;
+    const scriptPath = join(h.dataDir, "shell-probe.js");
+    writeFileSync(
+      scriptPath,
+      'const page = await create({ presentAsMain: true, contentAst: [{ type: "text", text: "from-file" }] });\n'
+        + 'console.log("made " + page.id);\n',
+    );
+    expect(await h.runCli("shell", scriptPath)).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("made ");
+    const made = /made ([0-9a-f-]{36})/.exec(h.io.stdoutText);
+    expect(made).not.toBeNull();
+    expect(await h.runCli("--json", "object", "get", made![1]!)).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).object as { name: string | null }).name).toBe("from-file");
+
+    expect(await h.runCli("shell", join(h.dataDir, "no-such-script.js"))).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("cannot read script");
+  });
+});

@@ -6,6 +6,42 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-07
+
+- **feat: graph-migration ergonomics — scoped bulk class ops, rich-content
+  flags, children windowing, uuid query refs, shell script files.** Grown
+  from a real 468-node migration (the MakerWorld "modelo 3D" → "Web link"
+  class move with the tag preserved as a Description mention): the friction
+  points became first-class surface.
+  - `class remap` gains `--parent <id>` (scope the move to members whose
+    direct parent is the given node — subtree-wide scoping rides the query
+    language) and `--jobs <n>` (member moves run in a concurrency pool,
+    default 8, cap 32; membership is an OR-Set so moves are order-free).
+    `class empty` / `class delete-members` gain the same `--parent` scope.
+    Scoped member lists resolve through the objects endpoint (class × parent
+    filter, cursor-followed) because the class-detail payload carries no
+    parent ids.
+  - `object create` / `object update` gain `--content <json>`: a contentAst
+    token array for rich content (mentions, external links) without dropping
+    into the shell; mutually exclusive with `--name` (name IS single-token
+    content), non-array JSON fails as usage. Note the standing model
+    invariant: root pages/classes carry text-only content — rich tokens on a
+    parentless create flatten server-side (the suite pins this).
+  - `object children` gains client-side windowing over the (unpaginated)
+    endpoint: `--offset`/`--limit` (machine surface reports `total`
+    alongside the window), `--count`, and `--fields a,b,c` projection (`id`
+    always kept).
+  - `search` query language: `class:`, `prop:`, and `linked:` accept uuids
+    verbatim (name-or-uuid refs, like `object list --class`), with the
+    `linked:` uuid prefetch skipped — no name lookup needed or possible.
+  - `notees shell [script]` runs a script file instead of piped stdin (the
+    REPL stays TTY-only); the help header now states the vm has no
+    `require`/`fs` so ids are fed inline or via a file.
+  - `object property set` help documents the `{"nodeId":"…"}` carrier-block
+    ref shape for text values (the shape the graph actually stores).
+  - Verification: `pnpm typecheck && pnpm test` — 84/84 green, incl. new
+    coverage for every flag above.
+
 ## 2026-10-06
 
 - **chore(docs): plan-era record keeping retired; `CHANGELOG.md` becomes the

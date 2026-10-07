@@ -41,6 +41,8 @@ export interface ShellOptions {
   io: ShellIo;
   json: boolean;
   stdin?: NodeJS.ReadableStream | undefined;
+  /** Run this file as a one-shot script instead of reading stdin (the REPL stays TTY-only). */
+  scriptFile?: string | undefined;
 }
 
 export interface ListOptions {
@@ -120,7 +122,9 @@ export interface ShellHelpers {
   opHelp(opType: string): { opType: string; description: string; example: Record<string, unknown>; affected: string };
 }
 
-const HELP_TEXT = `notees shell helpers (object API, top-level await works):
+const HELP_TEXT = `notees shell helpers (object API, top-level await works; scripts run in a
+vm without require/fs — feed ids inline, and prefer a script file over a
+giant heredoc):
   api                                        raw ApiClient: getJson/postJson/patchJson/deleteJson/postMultipart, .server, .apiKey
   get(id)                                    fetch an object (contentAst + authored properties)
   list(opts?)                                list objects -> array (opts: isClass, presentAsMain, class, q, property, limit, cursor)
@@ -457,9 +461,8 @@ function makeAsyncEval(): repl.REPLEval {
 
 // --- modes ----------------------------------------------------------------------
 
-/** Run piped stdin as one script. Throws CliError(EXIT.domain) on script failure. */
-async function runScript(helpers: ShellHelpers, options: ShellOptions): Promise<void> {
-  const source = await readStdin({ stdin: options.stdin });
+/** Run one script (piped stdin or a file). Throws CliError(EXIT.domain) on script failure. */
+async function runScript(helpers: ShellHelpers, options: ShellOptions, source: string, filename: string): Promise<void> {
   // runInThisContext keeps the real Node globals (Buffer, process, …) but sees
   // only globals, so the helpers (and a console bound to the injected io, so
   // script output respects --json-style capture) are anchored on globalThis
@@ -486,7 +489,7 @@ async function runScript(helpers: ShellHelpers, options: ShellOptions): Promise<
       `${slot}.console`,
     ].join(", ");
     const wrapper = `((${params}) => (async () => {\n${source}\n})())(${args})`;
-    const script = new vm.Script(wrapper, { filename: "<stdin>" });
+    const script = new vm.Script(wrapper, { filename });
     await script.runInThisContext({ breakOnSigint: true });
   } catch (error) {
     throw new CliError(EXIT.domain, `shell: script failed: ${errorMessage(error)}`);
@@ -531,17 +534,28 @@ function startRepl(
 }
 
 /**
- * Entry point for the `shell` command: probe, then REPL (TTY) or script (piped).
- * Resolves EXIT.ok on clean exit (script success or REPL quit); throws CliError
- * on probe or script failure — the CliError exitCode is the process exit code.
+ * Entry point for the `shell` command: probe, then REPL (TTY) or script
+ * (a file argument wins over piped stdin). Resolves EXIT.ok on clean exit
+ * (script success or REPL quit); throws CliError on probe or script failure —
+ * the CliError exitCode is the process exit code.
  */
 export async function runShell(options: ShellOptions): Promise<number> {
   await probe(options.client);
   const helpers = buildHelpers(options.client);
+  if (options.scriptFile !== undefined) {
+    let source: string;
+    try {
+      source = readFileSync(options.scriptFile, "utf8");
+    } catch (error) {
+      throw new CliError(EXIT.usage, `shell: cannot read script ${options.scriptFile}: ${errorMessage(error)}`);
+    }
+    await runScript(helpers, options, source, options.scriptFile);
+    return EXIT.ok;
+  }
   const stdin = options.stdin ?? process.stdin;
   if ((stdin as { isTTY?: boolean }).isTTY === true) {
     return startRepl(helpers, options.client, options, stdin);
   }
-  await runScript(helpers, options);
+  await runScript(helpers, options, await readStdin({ stdin }), "<stdin>");
   return EXIT.ok;
 }
