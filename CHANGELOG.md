@@ -18,10 +18,14 @@ history.
   verifies the checksum (sha256sum/shasum portable), needs node ≥ 22, and
   links `notees → notees.mjs` into `~/.local/bin` (override
   `NOTEES_INSTALL_DIR`; `NOTEES_RELEASE_BASE` mirrors/testing). No npm, no
-  docker — tags stay the only release coordinate. Docs: README "Installing"
-  + "Versioning", the operations skill (law 1 + `references/releases.md`),
-  AGENTS.md's workflow line. The v3.2.1 release was backfilled by hand so
-  the install path works today; the workflow takes over from the next tag.
+  docker — tags stay the only release coordinate. The bundle is
+  self-contained: tsup compiles every runtime dependency in
+  (`noExternal` for the `@notees/*` packages + commander, with a
+  `createRequire` banner shim — the first backfilled asset was not
+  standalone and was replaced). Docs: README "Installing" + "Versioning",
+  the operations skill (law 1 + `references/releases.md`), AGENTS.md's
+  workflow line. The v3.2.1 release was backfilled by hand so the install
+  path works today; the workflow takes over from the next tag.
   Verification: gate re-run green; install.sh exercised end-to-end against
   the live release (checksum verify + `notees doctor` from the installed
   symlink).
