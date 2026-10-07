@@ -1,0 +1,51 @@
+name: release
+
+# The CLI ships as source + git tags (no npm publication, no docker image):
+# a release is a v* tag, and this workflow builds the bundle and attaches it
+# to the tag's GitHub Release. Consumers install it with scripts/install.sh
+# (or from source per the README).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The @notees/* packages are consumed from the vendored monorepo
+          # checkout (see README "Syncing the vendored packages").
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@9.0.0 --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Gate + build the bundle
+        run: |
+          pnpm -r --workspace-concurrency=1 build
+          pnpm typecheck
+          pnpm test
+          pnpm build
+      - name: Stage the release asset
+        run: |
+          # The bundle is ESM; a bare .js file without a package.json beside
+          # it loads as CommonJS and fails on the import statements. Ship it
+          # as .mjs so the standalone artifact keeps its module type.
+          cp dist/cli.js cli.mjs
+          sha256sum cli.mjs > cli.mjs.sha256
+      - name: Attach the bundle to the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Notees CLI $GITHUB_REF_NAME. Install: \`curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/$GITHUB_REF_NAME/scripts/install.sh | bash\` (or from source — see the README)." \
+            cli.mjs cli.mjs.sha256

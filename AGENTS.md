@@ -49,7 +49,10 @@ AGENTS.md
 - `vendor/notees/` — git submodule → the main repo (pinned commit);
   `pnpm-workspace.yaml` consumes its packages as workspace projects
 - `.github/workflows/ci.yml` — install (`--frozen-lockfile`,
-  `submodules: recursive`) + build + test on push/PR
+  `submodules: recursive`) + build + test on push/PR;
+  `.github/workflows/release.yml` — on `v*` tags: gate + build, attach the
+  bundle (`cli.mjs` + sha256) to the tag's GitHub Release (consumed by
+  `scripts/install.sh`)
 
 ## Commands
 

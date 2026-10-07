@@ -8,6 +8,24 @@ history.
 
 ## 2026-10-07
 
+- **feat(release): tags carry an installable bundle — `release.yml` workflow
+  + `scripts/install.sh`.** A `v*` tag push now builds `dist/cli.js` in CI
+  (vendored build + typecheck + test + bundle, mirroring the release gate)
+  and attaches it to the tag's GitHub Release as `cli.mjs` + a sha256
+  sidecar — `.mjs` so the standalone ESM bundle keeps its module type
+  without a package.json beside it. `scripts/install.sh` fetches a release
+  (default latest, resolvable offline via the `/releases/latest` redirect),
+  verifies the checksum (sha256sum/shasum portable), needs node ≥ 22, and
+  links `notees → notees.mjs` into `~/.local/bin` (override
+  `NOTEES_INSTALL_DIR`; `NOTEES_RELEASE_BASE` mirrors/testing). No npm, no
+  docker — tags stay the only release coordinate. Docs: README "Installing"
+  + "Versioning", the operations skill (law 1 + `references/releases.md`),
+  AGENTS.md's workflow line. The v3.2.1 release was backfilled by hand so
+  the install path works today; the workflow takes over from the next tag.
+  Verification: gate re-run green; install.sh exercised end-to-end against
+  the live release (checksum verify + `notees doctor` from the installed
+  symlink).
+
 - **feat: graph-migration ergonomics — scoped bulk class ops, rich-content
   flags, children windowing, uuid query refs, shell script files.** Grown
   from a real 468-node migration (the MakerWorld "modelo 3D" → "Web link"

@@ -34,6 +34,17 @@ If you cloned without `--recurse-submodules`:
 git submodule update --init
 ```
 
+## Installing
+
+Every `v*` tag carries a prebuilt bundle (`cli.mjs`, ESM with a `node` shebang, sha256 sidecar) on its GitHub Release, built by `.github/workflows/release.yml`. The install script fetches it, verifies the checksum, and links `notees` into `~/.local/bin` (override with `NOTEES_INSTALL_DIR`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/main/scripts/install.sh | bash -s -- v3.2.1   # pin a version
+```
+
+Requirements: bash, curl, node ≥ 22. The bundle is standalone — no pnpm toolchain, no `vendor/` checkout. Installing from source (above) is the other supported path; there is no npm or docker distribution.
+
 ## Syncing the vendored packages
 
 The submodule pin is the lockstep boundary: bump it after the main repo ships protocol/store changes the CLI needs.
@@ -49,4 +60,4 @@ Commit the submodule bump — CI installs with `--frozen-lockfile`, so run `pnpm
 
 ## Versioning
 
-`CLI_VERSION` (in `src/cli.ts`) rides the server's release train — the `doctor` command warns when the server is ahead of the CLI. There is no separate npm/docker distribution; install from source.
+`CLI_VERSION` (in `src/cli.ts`) rides the server's release train — the `doctor` command warns when the server is ahead of the CLI. There is no separate npm/docker distribution; install from a release bundle or from source (see "Installing").

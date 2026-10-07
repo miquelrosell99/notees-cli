@@ -5,10 +5,12 @@ description: Release and package the Notees CLI (notees-cli). Use when cutting a
 
 # Notees CLI operations
 
-The CLI ships as source + git tags — there is no npm publication, no docker
-image, no GitHub-Release artifact, and no release workflow in CI
-(`.github/workflows/ci.yml` is build+test only). Releases ride the server's
-release train: `CLI_VERSION` (in `src/cli.ts`) tracks the main repo's server
+The CLI ships as source + git tags — there is no npm publication and no
+docker image. A release = a `vX.Y.Z` tag whose version matches `CLI_VERSION`
+in `src/cli.ts`; `.github/workflows/release.yml` builds the bundle on the tag
+push and attaches it (`cli.mjs` + sha256 sidecar) to the tag's GitHub
+Release, which `scripts/install.sh` fetches, verifies, and links. Releases
+ride the server's release train: `CLI_VERSION` tracks the main repo's server
 version, and the `doctor` command warns when the server is ahead of the CLI.
 
 Canonical detail: `references/releases.md`; the deployment it talks to on the
