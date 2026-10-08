@@ -27,6 +27,20 @@ history.
   grammar has no spelling for them yet — that production lands separately).
   Gate: `pnpm typecheck && pnpm test` green (84 tests), full workspace build
   green.
+- **feat(cli): align the CLI to the Margin Green brand tokens.** The brand
+  identity ("MARGIN — the page is the canvas; the margin is where thought
+  accumulates") now lives in this repo as a git submodule at `brand/`
+  (pinned to `v1.0.0`, <https://github.com/miquelrosell99/notees-brand>) —
+  the single source of truth every client consumes. Survey of the CLI's
+  brand surfaces: the tool emits plain text only (no ANSI colour, no
+  colour dependency, no hard-coded hex anywhere in `src/`, tests, scripts,
+  or packaging), so there were no terminal colours to remap; `doctor`'s
+  ok/FAIL markers and the `notees` shell prompt stay unstyled, and the
+  README carries no logo or badge block (left as-is). The submodule is
+  wired in so future coloured output derives from `brand/assets/tokens/`
+  (Advance Green `#2e5e46`, Iron Ink `#1c1a16`, Paper `#f7f4ec`,
+  Night `#161412`). Verification: `pnpm typecheck && pnpm test` — 84/84
+  green.
 
 ## 2026-10-07
 

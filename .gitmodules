@@ -2,3 +2,6 @@
 	path = vendor/notees
 	url = git@github.com:miquelrosell99/notees.git
 	branch = main
+[submodule "brand"]
+	path = brand
+	url = git@github.com:miquelrosell99/notees-brand.git
