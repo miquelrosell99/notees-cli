@@ -1878,16 +1878,16 @@ describe("covers (one-gesture cover)", () => {
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
     "base64",
   );
-  const COVER_PROP = "00000000-0000-0000-0000-000000000005";
-  const ASSET_CLASS = "00000000-0000-0000-0001-000000000009";
+  const ASSET_CLASS = SYSTEM_CLASS_UUIDS.asset;
 
   async function pngFile(h: Harness, name: string): Promise<string> {
     const path = join(h.dataDir, name);
     writeFileSync(path, PNG);
     return path;
   }
-  const coverOf = (object: { properties?: Array<{ schemaId: string; value: unknown }> }) =>
-    (object.properties ?? []).find((p) => p.schemaId === COVER_PROP)?.value as { nodeId: string } | undefined;
+  // The cover is the `coverAssetId` wire node field (object.update optional
+  // nullable; null = unset) — exposed on every object projection.
+  const coverOf = (object: { coverAssetId?: string | null }) => object.coverAssetId ?? null;
 
   it("cover set <file> → get → skip-existing → replace → clear, with class hygiene", async () => {
     const h = harness;
@@ -1911,21 +1911,21 @@ describe("covers (one-gesture cover)", () => {
     const skipped = JSON.parse(h.io.stdoutText) as { assetId: string; created: boolean; replaced: string | null };
     expect(skipped).toMatchObject({ assetId: first.assetId, created: false, replaced: false });
 
-    // replace: new asset, old one stays an asset, property repoints.
+    // replace: new asset, old one stays an asset, field repoints.
     expect(await h.runCli("--json", "cover", "set", page, file)).toBe(EXIT.ok);
     const second = JSON.parse(h.io.stdoutText) as { assetId: string; replaced: string | null };
     expect(second.assetId).not.toBe(first.assetId);
     expect(second.replaced).toBe(first.assetId);
     expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
-    expect(coverOf(JSON.parse(h.io.stdoutText).object)?.nodeId).toBe(second.assetId);
+    expect(coverOf(JSON.parse(h.io.stdoutText).object)).toBe(second.assetId);
     expect(await h.runCli("--json", "object", "get", first.assetId)).toBe(EXIT.ok);
     const stale = JSON.parse(h.io.stdoutText).object as { classIds: string[] };
     expect(stale.classIds).toContain(ASSET_CLASS);
 
-    // clear: property gone.
+    // clear: field back to null.
     expect(await h.runCli("cover", "clear", page)).toBe(EXIT.ok);
     expect(await h.runCli("--json", "object", "get", page)).toBe(EXIT.ok);
-    expect(coverOf(JSON.parse(h.io.stdoutText).object)).toBeUndefined();
+    expect(coverOf(JSON.parse(h.io.stdoutText).object)).toBeNull();
   });
 
   it("cover set --asset reuses an existing asset node and classes it", async () => {
@@ -1954,7 +1954,7 @@ describe("covers (one-gesture cover)", () => {
     expect(await h.runCli("cover", "get", pageA)).toBe(EXIT.usage);
   });
 
-  it("search exists-arm counts nodes with a property (prop:cover:)", async () => {
+  it("the coverAsset AST predicate counts nodes with a cover", async () => {
     const h = harness;
     expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "cover-klass")).toBe(EXIT.ok);
     const klassId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
@@ -1965,11 +1965,24 @@ describe("covers (one-gesture cover)", () => {
     }
     expect(await h.runCli("cover", "set", withCover, await pngFile(h, "exists.png"))).toBe(EXIT.ok);
 
-    expect(await h.runCli("--json", "search", "class:cover-klass prop:cover:")).toBe(EXIT.ok);
-    const rows = JSON.parse(h.io.stdoutText).rows as Array<{ id: string }>;
-    expect(rows.map((r) => r.id)).toEqual([withCover]);
-    expect(await h.runCli("--json", "search", "class:cover-klass")).toBe(EXIT.ok);
-    expect((JSON.parse(h.io.stdoutText).rows as unknown[]).length).toBe(2);
+    // The compiler and AST accept the coverAsset wire-field predicate, but
+    // the query-language GRAMMAR has no spelling for it yet — POST the AST
+    // programmatically (a `coverAsset:` grammar production lands separately).
+    const client = new ApiClient({ server: h.baseUrl, apiKey: API_KEY });
+    const ast = {
+      version: 1,
+      scope: { type: "entire_workspace" },
+      root: {
+        type: "group",
+        logic: "and",
+        children: [
+          { type: "class", classId: klassId },
+          { type: "coverAsset", op: "exists" },
+        ],
+      },
+    };
+    const res = await client.postJson<{ ids: string[] }>("/api/query", { ast });
+    expect(res.ids).toEqual([withCover]);
   });
 
   it("doctor reports the cli/server drift check", async () => {

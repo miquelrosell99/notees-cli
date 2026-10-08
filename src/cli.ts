@@ -1305,18 +1305,22 @@ async function objectPropertyDelete(
 // --- covers --------------------------------------------------------------------
 
 /**
- * Fixed ids of the cover family: the cover property (type image)
- * binds to `source`; the cover target is an ordinary asset-classed node —
- * the `cover` system class was withdrawn the day it shipped (it duplicated
- * the property's meaning). The property VALUE stays the authority, exactly
- * like the web client's coverProperty.ts flows.
+ * The cover is a wire node field: `object.update`'s optional nullable
+ * `coverAssetId` (SCHEMA.md "Node structure") — present writes, present-null
+ * clears, exactly like `color`. The retired image-typed `cover` property
+ * schema was superseded by the field and is never re-authored here. The
+ * cover target is an ordinary asset-classed node; the `asset` class root is
+ * seeded by the server on workspace bootstrap (SEEDED_SYSTEM_CLASSES), so no
+ * family ensure is needed.
  */
-const ASSET_CLASS_ID = "00000000-0000-0000-0001-000000000009";
-const SOURCE_CLASS_ID = "00000000-0000-0000-0001-000000000023";
-const COVER_PROPERTY_ID = "00000000-0000-0000-0000-000000000005";
+const ASSET_CLASS_ID = SYSTEM_CLASS_UUIDS.asset;
 
 interface FullObject {
   id: string;
+  /** Wire node fields (null = unset) — exposed on every object projection. */
+  coverAssetId?: string | null;
+  bannerAssetId?: string | null;
+  aliasedNodeId?: string | null;
   properties?: Array<{ schemaId: string; idx?: number; value: unknown }>;
   classIds?: string[];
   [key: string]: unknown;
@@ -1327,98 +1331,21 @@ async function getObject(ctx: CommandContext, id: string): Promise<FullObject> {
   return body.object;
 }
 
-/** The cover property's asset target on a node (null = no cover). */
+/** The cover's asset node id on a node (null = no cover). */
 function coverAssetOf(object: FullObject): string | null {
-  const cover = (object.properties ?? []).find(
-    (property) => property.schemaId === COVER_PROPERTY_ID && (property.idx ?? 0) === 0,
-  );
-  const target = cover?.value as { nodeId?: unknown } | undefined;
-  return typeof target?.nodeId === "string" ? target.nodeId : null;
+  return object.coverAssetId ?? null;
 }
 
-/**
- * Author the cover family when missing (idempotent, mirroring the web
- * self-heal): the asset/source class roots at their fixed ids, the
- * image-typed cover schema, and the source-class binding. Class writes ride
- * the relay batch (configuration ops have no REST surface); the schema uses
- * the property schemas endpoint. Binding assumption: an existing cover
- * schema implies the binding (the web self-heal authors both together; the
- * migration too) — the binding envelope is written only alongside a
- * schema this call created. No cover class (withdrawn same-day).
- */
-async function ensureCoverProperty(ctx: CommandContext): Promise<void> {
-  const { classes } = await ctx.client.getJson<{ classes: Array<{ id: string }> }>(
-    "/api/classes",
-  );
-  const byId = new Map(classes.map((klass) => [klass.id, klass]));
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const envelopes = [];
-  const missingRoots = [
-    ["asset", ASSET_CLASS_ID, "mdiPaperclip"],
-    ["source", SOURCE_CLASS_ID, "mdiBookshelf"],
-  ].filter(([, id]) => !byId.has(id as string));
-  for (const [name, id, icon] of missingRoots) {
-    envelopes.push(
-      newEnvelope({
-        workspaceId,
-        actorId,
-        deviceId: "notees-cli",
-        client: "cli",
-        hlc: clock.now(),
-        affectedNodeIds: [id as string],
-        opType: "class.create",
-        payload: { classId: id, contentAst: [{ type: "text", text: name }], icon },
-      }),
-    );
-  }
-  let createdSchema = false;
-  try {
-    await ctx.client.getJson(`/api/property-schemas/${COVER_PROPERTY_ID}`);
-  } catch (error) {
-    if (!(error instanceof CliError) || error.exitCode !== EXIT.domain) throw error;
-    await ctx.client.postJson("/api/property-schemas", {
-      propertySchemaId: COVER_PROPERTY_ID,
-      name: "cover",
-      type: "image",
-      multi: false,
-      scope: "class",
-    });
-    createdSchema = true;
-  }
-  if (createdSchema || missingRoots.length > 0) {
-    envelopes.push(
-      newEnvelope({
-        workspaceId,
-        actorId,
-        deviceId: "notees-cli",
-        client: "cli",
-        hlc: clock.now(),
-        affectedNodeIds: [SOURCE_CLASS_ID],
-        opType: "class.property.set",
-        payload: { classId: SOURCE_CLASS_ID, propertySchemaId: COVER_PROPERTY_ID, sequence: 7 },
-      }),
-    );
-  }
-  if (envelopes.length > 0) {
-    await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
-  }
-}
-
-async function coverClearValue(ctx: CommandContext, nodeId: string, object: FullObject): Promise<string | null> {
-  const assetId = coverAssetOf(object);
-  if (assetId === null) return null;
-  await deleteProperty(ctx, nodeId, COVER_PROPERTY_ID, 0);
-  return assetId;
+async function coverSetField(ctx: CommandContext, nodeId: string, coverAssetId: string | null): Promise<void> {
+  await ctx.client.patchJson(`/api/objects/${encodeURIComponent(nodeId)}`, { coverAssetId });
 }
 
 /**
  * `notees cover set <nodeId> <file>` / `--asset <assetNodeId>` — the one-gesture
- * cover: ensure family → (file: asset node + upload/attach | --asset: reuse a
- * node) → cover property + the asset class. Replaces an existing cover by
- * default (the old asset node survives as an asset); --skip-existing makes
- * scripts re-runnable (prints the existing asset id, no writes).
+ * cover: (file: asset node + upload/attach | --asset: reuse a node) →
+ * `coverAssetId` on the node. Replaces an existing cover by default (the old
+ * asset node survives as an asset); --skip-existing makes scripts re-runnable
+ * (prints the existing asset id, no writes).
  */
 async function coverSet(
   ctx: CommandContext,
@@ -1429,7 +1356,6 @@ async function coverSet(
   const fromFile = file !== undefined;
   const fromAsset = options.asset !== undefined;
   if (fromFile === fromAsset) failUsage("cover set takes exactly one of <file> or --asset <assetNodeId>");
-  await ensureCoverProperty(ctx);
   const object = await getObject(ctx, nodeId);
 
   const existing = coverAssetOf(object);
@@ -1439,7 +1365,8 @@ async function coverSet(
   }
   let replaced: string | null = null;
   if (existing !== null) {
-    replaced = await coverClearValue(ctx, nodeId, object);
+    replaced = existing;
+    await coverSetField(ctx, nodeId, null);
   }
 
   let assetId: string;
@@ -1459,7 +1386,7 @@ async function coverSet(
     assetId = created.id;
     await uploadAsset(ctx, file!, assetId);
   }
-  await setProperty(ctx, nodeId, COVER_PROPERTY_ID, { nodeId: assetId }, 0);
+  await coverSetField(ctx, nodeId, assetId);
   emit(ctx, `${assetId}\n`, { pageId: nodeId, assetId, created: true, replaced });
 }
 
@@ -1485,8 +1412,9 @@ async function coverGet(ctx: CommandContext, nodeId: string): Promise<void> {
  * (it stays an ordinary asset). */
 async function coverClear(ctx: CommandContext, nodeId: string): Promise<void> {
   const object = await getObject(ctx, nodeId);
-  const cleared = await coverClearValue(ctx, nodeId, object);
+  const cleared = coverAssetOf(object);
   if (cleared === null) failUsage("node has no cover");
+  await coverSetField(ctx, nodeId, null);
   emit(ctx, `${cleared}\n`, { pageId: nodeId, cleared: true, assetId: cleared });
 }
 
@@ -2261,7 +2189,7 @@ function buildProgram(): Command {
       await objectPropertyDelete(ctxOf(command), id, schema, options);
     });
 
-  const cover = program.command("cover").description("node covers — the one-gesture image cover (family ensure + asset node + property)");
+  const cover = program.command("cover").description("node covers — the one-gesture image cover (asset node + the coverAssetId wire field)");
   cover
     .command("set <nodeId> [file]")
     .description("set a node's cover from a file (or --asset <assetNodeId>); replaces by default, --skip-existing for re-runnable scripts")

@@ -6,6 +6,28 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-08
+
+- **feat(covers): the cover command rides the `coverAssetId` wire node field.**
+  The main monorepo made `coverAssetId` / `bannerAssetId` / `aliasedNodeId`
+  wire node fields on `object.update` (optional nullable; present writes,
+  present-null clears) and exposed them on every REST object projection,
+  superseding the retired image-typed `cover` property schema (the stored
+  logs were rewritten by the monorepo migration). The CLI follows: `cover
+  set` / `cover get` / `cover clear` read `object.coverAssetId` and write via
+  `PATCH /api/objects/:id { coverAssetId }` (null clears) instead of the
+  property POST/DELETE; the `ensureCoverProperty` family ensure died with the
+  retired schema — the asset class root the upload flow needs is seeded by
+  the server on workspace bootstrap, so no ensure remains. Vendor pin bumped
+  `5e707374 → a317fb67` (the first commit exposing the fields on the REST
+  object API). Tests: the covers block asserts the field end-to-end against
+  the real vendored server; the retired `prop:cover:` exists-arm search test
+  now POSTs the `{type:"coverAsset", op:"exists"}` AST programmatically (the
+  query compiler accepts the wire-field predicates, but the query-language
+  grammar has no spelling for them yet — that production lands separately).
+  Gate: `pnpm typecheck && pnpm test` green (84 tests), full workspace build
+  green.
+
 ## 2026-10-07
 
 - **fix(release): the pacman package installs the bundle executable.**
