@@ -7,3 +7,6 @@ coverage/
 # Environment and runtime data (never tracked)
 .env
 config/
+
+# Agent worktrees (git worktree add .worktrees/<slug>)
+.worktrees/
