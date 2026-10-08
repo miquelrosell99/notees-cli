@@ -8,6 +8,11 @@ history.
 
 ## 2026-10-08
 
+- **feat(packaging): the pacman package ships the brand app icon.**
+  `packaging/arch/PKGBUILD` vendors the Margin Green app icon (512, from the
+  `notees-brand` repo) and installs it into the hicolor theme, so desktop
+  environments and package managers show the mark. Verification: PKGBUILD
+  syntax + vendored sha256 recomputed and recorded.
 - **feat(covers): the cover command rides the `coverAssetId` wire node field.**
   The main monorepo made `coverAssetId` / `bannerAssetId` / `aliasedNodeId`
   wire node fields on `object.update` (optional nullable; present writes,
