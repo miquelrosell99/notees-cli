@@ -71,6 +71,8 @@ jobs:
         run: |
           mkdir -p /tmp/pkg
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/packaging/arch/PKGBUILD" -o /tmp/pkg/PKGBUILD
+          # The icon is a plain-file source: makepkg needs it beside the PKGBUILD.
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/packaging/arch/notees.png" -o /tmp/pkg/notees.png
       - name: Build and install as an unprivileged user (makepkg refuses root)
         run: |
           useradd -m builder

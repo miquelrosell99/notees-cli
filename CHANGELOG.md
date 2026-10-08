@@ -8,6 +8,12 @@ history.
 
 ## 2026-10-08
 
+- **chore(release): v4.0.0 — the CLI rides the server's major.** The brand
+  slice + the covers slice ship as the CLI's v4.0.0: `CLI_VERSION` 3.2.3 →
+  4.0.0 (the server shipped v4.0.0 with the Margin Green identity), the
+  PKGBUILD records the deterministic bundle's checksum, and release.yml's
+  pacman-smoke now fetches the vendored icon beside the PKGBUILD. Gate:
+  `pnpm typecheck && pnpm test` + `pnpm build` before the tag.
 - **feat(packaging): the pacman package ships the brand app icon.**
   `packaging/arch/PKGBUILD` vendors the Margin Green app icon (512, from the
   `notees-brand` repo) and installs it into the hicolor theme, so desktop

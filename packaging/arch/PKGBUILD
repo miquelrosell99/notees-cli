@@ -13,7 +13,7 @@
 # file is the supported way to build the package yourself.
 
 pkgname=notees-cli
-pkgver=3.2.3
+pkgver=4.0.0
 pkgrel=1
 pkgdesc="The notees command-line client for Notees (object/property/search surface over the server's API)"
 arch=('any')
@@ -24,7 +24,7 @@ source=("$url/releases/download/v$pkgver/cli.mjs"
         "$url/releases/download/v$pkgver/cli.mjs.sha256"
         "https://raw.githubusercontent.com/miquelrosell99/notees-cli/v$pkgver/LICENSE"
         "notees.png")
-sha256sums=('1dc03834d232cd2107b4a37fcae5647afc1e99ec628b53b3acb9043be6b3ab7d'
+sha256sums=('c457e0b4a5b624486d42c3f39c0daf8ca07fcccf47f90bf26ecf4977dc2149d2'
             'SKIP'
             'SKIP'
             '340e36f8a0e1c1402073c464a71d69bedfb61f4c71b5df959bab838c8c874769')
