@@ -8,6 +8,12 @@ history.
 
 ## 2026-10-09
 
+- **chore(release): v4.1.0 — the CLI rides the unified-datetime batch's
+  minor.** `CLI_VERSION` 4.0.0 → 4.1.0 (the server train shipped the batch as
+  the v4.1.0 minor; the GTK client tagged v4.1.0 in lockstep), the PKGBUILD
+  records the deterministic bundle's checksum, and the datetime slice below
+  ships with it. Gate: `pnpm typecheck && pnpm test` + `pnpm build` before
+  the tag.
 - **feat(datetime): the CLI rides the unified-datetime wire batch.** The main
   monorepo retired the `date` / `date_range` property schema types and unified
   on `datetime` (a value is a point `{nodeId, time?}` or a range
