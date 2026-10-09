@@ -14,7 +14,14 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
 
 import { newEnvelope } from "@notees/protocol";
-import { SYSTEM_CLASS_UUIDS, SYSTEM_PROPERTY_UUIDS } from "@notees/domain";
+import {
+  SYSTEM_CLASS_UUIDS,
+  SYSTEM_PROPERTY_UUIDS,
+  chainNodeIds,
+  dateNodeDisplayLabel,
+  dateNodeLabel,
+  parseIsoDate,
+} from "@notees/domain";
 import { bibToCsl, parseBibtex } from "@notees/export";
 
 import { buildServer, defaultWorkspaceId } from "@notees/server";
@@ -70,6 +77,7 @@ async function bootServer(): Promise<Harness> {
       maxMediaBytes: 50 * 1024 * 1024,
       maxDocumentBytes: 100 * 1024 * 1024,
       loginPerMinute: 10,
+      signupEnabled: false,
       corsOrigins: [],
     },
     { logger: false },
@@ -1703,6 +1711,103 @@ describe("object property set/delete", () => {
     const page = await h.createPage("property-probe-2", []);
     expect(await h.runCli("object", "property", "set", page, "no.such.schema", "1")).toBe(EXIT.usage);
     expect(h.io.stderrText).toContain("no property schema named");
+  });
+});
+
+describe("datetime properties (unified wire batch)", () => {
+  it("datetime schema creation, retired types rejected, point + range values round-trip", async () => {
+    const h = harness;
+
+    // Schema authoring routes the unified type; the retired ones fail loud
+    // client-side (the server's strict enum would 422 anyway — exit 2 first).
+    expect(await h.runCli("property", "create", "dt-when", "--type", "datetime")).toBe(EXIT.ok);
+    const dtSchemaId = h.io.stdoutText.trim();
+    expect(dtSchemaId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await h.runCli("--json", "property", "list")).toBe(EXIT.ok);
+    const listed = JSON.parse(h.io.stdoutText) as { propertySchemas: Array<{ id: string; type: string }> };
+    expect(listed.propertySchemas).toContainEqual(expect.objectContaining({ id: dtSchemaId, type: "datetime" }));
+    expect(await h.runCli("property", "create", "dt-retired", "--type", "date")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("datetime");
+    expect(await h.runCli("property", "create", "dt-retired-2", "--type", "date_range")).toBe(EXIT.usage);
+
+    // The date chain: today's nodes exist via `today`; tomorrow's are injected
+    // directly with the same content-addressed ids (the ensureChainNode shape).
+    expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
+    const todayId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    const pad2 = (n: number): string => String(n).padStart(2, "0");
+    const isoLocal = (d: Date): string => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowIso = isoLocal(tomorrow);
+    const tomorrowIds = chainNodeIds(tomorrowIso);
+    const tomorrowParts = parseIsoDate(tomorrowIso);
+    for (const [id, label, classId, parentId] of [
+      [tomorrowIds.year, dateNodeLabel(tomorrowParts, "year"), SYSTEM_CLASS_UUIDS.year, null],
+      [tomorrowIds.month, dateNodeLabel(tomorrowParts, "month"), SYSTEM_CLASS_UUIDS.month, tomorrowIds.year],
+      [tomorrowIds.day, dateNodeLabel(tomorrowParts, "day"), SYSTEM_CLASS_UUIDS.day, tomorrowIds.month],
+    ] as const) {
+      const res = await h.app.inject({
+        method: "POST",
+        url: "/api/objects",
+        headers: { "content-type": "application/json", "x-api-key": API_KEY },
+        payload: { id, presentAsMain: true, ...(parentId !== null ? { parentId } : {}), classIds: [classId], name: label },
+      });
+      expect([201, 409]).toContain(res.statusCode);
+    }
+
+    // Point value with a wall-clock time (full-day = the `time` key absent).
+    const pointPage = await h.createPage("dt-point-probe", []);
+    const point = { nodeId: todayId, time: "09:30" };
+    expect(
+      await h.runCli("--json", "object", "property", "set", pointPage, "dt-when", JSON.stringify(point)),
+    ).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", pointPage)).toBe(EXIT.ok);
+    let props = JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>;
+    expect(props.map((p) => ({ schemaId: p.schemaId, value: p.value }))).toEqual([{ schemaId: dtSchemaId, value: point }]);
+
+    // Range value: a timed start, a full-day end, and an open-ended variant.
+    const rangePage = await h.createPage("dt-range-probe", []);
+    const range = { start: { nodeId: todayId, time: "09:30" }, end: { nodeId: tomorrowIds.day } };
+    expect(
+      await h.runCli("--json", "object", "property", "set", rangePage, "dt-when", JSON.stringify(range)),
+    ).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "get", rangePage)).toBe(EXIT.ok);
+    props = JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>;
+    expect(props.map((p) => ({ schemaId: p.schemaId, value: p.value }))).toEqual([{ schemaId: dtSchemaId, value: range }]);
+
+    const openPage = await h.createPage("dt-open-probe", []);
+    const open = { start: { nodeId: todayId }, end: null };
+    expect(
+      await h.runCli("--json", "object", "property", "set", openPage, "dt-when", JSON.stringify(open)),
+    ).toBe(EXIT.ok);
+
+    // The server is the strict shape gate: a malformed time 422s (exit 1) —
+    // the CLI sends values verbatim and maps the wire error.
+    expect(
+      await h.runCli("object", "property", "set", pointPage, "dt-when", JSON.stringify({ nodeId: todayId, time: "9:30 am" })),
+    ).toBe(EXIT.domain);
+
+    // Human display: the markdown frontmatter renders `<date> HH:MM` for the
+    // point and a start/end map for the range (open side `null`).
+    const todayParts = parseIsoDate(isoLocal(new Date()));
+    const todayDisplay = dateNodeDisplayLabel(todayParts, "day");
+    const tomorrowDisplay = dateNodeDisplayLabel(tomorrowParts, "day");
+    expect(await h.runCli("export", "markdown", "--ids", pointPage, "--stdout")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain(`${todayDisplay} 09:30`);
+    expect(await h.runCli("export", "markdown", "--ids", rangePage, "--stdout")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain(`start: "${todayDisplay} 09:30"`);
+    expect(h.io.stdoutText).toContain(`end: ${tomorrowDisplay}`);
+    expect(await h.runCli("export", "markdown", "--ids", openPage, "--stdout")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("end: null");
+
+    // The json-archive surface carries the value union verbatim (additive-only).
+    expect(await h.runCli("export", "json", "--ids", rangePage)).toBe(EXIT.ok);
+    const archive = JSON.parse(h.io.stdoutText) as {
+      nodes: Array<{ properties: Array<{ schemaId: string; schemaType?: string; value: unknown }> }>;
+    };
+    expect(archive.nodes[0]!.properties).toEqual([
+      expect.objectContaining({ schemaId: dtSchemaId, schemaType: "datetime", value: range }),
+    ]);
   });
 });
 

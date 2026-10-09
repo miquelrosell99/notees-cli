@@ -26,7 +26,7 @@ cd notees-cli
 corepack enable && corepack prepare pnpm@9.0.0 --activate
 pnpm install
 pnpm build        # tsup bundle → dist/cli.js (the `notees` bin)
-pnpm test         # vitest (77 tests)
+pnpm test         # vitest (85 tests)
 pnpm dev -- --help    # run from source via tsx
 ```
 

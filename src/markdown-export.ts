@@ -96,12 +96,37 @@ export function rendersAsDocument(
   return node.isClass === 0 && (node.parentId === null || node.presentAsMain === 1);
 }
 
+/** One property value's ref ids, unified-datetime aware: a point `{nodeId}`
+ * (optionally with `time`), a range `{start, end}` whose sides are slots or
+ * null (open side — nothing to collect), and one metadata qualifier entry
+ * (`{nodeId}` or a bare legacy-uuid string). Bare scalar values collect
+ * nothing — the pre-batch behavior for text-ish schemas. */
+function collectValueRefIds(value: unknown, into: Set<string>): void {
+  if (typeof value === "string") {
+    // Legacy node-typed read-leniency (v1-migrated data rode bare uuids);
+    // uuid-shaped only so plain text values never fetch as ids.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) into.add(value);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (typeof value.nodeId === "string") {
+    into.add(value.nodeId);
+    return;
+  }
+  if ("start" in value || "end" in value) {
+    collectValueRefIds(value.start, into);
+    collectValueRefIds(value.end, into);
+  }
+}
+
 /** Collect every id export rendering may resolve: mentions, chips, bound verbs, class ids, node-typed property values. */
 export function collectReferenceIds(node: ExportNode, into: Set<string>): void {
   for (const classId of node.classIds) into.add(classId);
   for (const property of node.properties) {
-    const value = property.value;
-    if (isRecord(value) && typeof value.nodeId === "string") into.add(value.nodeId);
+    collectValueRefIds(property.value, into);
+    if (isRecord(property.metadata)) {
+      for (const entry of Object.values(property.metadata)) collectValueRefIds(entry, into);
+    }
   }
   const walk = (tokens: readonly ExportNode["contentAst"][number][]): void => {
     for (const token of tokens) {

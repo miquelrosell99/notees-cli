@@ -6,6 +6,30 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-09
+
+- **feat(datetime): the CLI rides the unified-datetime wire batch.** The main
+  monorepo retired the `date` / `date_range` property schema types and unified
+  on `datetime` (a value is a point `{nodeId, time?}` or a range
+  `{start, end}` of `{nodeId, time?}` slots, either side open; full-day is the
+  absence of `time`), and the live logs were rewritten by its migration. The
+  CLI follows: vendor pin bumped `a317fb67 → af57c5bb` (the batch's
+  convergence commit on main), `property create --type` routes `datetime` and
+  rejects the retired types client-side (the server's strict enum would 422
+  anyway — exit 2 lands first, and the usage message now lists the unified
+  enum), and the markdown exporter's reference closure walks the value union —
+  range `start`/`end` slots and metadata qualifier refs are collected so the
+  bundle resolves their display names instead of leaking raw ids; display
+  formatting itself (`<date> HH:MM`, ranges as a start/end map, open side
+  `null`) is the vendored exporter's `datetime` branches. Values still pass
+  through `object property set` verbatim as JSON — the server is the strict
+  shape gate (a malformed `time` 422s → exit 1). Test boot config gained the
+  vendored server's new required `signupEnabled: false`; a new suite block
+  exercises datetime schema creation, retired-type rejection, point/range/
+  open-range round-trips, malformed-time failure, markdown frontmatter
+  rendering, and the json-archive surface carrying the union verbatim.
+  Gate: `pnpm typecheck && pnpm test` green (85 tests).
+
 ## 2026-10-08
 
 - **chore(release): v4.0.0 — the CLI rides the server's major.** The brand
