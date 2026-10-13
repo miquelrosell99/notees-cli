@@ -215,6 +215,9 @@ importers:
       sql.js:
         specifier: ^1.10.0
         version: 1.14.2
+      uuidv7:
+        specifier: ^1.0.0
+        version: 1.2.1
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^7.6.11

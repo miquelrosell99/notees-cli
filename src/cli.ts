@@ -437,6 +437,87 @@ async function objectRestore(ctx: CommandContext, ids: string[]): Promise<void> 
   );
 }
 
+/** The merge plan summary — the server's POST /objects/:id/merge contract. */
+interface MergeSummary {
+  childrenMoved: number;
+  classesRemapped: number;
+  tagsRemapped: number;
+  propertiesCopied: number;
+  propertiesSkipped: number;
+  contentLinksRewritten: number;
+  propertyValuesRewritten: number;
+  aliasesRepointed: number;
+  collectionsRemapped: number;
+  fieldsCopied: number;
+}
+
+/** One human line over the plan's nonzero counts. */
+function renderMergeSummary(summary: MergeSummary): string {
+  const parts: string[] = [];
+  if (summary.childrenMoved > 0) parts.push(`${summary.childrenMoved} children moved`);
+  if (summary.classesRemapped > 0 || summary.tagsRemapped > 0) {
+    parts.push(`${summary.classesRemapped} classes + ${summary.tagsRemapped} tags remapped`);
+  }
+  if (summary.propertiesCopied > 0) {
+    parts.push(
+      `${summary.propertiesCopied} properties copied` +
+        (summary.propertiesSkipped > 0 ? ` (${summary.propertiesSkipped} skipped — target already had a value)` : ""),
+    );
+  } else if (summary.propertiesSkipped > 0) {
+    parts.push(`${summary.propertiesSkipped} properties kept (target already had values)`);
+  }
+  if (summary.contentLinksRewritten > 0) parts.push(`${summary.contentLinksRewritten} pages' mentions retargeted`);
+  if (summary.propertyValuesRewritten > 0) parts.push(`${summary.propertyValuesRewritten} property references retargeted`);
+  if (summary.aliasesRepointed > 0) parts.push(`${summary.aliasesRepointed} aliases repointed`);
+  if (summary.collectionsRemapped > 0) parts.push(`${summary.collectionsRemapped} collections remapped`);
+  if (summary.fieldsCopied > 0) parts.push(`${summary.fieldsCopied} fields copied`);
+  return parts.length > 0 ? parts.join(", ") : "nothing to remap";
+}
+
+async function objectMerge(
+  ctx: CommandContext,
+  sourceRef: string,
+  targetRef: string,
+  options: { dryRun?: boolean; yes?: boolean },
+): Promise<void> {
+  if (sourceRef === targetRef) failUsage("object merge: source and target are the same node");
+  const named = async (ref: string): Promise<{ id: string; name: string }> => {
+    const body = await ctx.client.getJson<{ object: { id: string; name?: string | null } }>(
+      `/api/objects/${encodeURIComponent(ref)}`,
+    );
+    return { id: body.object.id, name: body.object.name ?? body.object.id };
+  };
+  const source = await named(sourceRef);
+  const target = await named(targetRef);
+  const plan = { source, target };
+  const preview = `merge "${source.name}" into "${target.name}" — children move, references retarget, the source trashes`;
+  if (options.dryRun === true) {
+    const res = await ctx.client.postJson<{ dryRun: boolean; summary: MergeSummary }>(
+      `/api/objects/${encodeURIComponent(source.id)}/merge?dryRun=true`,
+      { targetId: target.id },
+    );
+    emit(ctx, `dry run: ${preview}\n  ${renderMergeSummary(res.summary)}\n`, {
+      ...plan,
+      dryRun: true,
+      summary: res.summary,
+    });
+    return;
+  }
+  if (options.yes !== true) {
+    ctx.io.stderr.write(`Refusing to merge: ${preview}.\nRe-run with --yes to proceed (or --dry-run to inspect).\n`);
+    throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
+  }
+  const res = await ctx.client.postJson<{ merged: boolean; targetId: string; summary: MergeSummary }>(
+    `/api/objects/${encodeURIComponent(source.id)}/merge`,
+    { targetId: target.id },
+  );
+  emit(ctx, `merged "${source.name}" into "${target.name}" — ${renderMergeSummary(res.summary)}\n`, {
+    ...plan,
+    merged: res.merged,
+    summary: res.summary,
+  });
+}
+
 /**
  * `notees object upsert` — find-or-create by exact title (case-insensitive)
  * within optional scopes (--class, --parent). Zero matches → create with
@@ -2168,6 +2249,18 @@ function buildProgram(): Command {
     .description("restore trashed objects (whole-tree; descendants trashed independently stay trashed)")
     .action(async (ids: string[], _options: object, command: Command) => {
       await objectRestore(ctxOf(command), ids);
+    });
+  object
+    .command("merge <source> <target>")
+    .description(
+      "merge one object into another: the source's children move, its class/tag bindings and authored properties remap " +
+        "(the target keeps values it already has), references to the source (mentions, property references, aliases, " +
+        "collections) retarget, and the source moves to the trash. Preview-first: --dry-run shows the plan, --yes proceeds",
+    )
+    .option("--dry-run", "print the merge plan without writing", false)
+    .option("--yes", "proceed without prompting (required — destructive)", false)
+    .action(async (source: string, target: string, options: { dryRun?: boolean; yes?: boolean }, command: Command) => {
+      await objectMerge(ctxOf(command), source, target, options);
     });
   const property = object.command("property").description("typed property operations");
   property

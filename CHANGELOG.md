@@ -6,6 +6,25 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-13
+
+- **feat(merge): `notees object merge <source> <target>` — merge one object
+  into another, preview-first.** The main monorepo shipped node merge as a
+  planner over the derived store (a batch of existing op types — no wire
+  change) exposed at `POST /api/objects/:id/merge` with a `?dryRun=true`
+  preview; the CLI rides it. The command resolves both nodes, honors the
+  destructive-command contract (`--dry-run` prints the plan's counts and
+  writes nothing; without `--yes` it prints the blast radius to stderr and
+  exits 2; `--yes` merges), and reports the server's plan summary in human
+  text and `--json` (`{source, target, merged, summary}` — additive shape).
+  Semantics (SCHEMA.md "Node merge"): the source's children move, class/tag
+  bindings and authored properties remap (the target keeps values it already
+  has), references retarget (mentions, property references, aliases,
+  collections), and the source trashes. Vendor pin bumped `af57c5bb →
+  1b89adf0` (the merge slice's commit on the main repo's main). Gate: `pnpm
+  typecheck && pnpm test` green (87 tests, incl. the new `object merge`
+  preview/merge/guard specs).
+
 ## 2026-10-09
 
 - **chore(release): v4.1.0 — the CLI rides the unified-datetime batch's

@@ -214,6 +214,50 @@ describe("object lifecycle (json mode)", () => {
   });
 });
 
+describe("object merge", () => {
+  it("preview-first: --dry-run shows the plan, --yes merges, the source trashes", async () => {
+    const h = harness;
+    const source = await h.createPage("merge-source", [{ type: "text", text: "a block" }]);
+    const target = await h.createPage("merge-target", []);
+
+    // dry run: exit 0, plan only, nothing written.
+    expect(await h.runCli("--json", "object", "merge", source, target, "--dry-run")).toBe(EXIT.ok);
+    const dry = JSON.parse(h.io.stdoutText);
+    expect(dry.dryRun).toBe(true);
+    expect(dry.summary.childrenMoved).toBe(1);
+    expect(await h.runCli("--json", "object", "get", source)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(true);
+
+    // without --yes: exit 2 with the blast radius, nothing written.
+    const refused = await h.runCli("--json", "object", "merge", source, target);
+    expect(refused).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("--yes");
+    expect(await h.runCli("--json", "object", "get", source)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(true);
+
+    // --yes: the merge lands.
+    expect(await h.runCli("--json", "object", "merge", source, target, "--yes")).toBe(EXIT.ok);
+    const merged = JSON.parse(h.io.stdoutText);
+    expect(merged.merged).toBe(true);
+    expect(merged.summary.childrenMoved).toBe(1);
+
+    // The source is trashed; the target owns the block.
+    expect(await h.runCli("--json", "object", "get", source)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).object.isActive).toBe(false);
+    expect(await h.runCli("--json", "object", "children", target)).toBe(EXIT.ok);
+    const children = JSON.parse(h.io.stdoutText).children as Array<{ id: string }>;
+    expect(children.length).toBe(1);
+  });
+
+  it("guard failures surface the server's 422 (source === target)", async () => {
+    const h = harness;
+    const page = await h.createPage("merge-same", []);
+    const code = await h.runCli("--json", "object", "merge", page, page, "--yes");
+    expect(code).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("same node");
+  });
+});
+
 describe("exit codes", () => {
   it("bad API key → 3", async () => {
     const h = harness;
