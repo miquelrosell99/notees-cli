@@ -131,7 +131,7 @@ export function collectReferenceIds(node: ExportNode, into: Set<string>): void {
   const walk = (tokens: readonly ExportNode["contentAst"][number][]): void => {
     for (const token of tokens) {
       if (token.type === "mention") into.add(token.targetNodeId);
-      else if (token.type === "class_chip") into.add(token.classId);
+      else if (token.type === "class_link") into.add(token.classId);
       else if (token.type === "typed_link") {
         if (typeof token.verb === "object") into.add(token.verb.propertySchemaId);
       } else if (token.type === "quote") {

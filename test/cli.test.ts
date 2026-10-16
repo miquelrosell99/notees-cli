@@ -1487,16 +1487,19 @@ describe("class remap", () => {
 describe("object list --all", () => {
   it("follows the cursor to exhaustion", async () => {
     const h = harness;
+    // Unique probe vocabulary: the list q-filter matches per term, so a
+    // shared word ("probe") would pick up other suites' rows on the shared
+    // test server.
     for (let i = 1; i <= 3; i += 1) {
-      expect(await h.runCli("object", "create", "--name", `all-probe-${i}`)).toBe(EXIT.ok);
+      expect(await h.runCli("object", "create", "--name", `cursorq-${i}`)).toBe(EXIT.ok);
     }
     // Page size 2 < 3 results: without --all the first page stops early.
-    expect(await h.runCli("--json", "object", "list", "--q", "all-probe", "--limit", "2")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "list", "--q", "cursorq", "--limit", "2")).toBe(EXIT.ok);
     const paged = JSON.parse(h.io.stdoutText) as { objects: unknown[]; nextCursor: string | null };
     expect(paged.objects.length).toBe(2);
     expect(paged.nextCursor).not.toBeNull();
 
-    expect(await h.runCli("--json", "object", "list", "--q", "all-probe", "--limit", "2", "--all")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "list", "--q", "cursorq", "--limit", "2", "--all")).toBe(EXIT.ok);
     const all = JSON.parse(h.io.stdoutText) as { objects: unknown[]; nextCursor: string | null };
     expect(all.objects.length).toBe(3);
     expect(all.nextCursor).toBeNull();
@@ -1916,7 +1919,7 @@ describe("export json", () => {
     expect(await h.runCli("export", "json", "--ids", referrer)).toBe(EXIT.ok);
     const archive = JSON.parse(h.io.stdoutText) as Archive;
     expect(archive.format).toBe("notees-json-archive");
-    expect(archive.version).toBe(1);
+    expect(archive.version).toBe(2);
     expect(typeof archive.generatedAt).toBe("string");
     expect(archive.nodes).toHaveLength(1);
     const node = archive.nodes[0]!;
@@ -1958,11 +1961,11 @@ describe("export json", () => {
 
     expect(await h.runCli("--json", "export", "json", "--ids", a, b, "--output", file)).toBe(EXIT.ok);
     const machine = JSON.parse(h.io.stdoutText) as { format: string; version: number; nodes: number };
-    expect(machine).toEqual({ format: "notees-json-archive", version: 1, nodes: 2 });
+    expect(machine).toEqual({ format: "notees-json-archive", version: 2, nodes: 2 });
 
     const archive = JSON.parse(readFileSync(file, "utf8")) as Archive;
     expect(archive.format).toBe("notees-json-archive");
-    expect(archive.version).toBe(1);
+    expect(archive.version).toBe(2);
     expect(archive.nodes.map((node) => node.id).sort()).toEqual([a, b].sort());
   });
 

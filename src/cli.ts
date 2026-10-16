@@ -592,8 +592,8 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
     body.contentAst = [{ type: "text", text: options.name }];
   }
   if (contentAst !== undefined) body.contentAst = contentAst;
-  // Promotion/demotion: flip the render bit between the parent's
-  // main-children zone (true) and the inline body (false).
+  // Promotion/demotion: flip the embedding flag between the standalone
+  // Page role (false) and the embedded Block role (true).
   if (options.isEmbedded !== undefined) body.isEmbedded = options.isEmbedded;
   if (options.icon !== undefined) body.icon = options.icon;
   if (options.color !== undefined) {
@@ -2218,10 +2218,13 @@ function buildProgram(): Command {
     .command("create")
     .description("create an object (prints the new id)")
     .option("--isClass", "declare a class node (a root: no --parent/--class/--isEmbedded)")
-    .option(
-      "--isEmbedded",
-      "embedding flag: false = standalone, the parent's main-children zone (server default: 0 parentless, 1 parented)",
-      undefined,
+    .addOption(
+      new Option("--isEmbedded", "create embedded in the parent's body (the Block role — the server default when parented)").default(
+        undefined,
+      ),
+    )
+    .addOption(
+      new Option("--no-isEmbedded", "create standalone (the Page role — the parent's main-children zone)"),
     )
     .option("--name <name>", "object name")
     .option(
@@ -2400,11 +2403,11 @@ function buildProgram(): Command {
       "replace the node's content with this contentAst token array (mentions, external links, …; mutually exclusive with --name)",
     )
     .addOption(
-      new Option("--no-isEmbedded", "promote: standalone under the parent (the Page role)").default(
+      new Option("--isEmbedded", "demote: embed the node in the parent's body (the Block role)").default(
         undefined,
       ),
     )
-    .addOption(new Option("--isEmbedded", "demote: embed the node in the parent's body (the Block role)"))
+    .addOption(new Option("--no-isEmbedded", "promote: standalone under the parent (the Page role)"))
     .option("--icon <icon>", "icon")
     .option("--color <color>", "color: preset token (red…gray) or #RRGGBB; 'none' clears")
     .action(async (id: string, options: { name?: string; isEmbedded?: boolean; icon?: string; color?: string }, command: Command) => {
