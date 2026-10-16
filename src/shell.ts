@@ -47,7 +47,7 @@ export interface ShellOptions {
 
 export interface ListOptions {
   isClass?: boolean;
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   class?: string;
   q?: string;
   property?: string;
@@ -57,7 +57,7 @@ export interface ListOptions {
 
 export interface SearchOptions {
   isClass?: boolean;
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   limit?: number;
 }
 
@@ -127,15 +127,15 @@ vm without require/fs — feed ids inline, and prefer a script file over a
 giant heredoc):
   api                                        raw ApiClient: getJson/postJson/patchJson/deleteJson/postMultipart, .server, .apiKey
   get(id)                                    fetch an object (contentAst + authored properties)
-  list(opts?)                                list objects -> array (opts: isClass, presentAsMain, class, q, property, limit, cursor)
-  search(q, opts?)                           full-text search -> results array (opts: isClass, presentAsMain, limit)
+  list(opts?)                                list objects -> array (opts: isClass, isEmbedded, class, q, property, limit, cursor)
+  search(q, opts?)                           full-text search -> results array (opts: isClass, isEmbedded, limit)
   classes()                                  list classes
   classInfo(id)                              one class (with members) merged into a single object
   backlinks(id)                              edges pointing at id
   props(id)                                  authored properties of an object
   effective(id)                              authored + class-default effective properties
-  create(partial)                            POST /objects -> created object (fields: isClass, presentAsMain, name, contentAst, classIds, parentId)
-  update(id, fields)                         PATCH fields (name, presentAsMain, icon, color, contentAst) -> updated object
+  create(partial)                            POST /objects -> created object (fields: isClass, isEmbedded, name, contentAst, classIds, parentId)
+  update(id, fields)                         PATCH fields (name, isEmbedded, icon, color, contentAst) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   unsetProperty(id, schemaId, idx?)          unset a property slot (idx defaults 0) -> updated object
@@ -192,7 +192,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     list: async (opts = {}) => {
       const query = queryString({
         isClass: opts.isClass,
-        presentAsMain: opts.presentAsMain,
+        isEmbedded: opts.isEmbedded,
         class: opts.class,
         q: opts.q,
         property: opts.property,
@@ -203,7 +203,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       return body.objects;
     },
     search: async (q, opts = {}) => {
-      const query = queryString({ q, isClass: opts.isClass, presentAsMain: opts.presentAsMain, limit: opts.limit });
+      const query = queryString({ q, isClass: opts.isClass, isEmbedded: opts.isEmbedded, limit: opts.limit });
       const body = await client.getJson<{ results: unknown[] }>(`/api/search${query}`);
       return body.results;
     },

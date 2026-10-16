@@ -110,14 +110,14 @@ async function bootServer(): Promise<Harness> {
       // Title-is-content: the page's own content IS its title; the given
       // contentAst becomes a child block (pages are text-only by invariant).
       const code = await this.runCliWithStdin(
-        JSON.stringify({ presentAsMain: true, contentAst: [{ type: "text", text: name }] }),
+        JSON.stringify({ isEmbedded: false, contentAst: [{ type: "text", text: name }] }),
         "--json", "object", "create", "--stdin",
       );
       if (code !== EXIT.ok) throw new Error(`createPage ${name} failed: ${io.stderrText}`);
       const id = (JSON.parse(io.stdoutText) as { id: string }).id;
       if (contentAst.length > 0) {
         const blockCode = await this.runCliWithStdin(
-          JSON.stringify({ presentAsMain: false, parentId: id, contentAst }),
+          JSON.stringify({ isEmbedded: true, parentId: id, contentAst }),
           "--json", "object", "create", "--stdin",
         );
         if (blockCode !== EXIT.ok) throw new Error(`createPage block ${name} failed: ${io.stderrText}`);
@@ -147,7 +147,7 @@ describe("object lifecycle (json mode)", () => {
     // Title-is-content: the title IS the content; `name` is only a create
     // convenience when no contentAst is given.
     const stdin = JSON.stringify({
-      presentAsMain: true,
+      isEmbedded: false,
       contentAst: [{ type: "text", text: "t1-cli-page" }],
     });
     const createCode = await h.runCliWithStdin(stdin, "--json", "object", "create", "--stdin");
@@ -164,7 +164,7 @@ describe("object lifecycle (json mode)", () => {
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("t1-cli-page-v2");
 
     // list
-    expect(await h.runCli("--json", "object", "list", "--presentAsMain")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "list", "--no-isEmbedded")).toBe(EXIT.ok);
     const list = JSON.parse(h.io.stdoutText);
     expect(list.objects.map((o: { id: string }) => o.id)).toContain(created.id);
     expect(list.nextCursor).toBeDefined();
@@ -192,7 +192,7 @@ describe("object lifecycle (json mode)", () => {
 
   it("create reads the body from --stdin", async () => {
     const h = harness;
-    const stdin = JSON.stringify({ presentAsMain: true, contentAst: [{ type: "text", text: "t2-stdin-page" }] });
+    const stdin = JSON.stringify({ isEmbedded: false, contentAst: [{ type: "text", text: "t2-stdin-page" }] });
     const code = await h.runCliWithStdin(stdin, "--json", "object", "create", "--stdin");
     expect(code).toBe(EXIT.ok);
     const { id } = JSON.parse(h.io.stdoutText);
@@ -207,7 +207,7 @@ describe("object lifecycle (json mode)", () => {
     const taskClass = classes.find((c) => c.name === "Task")!;
     expect(taskClass).toBeDefined();
 
-    const code = await h.runCli("--json", "object", "create", "--presentAsMain", "--name", "t3-task-page", "--class", taskClass.id);
+    const code = await h.runCli("--json", "object", "create", "--no-isEmbedded", "--name", "t3-task-page", "--class", taskClass.id);
     expect(code).toBe(EXIT.ok);
     const { id } = JSON.parse(h.io.stdoutText);
     expect(await h.runCli("--json", "backlinks", id)).toBe(EXIT.ok);
@@ -341,7 +341,7 @@ describe("assets, classes, sync", () => {
 
   it("sync status reports server stats and the local cursor", async () => {
     const h = harness;
-    await h.runCli("--json", "object", "create", "--presentAsMain", "--name", "t5-sync-probe");
+    await h.runCli("--json", "object", "create", "--no-isEmbedded", "--name", "t5-sync-probe");
     expect(await h.runCli("--json", "sync", "status")).toBe(EXIT.ok);
     const status = JSON.parse(h.io.stdoutText);
     // One server + one state file for the whole file: envelopeCount includes
@@ -355,7 +355,7 @@ describe("assets, classes, sync", () => {
 
   it("object create prints a bare id in human mode", async () => {
     const h = harness;
-    expect(await h.runCli("object", "create", "--presentAsMain", "--name", "t6-human")).toBe(EXIT.ok);
+    expect(await h.runCli("object", "create", "--no-isEmbedded", "--name", "t6-human")).toBe(EXIT.ok);
     expect(h.io.stdoutText.trim()).toMatch(/^[0-9a-f-]{36}$/);
   });
 });
@@ -399,7 +399,7 @@ describe("export markdown", () => {
     const manifest = JSON.parse(readFileSync(join(dir, "notees-manifest.json"), "utf8")) as {
       format: string;
       version: number;
-      nodes: { id: string; name: string; type: string; isClass: boolean; presentAsMain: boolean }[];
+      nodes: { id: string; name: string; type: string; isClass: boolean; isEmbedded: boolean }[];
     };
     expect(manifest.format).toBe("notees-markdown");
     expect(manifest.version).toBe(2);
@@ -408,7 +408,7 @@ describe("export markdown", () => {
       name: "expm-file-a",
       type: "page",
       isClass: false,
-      presentAsMain: true,
+      isEmbedded: false,
     });
   });
 
@@ -437,7 +437,7 @@ describe("export markdown", () => {
     const pageId = await h.createPage("expm-parent", [{ type: "text", text: "parent body" }]);
     await h.runCliWithStdin(
       JSON.stringify({
-        presentAsMain: false,
+        isEmbedded: true,
         parentId: pageId,
         contentAst: [{ type: "text", text: "child bullet body" }],
       }),
@@ -466,7 +466,7 @@ describe("export markdown", () => {
     ): Record<string, unknown> => ({
       id,
       isClass: false,
-      presentAsMain: false,
+      isEmbedded: true,
       parentId: pageId,
       classIds: [],
       name: null,
@@ -476,7 +476,7 @@ describe("export markdown", () => {
     });
     const objects = new Map<string, Record<string, unknown>>([
       [pageId, objectFixture(pageId, {
-        presentAsMain: true,
+        isEmbedded: false,
         parentId: null,
         name: "fake page",
         contentAst: [{ type: "text", text: "fake page" }],
@@ -485,7 +485,7 @@ describe("export markdown", () => {
       [childB, objectFixture(childB, { contentAst: [{ type: "text", text: "beta body" }] })],
       [grand, objectFixture(grand, { parentId: childB, contentAst: [{ type: "text", text: "grand body" }] })],
       [childPage, objectFixture(childPage, {
-        presentAsMain: true,
+        isEmbedded: false,
         contentAst: [{ type: "text", text: "child page body" }],
       })],
     ]);
@@ -547,7 +547,7 @@ describe("export markdown", () => {
     const pageId = await h.createPage("expm-order-parent", []);
     const mkChild = async (text: string): Promise<string> => {
       const code = await h.runCliWithStdin(
-        JSON.stringify({ presentAsMain: false, parentId: pageId, contentAst: [{ type: "text", text }] }),
+        JSON.stringify({ isEmbedded: true, parentId: pageId, contentAst: [{ type: "text", text }] }),
         "--json", "object", "create", "--stdin",
       );
       if (code !== EXIT.ok) throw new Error(`mkChild ${text} failed: ${h.io.stderrText}`);
@@ -558,7 +558,7 @@ describe("export markdown", () => {
     const c = await mkChild("order-third");
     // A main child: exported as its own file when selected, never a bullet.
     await h.runCliWithStdin(
-      JSON.stringify({ presentAsMain: true, parentId: pageId, contentAst: [{ type: "text", text: "order-main-child-body" }] }),
+      JSON.stringify({ isEmbedded: false, parentId: pageId, contentAst: [{ type: "text", text: "order-main-child-body" }] }),
       "--json", "object", "create", "--stdin",
     );
 
@@ -883,13 +883,13 @@ describe("search (query language)", () => {
       ).propertySchema.id;
     }
     const { id } = await apiPost<{ id: string }>("/api/objects", {
-      presentAsMain: true,
+      isEmbedded: false,
       // Title-is-content: the paper's own content IS its title.
       contentAst: [{ type: "text", text: name }],
       classIds: [SYSTEM_CLASS_UUIDS.paper],
     });
     await apiPost<{ id: string }>("/api/objects", {
-      presentAsMain: false,
+      isEmbedded: true,
       parentId: id,
       contentAst: [{ type: "text", text: `${name} body text` }],
     });
@@ -941,7 +941,7 @@ describe("search (query language)", () => {
     const notes = await h.createPage("dsllinknotes", []);
     const notesBlock = await h.runCliWithStdin(
       JSON.stringify({
-        presentAsMain: false,
+        isEmbedded: true,
         parentId: notes,
         contentAst: [
           { type: "mention", targetNodeId: target, text: "the linked paper" },
@@ -955,7 +955,7 @@ describe("search (query language)", () => {
     const other = await h.createPage("dsllinkother", []);
     const otherBlock = await h.runCliWithStdin(
       JSON.stringify({
-        presentAsMain: false,
+        isEmbedded: true,
         parentId: other,
         contentAst: [{ type: "text", text: "revolutionary manifesto" }],
       }),
@@ -1097,7 +1097,7 @@ describe("shell (scripted mode)", () => {
     // Piped stdin runs as a script: helpers are globals, top-level await works.
     const script = `
       const p = await create({
-        presentAsMain: true,
+        isEmbedded: false,
         contentAst: [{ type: "text", text: "shell-t1-page" }],
       });
       console.log("created " + p.id);
@@ -1141,7 +1141,7 @@ describe("shell (scripted mode)", () => {
 
     const script = `
       const p = await create({
-        presentAsMain: true,
+        isEmbedded: false,
         name: "shell-t2-src",
         classIds: ["${SYSTEM_CLASS_UUIDS.book}"],
       });
@@ -1192,7 +1192,7 @@ describe("shell (scripted mode)", () => {
       const source = klasses.find((c) => c.name === "Source");
       const binding = await setClassProperty(source.id, schema.id, { sequence: 99, defaultValue: "shell-def" });
       console.log("bound " + binding.sequence + " " + binding.defaultValue);
-      const obj = await create({ presentAsMain: true, name: "shell-pg7-src", classIds: [source.id] });
+      const obj = await create({ isEmbedded: false, name: "shell-pg7-src", classIds: [source.id] });
       await setProperty(obj.id, schema.id, "shell-authored");
       const eff = await effective(obj.id);
       console.log("shadowed " + eff.find((r) => r.schemaId === schema.id).value);
@@ -1356,7 +1356,7 @@ describe("shell op submission", () => {
   it("submitOp sends an op through the relay batch path and it applies", async () => {
     const h = harness;
     const script = `
-      const p = await create({ presentAsMain: true, contentAst: [{ type: "text", text: "submitop-target" }] });
+      const p = await create({ isEmbedded: false, contentAst: [{ type: "text", text: "submitop-target" }] });
       const res = await submitOp("object.update", { objectId: p.id, contentAst: [{ type: "text", text: "submitop-renamed" }] }, [p.id]);
       console.log("saved " + res.savedCount);
       const after = await get(p.id);
@@ -1534,7 +1534,7 @@ describe("object children", () => {
   it("lists direct children in child-position order with render kinds", async () => {
     const h = harness;
     const parent = await h.createPage("children-probe", []);
-    expect(await h.runCli("object", "create", "--name", "child-main", "--parent", parent, "--presentAsMain")).toBe(
+    expect(await h.runCli("object", "create", "--name", "child-main", "--parent", parent, "--no-isEmbedded")).toBe(
       EXIT.ok,
     );
     const mainId = h.io.stdoutText.trim();
@@ -1545,7 +1545,7 @@ describe("object children", () => {
 
     expect(await h.runCli("--json", "object", "children", parent)).toBe(EXIT.ok);
     const res = JSON.parse(h.io.stdoutText) as {
-      children: Array<{ id: string; name: string | null; presentAsMain: boolean }>;
+      children: Array<{ id: string; name: string | null; isEmbedded: boolean }>;
     };
     expect(res.children.map((c) => c.id)).toEqual([mainId, b1, b2]);
     expect(res.children.map((c) => c.name)).toEqual(["child-main", "child-block-1", "child-block-2"]);
@@ -1794,7 +1794,7 @@ describe("datetime properties (unified wire batch)", () => {
         method: "POST",
         url: "/api/objects",
         headers: { "content-type": "application/json", "x-api-key": API_KEY },
-        payload: { id, presentAsMain: true, ...(parentId !== null ? { parentId } : {}), classIds: [classId], name: label },
+        payload: { id, isEmbedded: false, ...(parentId !== null ? { parentId } : {}), classIds: [classId], name: label },
       });
       expect([201, 409]).toContain(res.statusCode);
     }
@@ -1889,7 +1889,7 @@ describe("export json", () => {
   interface ArchiveNode {
     id: string;
     isClass: boolean;
-    presentAsMain: boolean;
+    isEmbedded: boolean;
     parentId: string | null;
     displayName: string;
     contentAst: unknown[];
@@ -1922,7 +1922,7 @@ describe("export json", () => {
     const node = archive.nodes[0]!;
     expect(node.id).toBe(referrer);
     expect(node.isClass).toBe(false);
-    expect(node.presentAsMain).toBe(true);
+    expect(node.isEmbedded).toBe(false);
     expect(node.parentId).toBeNull();
     // Title-is-content: the page's own stream IS its title; the mention block
     // created by the helper rides as a child id (blocks are not in an
@@ -1938,7 +1938,7 @@ describe("export json", () => {
     const pageId = await h.createPage("expj-parent", [{ type: "text", text: "inline block" }]);
     await h.runCliWithStdin(
       JSON.stringify({
-        presentAsMain: true,
+        isEmbedded: false,
         parentId: pageId,
         contentAst: [{ type: "text", text: "child page" }],
       }),
@@ -2349,7 +2349,7 @@ describe("search by uuid", () => {
     expect(
       await h.runCliWithStdin(
         JSON.stringify({
-          presentAsMain: false,
+          isEmbedded: true,
           parentId: notes,
           contentAst: [{ type: "mention", targetNodeId: target, text: "uuid-link-target" }],
         }),
@@ -2369,7 +2369,7 @@ describe("shell script file", () => {
     const scriptPath = join(h.dataDir, "shell-probe.js");
     writeFileSync(
       scriptPath,
-      'const page = await create({ presentAsMain: true, contentAst: [{ type: "text", text: "from-file" }] });\n'
+      'const page = await create({ isEmbedded: false, contentAst: [{ type: "text", text: "from-file" }] });\n'
         + 'console.log("made " + page.id);\n',
     );
     expect(await h.runCli("shell", scriptPath)).toBe(EXIT.ok);

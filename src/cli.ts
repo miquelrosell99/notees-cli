@@ -158,7 +158,7 @@ async function objectGetMany(ctx: CommandContext, ids: string[]): Promise<void> 
 
 /** Shared create-body assembly for `object create` / `object upsert`. */
 function buildCreateBody(options: {
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   isClass?: boolean;
   name?: string;
   class?: string[];
@@ -166,11 +166,11 @@ function buildCreateBody(options: {
 }): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   // Revision 11 render state: --isClass declares a class node (a root —
-  // rejected server-side alongside --parent/--class); --presentAsMain sets
+  // rejected server-side alongside --parent/--class); --isEmbedded/--no-isEmbedded set
   // the render bit (server default: true when parentless, false when
   // parented).
   if (options.isClass === true) body.isClass = true;
-  if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
+  if (options.isEmbedded !== undefined) body.isEmbedded = options.isEmbedded;
   if (options.name !== undefined) body.name = options.name;
   if (options.parent !== undefined) body.parentId = options.parent;
   const classIds = options.class ?? [];
@@ -204,7 +204,7 @@ function nonNegativeIntOption(raw: string | undefined, flag: string): number | u
 }
 
 async function objectCreate(ctx: CommandContext, options: {
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   isClass?: boolean;
   name?: string;
   content?: string;
@@ -251,7 +251,7 @@ async function objectCreate(ctx: CommandContext, options: {
 /**
  * `notees object create --batch` — bulk import from a JSON array on stdin:
  * one create per entry, each entry a POST /api/objects body (`name`,
- * `contentAst`, `parentId`, `presentAsMain`, `classIds`, … — the server
+ * `contentAst`, `parentId`, `isEmbedded`, `classIds`, … — the server
  * validates). Entries group by parent and groups run concurrently; entries
  * under one parent stay sequential, because child position follows apply
  * order and bulk blocks under a single parent must keep their array order.
@@ -405,7 +405,7 @@ async function objectChildren(ctx: CommandContext, id: string, options: {
 
   const rows = children.map((child) => [
     typeof child.name === "string" && child.name.length > 0 ? child.name : "(untitled)",
-    renderKindLabel(child as { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }),
+    renderKindLabel(child as { isClass?: boolean; isEmbedded?: boolean; parentId?: string | null }),
     String(child.id),
   ]);
   const suffix =
@@ -529,7 +529,7 @@ async function objectUpsert(ctx: CommandContext, options: {
   name?: string;
   class?: string[];
   parent?: string;
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
 }): Promise<void> {
   const name = options.name ?? "";
   const wanted = name.trim().toLowerCase();
@@ -569,7 +569,7 @@ async function objectUpsert(ctx: CommandContext, options: {
     name,
     class: classIds,
     ...(options.parent !== undefined ? { parent: options.parent } : {}),
-    ...(options.presentAsMain !== undefined ? { presentAsMain: options.presentAsMain } : {}),
+    ...(options.isEmbedded !== undefined ? { isEmbedded: options.isEmbedded } : {}),
   });
   const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/objects", createBody);
   emit(ctx, `${created.id}\n`, { ...created, created: true });
@@ -578,7 +578,7 @@ async function objectUpsert(ctx: CommandContext, options: {
 async function objectUpdate(ctx: CommandContext, id: string, options: {
   name?: string;
   content?: string;
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   icon?: string;
   color?: string;
 }): Promise<void> {
@@ -594,14 +594,14 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   if (contentAst !== undefined) body.contentAst = contentAst;
   // Promotion/demotion: flip the render bit between the parent's
   // main-children zone (true) and the inline body (false).
-  if (options.presentAsMain !== undefined) body.presentAsMain = options.presentAsMain;
+  if (options.isEmbedded !== undefined) body.isEmbedded = options.isEmbedded;
   if (options.icon !== undefined) body.icon = options.icon;
   if (options.color !== undefined) {
     // Color grammar (SCHEMA.md): preset token or #RRGGBB; "none" clears.
     body.color = options.color.toLowerCase() === "none" ? null : options.color;
   }
   if (Object.keys(body).length === 0) {
-    failUsage("object update requires at least one of --name, --content, --presentAsMain, --icon, --color");
+    failUsage("object update requires at least one of --name, --content, --isEmbedded, --icon, --color");
   }
   const updated = await ctx.client.patchJson<{ object: unknown }>(
     `/api/objects/${encodeURIComponent(id)}`,
@@ -616,10 +616,10 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
  * non-class node with document chrome (parentless or render-bit set) is a
  * "page", and a parented node with the bit unset is a "block".
  */
-function renderKindLabel(node: { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }): string {
+function renderKindLabel(node: { isClass?: boolean; isEmbedded?: boolean; parentId?: string | null }): string {
   if (node.isClass === true) return "class";
   if (node.isClass === false) {
-    return node.parentId === null || node.presentAsMain === true ? "page" : "block";
+    return node.parentId === null || node.isEmbedded === false ? "page" : "block";
   }
   return "object";
 }
@@ -628,9 +628,9 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
   const permanent = options.permanent === true;
   if (options.yes !== true) {
     // Blast-radius preview — never prompt when --json or non-tty.
-    let preview: { name?: string | null; isClass?: boolean; presentAsMain?: boolean } = {};
+    let preview: { name?: string | null; isClass?: boolean; isEmbedded?: boolean } = {};
     try {
-      const fetched = await ctx.client.getJson<{ object: { name?: string | null; isClass?: boolean; presentAsMain?: boolean } }>(
+      const fetched = await ctx.client.getJson<{ object: { name?: string | null; isClass?: boolean; isEmbedded?: boolean } }>(
         `/api/objects/${encodeURIComponent(id)}`,
       );
       preview = fetched.object;
@@ -655,7 +655,7 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
 
 async function objectList(ctx: CommandContext, options: {
   isClass?: boolean;
-  presentAsMain?: boolean;
+  isEmbedded?: boolean;
   class?: string[];
   parent?: string;
   trashed?: boolean;
@@ -676,7 +676,7 @@ async function objectList(ctx: CommandContext, options: {
         : undefined;
   const pageParams = {
     isClass: options.isClass,
-    presentAsMain: options.presentAsMain,
+    isEmbedded: options.isEmbedded,
     ...(classes.length === 1 ? { class: classes[0] } : {}),
     ...(options.parent !== undefined ? { parent: options.parent } : {}),
     ...(options.trashed === true ? { trashed: "true" } : {}),
@@ -699,20 +699,20 @@ async function objectList(ctx: CommandContext, options: {
   const machine = { objects, nextCursor: options.all === true ? null : (nextCursor ?? null) };
   const rows = objects.map((object) => [
     typeof object.name === "string" && object.name.length > 0 ? object.name : "(untitled)",
-    renderKindLabel(object as { isClass?: boolean; presentAsMain?: boolean; parentId?: string | null }),
+    renderKindLabel(object as { isClass?: boolean; isEmbedded?: boolean; parentId?: string | null }),
     String(object.id),
   ]);
   emit(ctx, `${formatTable([["NAME", "KIND", "ID"], ...rows])}\n`, machine);
 }
 
-async function search(ctx: CommandContext, queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }): Promise<void> {
+async function search(ctx: CommandContext, queryText: string, options: { isClass?: boolean; isEmbedded?: boolean }): Promise<void> {
   // Plain text goes to the FTS endpoint; query-language syntax (class:,
   // prop:…, AND/OR/NOT, quotes — see looksLikeQueryLanguage) is compiled to a
   // QueryAST here and executed through POST /api/query. DSL parse errors
   // fail loud (exit 2) with the parser's message — never silently degraded
   // to a text search.
   if (!looksLikeQueryLanguage(queryText)) {
-    const query = queryString({ q: queryText, isClass: options.isClass, presentAsMain: options.presentAsMain });
+    const query = queryString({ q: queryText, isClass: options.isClass, isEmbedded: options.isEmbedded });
     const body = await ctx.client.getJson<unknown>(`/api/search${query}`);
     emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
     return;
@@ -729,7 +729,7 @@ async function search(ctx: CommandContext, queryText: string, options: { isClass
 interface SearchRow {
   id: string;
   isClass: boolean;
-  presentAsMain: boolean;
+  isEmbedded: boolean;
   parentId: string | null;
   name: string | null;
 }
@@ -1461,7 +1461,7 @@ async function coverSet(
   } else {
     const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
       name: basename(file!),
-      presentAsMain: true,
+      isEmbedded: false,
       classIds: [ASSET_CLASS_ID],
     });
     assetId = created.id;
@@ -1831,7 +1831,7 @@ async function ensureChainNode(
   try {
     await ctx.client.postJson("/api/objects", {
       id,
-      presentAsMain: true,
+      isEmbedded: false,
       ...(parentId !== null ? { parentId } : {}),
       classIds: [classId],
       name: label,
@@ -1893,7 +1893,7 @@ async function findOrCreatePerson(
   const existing = await findPersonByName(ctx, literal);
   if (existing !== undefined) return existing;
   const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-    presentAsMain: true,
+    isEmbedded: false,
     name: literal,
     classIds: [SYSTEM_CLASS_UUIDS.person],
   });
@@ -1923,7 +1923,7 @@ async function upsertSourceByCitekey(
   let id: string;
   if (existing === undefined) {
     const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-      presentAsMain: true,
+      isEmbedded: false,
       name: spec.title,
       classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
     });
@@ -2217,10 +2217,10 @@ function buildProgram(): Command {
   object
     .command("create")
     .description("create an object (prints the new id)")
-    .option("--isClass", "declare a class node (a root: no --parent/--class/--presentAsMain)")
+    .option("--isClass", "declare a class node (a root: no --parent/--class/--isEmbedded)")
     .option(
-      "--presentAsMain",
-      "render bit: set for the parent's main-children zone (server default: true when parentless, false when parented)",
+      "--isEmbedded",
+      "embedding flag: false = standalone, the parent's main-children zone (server default: 0 parentless, 1 parented)",
       undefined,
     )
     .option("--name <name>", "object name")
@@ -2385,10 +2385,10 @@ function buildProgram(): Command {
     .option("--class <id>", "class id scope (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "parent object id scope")
     .addOption(
-      new Option("--presentAsMain", "create with the render bit set (main-children zone)").default(undefined),
+      new Option("--isEmbedded", "create embedded in the parent's body (the Block role — the server default when parented)").default(undefined),
     )
-    .addOption(new Option("--no-presentAsMain", "create with the render bit unset (inline body)"))
-    .action(async (options: { name?: string; class?: string[]; parent?: string; presentAsMain?: boolean }, command: Command) => {
+    .addOption(new Option("--no-isEmbedded", "create standalone (the Page role — the parent's main-children zone)"))
+    .action(async (options: { name?: string; class?: string[]; parent?: string; isEmbedded?: boolean }, command: Command) => {
       await objectUpsert(ctxOf(command), options);
     });
   object
@@ -2400,14 +2400,14 @@ function buildProgram(): Command {
       "replace the node's content with this contentAst token array (mentions, external links, …; mutually exclusive with --name)",
     )
     .addOption(
-      new Option("--presentAsMain", "promote: render the node in its parent's main-children zone").default(
+      new Option("--no-isEmbedded", "promote: standalone under the parent (the Page role)").default(
         undefined,
       ),
     )
-    .addOption(new Option("--no-presentAsMain", "demote: render the node in the inline body"))
+    .addOption(new Option("--isEmbedded", "demote: embed the node in the parent's body (the Block role)"))
     .option("--icon <icon>", "icon")
     .option("--color <color>", "color: preset token (red…gray) or #RRGGBB; 'none' clears")
-    .action(async (id: string, options: { name?: string; presentAsMain?: boolean; icon?: string; color?: string }, command: Command) => {
+    .action(async (id: string, options: { name?: string; isEmbedded?: boolean; icon?: string; color?: string }, command: Command) => {
       await objectUpdate(ctxOf(command), id, options);
     });
   object
@@ -2425,12 +2425,12 @@ function buildProgram(): Command {
     .addOption(new Option("--no-isClass", "filter: non-class nodes only"))
     .addOption(
       new Option(
-        "--presentAsMain",
-        "filter: document-chrome rows (non-class roots + main children — the pages-ish listing)",
+        "--isEmbedded",
+        "filter: embedded body rows (parented non-class nodes with the flag set — blocks)",
       ).default(undefined),
     )
     .addOption(
-      new Option("--no-presentAsMain", "filter: inline-body blocks (parented rows with the render bit unset)"),
+      new Option("--no-isEmbedded", "filter: standalone rows (non-class roots + child pages — the pages listing)"),
     )
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "filter: direct children of this object id")
@@ -2447,19 +2447,19 @@ function buildProgram(): Command {
   program
     .command("search <query>")
     .description(
-      "search — plain text (FTS) or the query language: class:Name (name or uuid), isClass:true|false, presentAsMain:true|false, " +
+      "search — plain text (FTS) or the query language: class:Name (name or uuid), isClass:true|false, isEmbedded:true|false, " +
         "prop:name:<op>value (:= != :> :>= :< :<=, bare : = contains, no value = exists; schema by name or uuid), " +
         "bare schema fields (year:>2010), text:term, linked:Name (name or uuid), \"quoted phrases\", AND OR NOT, ( )",
     )
     .addOption(new Option("--isClass", "filter: class nodes only (plain-text search only)").default(undefined))
     .addOption(new Option("--no-isClass", "filter: non-class nodes only (plain-text search only)"))
     .addOption(
-      new Option("--presentAsMain", "filter: document-chrome rows only (plain-text search only)").default(undefined),
+      new Option("--isEmbedded", "filter: embedded body rows only — blocks (plain-text search only)").default(undefined),
     )
     .addOption(
-      new Option("--no-presentAsMain", "filter: inline-body blocks only (plain-text search only)"),
+      new Option("--no-isEmbedded", "filter: standalone rows only — pages (plain-text search only)"),
     )
-    .action(async (queryText: string, options: { isClass?: boolean; presentAsMain?: boolean }, command: Command) => {
+    .action(async (queryText: string, options: { isClass?: boolean; isEmbedded?: boolean }, command: Command) => {
       await search(ctxOf(command), queryText, options);
     });
 

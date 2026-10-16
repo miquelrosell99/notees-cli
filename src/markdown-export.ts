@@ -18,7 +18,7 @@ import { CliError, EXIT } from "./exit-codes.js";
 export interface ExportApiObject {
   id: string;
   isClass: boolean;
-  presentAsMain: boolean;
+  isEmbedded: boolean;
   parentId: string | null;
   classIds: string[];
   name: string | null;
@@ -48,7 +48,7 @@ export function toExportNode(obj: ExportApiObject, schemaIndex?: SchemaIndex): E
   return {
     id: obj.id,
     isClass: obj.isClass ? 1 : 0,
-    presentAsMain: obj.presentAsMain ? 1 : 0,
+    isEmbedded: obj.isEmbedded ? 1 : 0,
     parentId: obj.parentId ?? null,
     name: obj.name ?? null,
     contentAst: Array.isArray(obj.contentAst) ? (obj.contentAst as ExportNode["contentAst"]) : [],
@@ -91,9 +91,9 @@ export interface ApiEdgeRow {
 /** Document-chrome predicate over the export shape (Revision 11): non-class
  * nodes render as documents when parentless or render-bit set. */
 export function rendersAsDocument(
-  node: Pick<ExportNode, "isClass" | "presentAsMain" | "parentId">,
+  node: Pick<ExportNode, "isClass" | "isEmbedded" | "parentId">,
 ): boolean {
-  return node.isClass === 0 && (node.parentId === null || node.presentAsMain === 1);
+  return node.isClass === 0 && (node.parentId === null || node.isEmbedded === 0);
 }
 
 /** One property value's ref ids, unified-datetime aware: a point `{nodeId}`
@@ -289,7 +289,7 @@ export async function buildMarkdownBundle(
     }
     const inline: ExportNode[] = [];
     for (const child of rows) {
-      if (child.parentId === null || child.isClass || child.presentAsMain) continue;
+      if (child.parentId === null || child.isClass || !child.isEmbedded) continue;
       inline.push(toExportNode(child, schemaIndex));
       pending.push(child.id);
     }
