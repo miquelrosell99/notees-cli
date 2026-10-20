@@ -1179,7 +1179,6 @@ describe("shell (scripted mode)", () => {
         name: "shell-pg7-code",
         type: "text",
         multi: false,
-        scope: "class",
       });
       console.log("created " + schema.id);
       const renamed = await updatePropertySchema(schema.id, { name: "shell-pg7-key" });
@@ -1735,7 +1734,7 @@ describe("object property set/delete", () => {
       method: "POST",
       url: "/api/property-schemas",
       headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      payload: { propertySchemaId: schemaId, name: "cliProbeRating", type: "number", multi: false, scope: "global" },
+      payload: { propertySchemaId: schemaId, name: "cliProbeRating", type: "number", multi: false },
     });
     expect(created.statusCode).toBe(201);
 

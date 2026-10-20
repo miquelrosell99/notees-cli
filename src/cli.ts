@@ -1111,7 +1111,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "4.1.0";
+const CLI_VERSION = "4.1.1";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
@@ -1530,7 +1530,11 @@ interface ApiPropertySchema {
   name: string;
   type: string;
   multi: boolean;
-  scope: string;
+  icon: string | null;
+  /** The sole locality authority (the retired `scope` enum is gone): null =
+   * global (any node may carry it); a non-empty class-id list = local to those
+   * classes and their extends-ancestors. */
+  scopeClassIds: string[] | null;
   options: Array<{ id: string; label: string }> | null;
   targetClassFilter: string[] | null;
   datePrecision: string | null;
@@ -1539,11 +1543,21 @@ interface ApiPropertySchema {
 
 async function propertyList(ctx: CommandContext): Promise<void> {
   const body = await ctx.client.getJson<{ propertySchemas: ApiPropertySchema[] }>("/api/property-schemas");
+  // Resolve locality class ids to names for the human table (one listing
+  // call; ids with no live class row fall back to the raw id).
+  const scopedIds = [...new Set(body.propertySchemas.flatMap((schema) => schema.scopeClassIds ?? []))];
+  const classNames = new Map<string, string>();
+  if (scopedIds.length > 0) {
+    const listing = await ctx.client.getJson<{ classes: Array<{ id: string; name: string }> }>("/api/classes");
+    for (const klass of listing.classes) classNames.set(klass.id, klass.name);
+  }
   const rows = body.propertySchemas.map((schema) => [
     schema.name,
     schema.type,
     schema.multi ? "multi" : "",
-    schema.scope,
+    schema.scopeClassIds === null
+      ? "global"
+      : schema.scopeClassIds.map((id) => classNames.get(id) ?? id).join(", "),
     schema.id,
   ]);
   emit(ctx, `${formatTable([["NAME", "TYPE", "MULTI", "SCOPE", "ID"], ...rows])}\n`, body);
@@ -1604,7 +1618,6 @@ async function propertyCreate(
     name,
     type,
     multi: options.multi === true,
-    scope: "global",
     ...(options.option !== undefined && options.option.length > 0
       ? {
           options: options.option.map((label) => ({
@@ -1726,7 +1739,6 @@ async function ensurePropertySchema(ctx: CommandContext, name: SystemPropertyNam
     name,
     type: spec.type,
     multi: spec.multi ?? false,
-    scope: "class",
     ...(spec.options !== undefined ? { options: spec.options } : {}),
     ...(spec.targetClassFilter !== undefined
       ? { targetClassFilter: spec.targetClassFilter.map((className: SystemClassName) => SYSTEM_CLASS_UUIDS[className]) }

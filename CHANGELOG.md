@@ -6,6 +6,33 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-20
+
+- **feat(model): the CLI rides the property-scope retirement batch —
+  scopeClassIds is the sole locality authority.** The main monorepo retired
+  the display-only `scope: "global"|"class"|"object"` enum (rejected outright
+  like any retired key; live logs rewrite in place via
+  `scripts/migrate-property-scope.mts`) and made a schema's `scopeClassIds`
+  (absent/null = global; a non-empty class list = local to those classes and
+  their extends-ancestors) the only thing that says who may carry a property.
+  The batch also added the schema `icon`, update-side
+  `targetClassFilter`/`multi`/`validationRules` (min/max/pattern, enforced at
+  `property.set`), the R3/R5 eligibility guards (ineligible authored values
+  read tagged `eligible: false`, never derived), and the node `listStyle`
+  (numbered/alpha/roman). The CLI follows: vendor pin bumped
+  `0033e84b → 668a835b` (the batch's convergence commit on the main repo's
+  main); `property create` and the bibtex import's system-schema get-or-create
+  stop sending the retired `scope` key (global is the absence of
+  `scopeClassIds`; the server's strict payload rejected the old spelling with
+  a 422); `property list`'s SCOPE column renders the locality from
+  `scopeClassIds`, resolving class ids to titles via one `/api/classes` call
+  (ids with no live class row fall back to the raw id; `--json` keeps passing
+  the server rows through verbatim, now carrying `scopeClassIds`, `icon`, and
+  `validationRules`); `--targetClass` keeps feeding `targetClassFilter`
+  (unchanged semantics — node-typed target constraint, orthogonal to
+  locality). Gate: `pnpm typecheck && pnpm test` green (87 tests; the retired-
+  scope fixtures in the suite drop the enum the way the wire now demands).
+
 ## 2026-10-13
 
 - **feat(merge): `notees object merge <source> <target>` — merge one object
