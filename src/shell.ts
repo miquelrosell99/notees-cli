@@ -98,7 +98,7 @@ export interface ShellHelpers {
   updatePropertySchema(id: string, fields: Record<string, unknown>): Promise<unknown>;
   /** propertySchema.delete — soft-delete (authored values survive). */
   deletePropertySchema(id: string): Promise<unknown>;
-  /** class.property.set — the binding patch (sequence/flags/defaultValue). */
+  /** class.property.set — the binding upsert (presence-only since the sequence/required/defaultValue retirement; the global default lives on the schema). */
   setClassProperty(classId: string, propertySchemaId: string, fields: Record<string, unknown>): Promise<unknown>;
   /** class.property.unset — remove the binding (authored values survive). */
   unsetClassProperty(classId: string, propertySchemaId: string): Promise<unknown>;
@@ -144,7 +144,7 @@ giant heredoc):
   createPropertySchema(input)                propertySchema.create (input carries the schema uuid) -> schema
   updatePropertySchema(id, fields)           propertySchema.update (name/options/datePrecision/dateQualified) -> schema
   deletePropertySchema(id)                   propertySchema.delete (soft-delete; authored values survive)
-  setClassProperty(classId, schemaId, fields)  class.property.set (sequence/flags/defaultValue patch) -> binding
+  setClassProperty(classId, schemaId, fields)  class.property.set (presence-only binding upsert) -> binding
   unsetClassProperty(classId, schemaId)      class.property.unset (authored values survive)
   upload(filePath)                           upload a file from disk -> asset id
   exportMd(ids) (alias: export)              markdown bundle text for the given object ids

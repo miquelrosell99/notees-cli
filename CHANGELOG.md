@@ -6,6 +6,52 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-21
+
+- **feat(content,model): the CLI rides the external_link retirement AND the
+  property-definition batch — vendor pin `668a835b → 278fb7cfe`.** The pin
+  crosses three breaking slices on the main repo's main; the CLI follows all
+  of them (the lockstep law — the pin is the boundary, the CLI rides what it
+  carries):
+  - **`external_link` retires** (main commit `077f84b1`; normative grammar in
+    SCHEMA.md): links are markdown `[label](href)` spans inside ordinary
+    `text` tokens, parsed at render time; the retired token no longer passes
+    the strict content schema. The `--content` help text and docs comment
+    describe links as `[label](href)` spans in text tokens instead of
+    external links as a token type; the e2e `--content` test stores and
+    round-trips a text token carrying a markdown link next to a mention (the
+    old `external_link` payload is a strict-schema 422 now). The markdown
+    exporter needed no CLI-side change: it delegates to the vendored
+    `@notees/export` serializer, whose `renderSpan` text case splits links
+    with `splitMarkdownLinks` (`@notees/domain`) and emits link segments
+    verbatim while escaping non-link segments — previously `external_link`
+    tokens were silently dropped.
+  - **Binding `sequence`/`required` retire; `defaultValue` moves to the
+    property schema** (main `26a19684b` + `71047ba5a`): `class.property.set` is strictly
+    `{classId, propertySchemaId, active?}` — the strict schema rejects
+    `sequence`, `required`, and `defaultValue` like any retired key, and
+    class properties render as a pure alphabetical list by property name.
+    `property bind` drops `--sequence`, `--required/--no-required`,
+    `--readonly/--no-readonly`, `--hideWhenEmpty/--no-hideWhenEmpty`, and
+    `--default` (the main repo's docs flagged this as the pending CLI
+    lockstep follow-up); the one global default is now
+    `property create --default <json>` (typed per the schema type at apply —
+    a wrong-typed default is a server-side 422). The shell's
+    `setClassProperty` doc comments follow; the e2e property + shell tests
+    re-anchor to the presence-only binding and the schema-level default.
+  - **Schema `readonly` retires** (main `4eda19e07`): never user
+    configuration — clients derive readonly-ness from the system property
+    list (`isReadonlyProperty`, `@notees/domain`); the CLI never surfaced
+    the flag on the schema verbs, so no CLI change beyond the bind flags
+    above.
+  - **`CLI_VERSION` 4.1.1 → 4.4.0** — the vendored server rejoined the tag
+    train at 4.4.0 (`SERVER_VERSION`), and `CLI_VERSION` rides the server's
+    release train; `doctor`'s drift check compares against it.
+  Gate: `pnpm typecheck && pnpm test` green (87 tests; run with a clean
+  environment — a `NOTEES_SERVER` env var leaks a server into the
+  missing-server usage test, which then exits 3 against that server instead
+  of 2).
+
 ## 2026-10-20
 
 - **feat(model): the CLI rides the property-scope retirement batch —
