@@ -179,8 +179,9 @@ function buildCreateBody(options: {
 }
 
 /**
- * `--content <json>`: a contentAst token array (mentions, external links,
- * … — the server is the strict shape gate). The array-ness is validated
+ * `--content <json>`: a contentAst token array (mentions, markdown links as
+ * `[label](href)` spans inside text tokens, … — the server is the strict
+ * shape gate). The array-ness is validated
  * client-side so a mistyped scalar fails as usage, not as a wire error.
  */
 function parseContentAstOption(raw: string | undefined): unknown[] | undefined {
@@ -1111,7 +1112,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "4.1.1";
+const CLI_VERSION = "4.4.0";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
@@ -1586,6 +1587,7 @@ async function propertyCreate(
     pad?: string;
     decimals?: string;
     rounding?: string;
+    default?: string;
   },
 ): Promise<void> {
   const type = options.type ?? "text";
@@ -1607,6 +1609,14 @@ async function propertyCreate(
   const numberRounding = options.rounding as "round" | "floor" | "ceil" | "truncate" | undefined;
   if (options.rounding !== undefined && !["round", "floor", "ceil", "truncate"].includes(options.rounding)) {
     failUsage("--rounding must be one of: round, floor, ceil, truncate");
+  }
+  let defaultValue: unknown;
+  if (options.default !== undefined) {
+    try {
+      defaultValue = JSON.parse(options.default) as unknown;
+    } catch {
+      failUsage("--default must be valid JSON (e.g. --default '\"n/a\"' or --default '42')");
+    }
   }
   const propertySchemaId = uuidv7();
   const targetClassFilter: string[] = [];
@@ -1630,6 +1640,7 @@ async function propertyCreate(
     ...(numberPad !== undefined ? { numberPad } : {}),
     ...(numberDecimals !== undefined ? { numberDecimals } : {}),
     ...(numberRounding !== undefined ? { numberRounding } : {}),
+    ...(options.default !== undefined ? { defaultValue } : {}),
   });
   emit(ctx, `${body.propertySchema.id}\n`, body);
 }
@@ -1664,43 +1675,23 @@ async function propertyDelete(
   emit(ctx, `deleted ${schema.id}\n`, { id: schema.id, deleted: true });
 }
 
-interface ClassPropertyFlags {
-  sequence?: string;
-  required?: boolean;
-  readonly?: boolean;
-  hideWhenEmpty?: boolean;
-  default?: string;
-}
-
-/** `notees property bind` — the class.property.set patch: omitted flags keep
- * their stored values, `--no-<flag>` clears them (null), --default parses as JSON. */
+/** `notees property bind` — the class.property.set upsert. The binding is
+ * presence-only since the property-definition batch: `sequence`, `required`,
+ * and `defaultValue` retired from the binding (the strict schema rejects
+ * them), and the one global default moved to the property schema
+ * (`property create --default`) — class properties render as a pure
+ * alphabetical list by property name. The endpoint requires at least one
+ * binding field, so a bind writes `active: true`. */
 async function propertyBind(
   ctx: CommandContext,
   classRef: string,
   schemaRef: string,
-  options: ClassPropertyFlags,
 ): Promise<void> {
   const klass = await resolveClassRef(ctx, classRef);
   const schema = await resolvePropertySchemaRef(ctx, schemaRef);
-  const body: Record<string, unknown> = { propertySchemaId: schema.id };
-  if (options.sequence !== undefined) {
-    const sequence = Number.parseInt(options.sequence, 10);
-    if (!Number.isInteger(sequence) || sequence < 0) failUsage("--sequence must be a non-negative integer");
-    body.sequence = sequence;
-  }
-  if (options.required !== undefined) body.required = options.required;
-  if (options.readonly !== undefined) body.readonly = options.readonly;
-  if (options.hideWhenEmpty !== undefined) body.hideWhenEmpty = options.hideWhenEmpty;
-  if (options.default !== undefined) {
-    try {
-      body.defaultValue = JSON.parse(options.default) as unknown;
-    } catch {
-      failUsage("--default must be valid JSON (e.g. --default '\"n/a\"' or --default '42')");
-    }
-  }
   const res = await ctx.client.postJson<{ binding: unknown }>(
     `/api/classes/${encodeURIComponent(klass.id)}/properties`,
-    body,
+    { propertySchemaId: schema.id, active: true },
   );
   emit(ctx, `${JSON.stringify(res.binding, null, 2)}\n`, { classId: klass.id, ...res });
 }
@@ -2241,7 +2232,7 @@ function buildProgram(): Command {
     .option("--name <name>", "object name")
     .option(
       "--content <json>",
-      "contentAst token array for rich content (mentions, external links, …; mutually exclusive with --name)",
+      "contentAst token array for rich content (mentions, markdown links [label](href) in text tokens, …; mutually exclusive with --name)",
     )
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "parent object id")
@@ -2341,7 +2332,8 @@ function buildProgram(): Command {
     .option("--pad <n>", "number schemas: zero-pad the integer part to N digits (display only)")
     .option("--decimals <n>", "number schemas: digits after the point 0-10 (display only)")
     .option("--rounding <mode>", "number schemas: round | floor | ceil | truncate (display only)")
-    .action(async (name: string, options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[]; pad?: string; decimals?: string; rounding?: string }, command: Command) => {
+    .option("--default <json>", "the property's one global default value (JSON, typed per --type; a wrong-typed default is rejected server-side)")
+    .action(async (name: string, options: { type?: string; multi?: boolean; option?: string[]; targetClass?: string[]; pad?: string; decimals?: string; rounding?: string; default?: string }, command: Command) => {
       await propertyCreate(ctxOf(command), name, options);
     });
   schemaCmd
@@ -2360,19 +2352,11 @@ function buildProgram(): Command {
   schemaCmd
     .command("bind <class> <schema>")
     .description(
-      "bind a property schema to a class (class.property.set; class/schema: uuid or title/name; " +
-        "omitted flags keep their values, --no-<flag> clears)",
+      "bind a property schema to a class (class.property.set; class/schema: uuid or title/name — the binding is presence-only: " +
+        "class properties render alphabetically, the global default lives on the schema via property create --default)",
     )
-    .option("--sequence <n>", "binding order within the class")
-    .addOption(new Option("--required", "mark the binding required").default(undefined))
-    .addOption(new Option("--no-required", "clear the required flag"))
-    .addOption(new Option("--readonly", "mark the binding read-only").default(undefined))
-    .addOption(new Option("--no-readonly", "clear the read-only flag"))
-    .addOption(new Option("--hideWhenEmpty", "hide the row while unvalued").default(undefined))
-    .addOption(new Option("--no-hideWhenEmpty", "clear the hide-when-empty flag"))
-    .option("--default <json>", "binding default value (JSON; a wrong-typed default is rejected)")
-    .action(async (classRef: string, schemaRef: string, options: ClassPropertyFlags, command: Command) => {
-      await propertyBind(ctxOf(command), classRef, schemaRef, options);
+    .action(async (classRef: string, schemaRef: string, _options: object, command: Command) => {
+      await propertyBind(ctxOf(command), classRef, schemaRef);
     });
   schemaCmd
     .command("unbind <class> <schema>")
@@ -2412,7 +2396,7 @@ function buildProgram(): Command {
     .option("--name <name>", "new name")
     .option(
       "--content <json>",
-      "replace the node's content with this contentAst token array (mentions, external links, …; mutually exclusive with --name)",
+      "replace the node's content with this contentAst token array (mentions, markdown links [label](href) in text tokens, …; mutually exclusive with --name)",
     )
     .addOption(
       new Option("--isEmbedded", "demote: embed the node in the parent's body (the Block role)").default(

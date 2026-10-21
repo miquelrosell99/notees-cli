@@ -18,7 +18,7 @@ the CLI itself — for that, `notees-cli-development`.
   into content = create a block carrying a `mention` of the class node.
 - **Title-is-content; rich content lives on parented blocks.** A node's
   title IS its content. Root pages/classes carry **text-only** content —
-  rich tokens (`mention`, `external_link`, …) on a parentless create
+  rich tokens (`mention`, …) on a parentless create
   **flatten to their text server-side**. To keep a mention/link, create the
   block **under a parent** (`--parent`, or `presentAsMain: false` with a
   parentId).
@@ -30,8 +30,9 @@ the CLI itself — for that, `notees-cli-development`.
   existing Description means **append into its carrier block** (`object
   update <carrierId> --content '<ast>'`), not a second slot.
 - **Token shapes:** mention `{"type":"mention","targetNodeId":"<uuid>","text":"<label>"}`,
-  external link `{"type":"external_link","href":"https://…","text":"…"}`,
-  plain text `{"type":"text","text":"…"}`.
+  plain text `{"type":"text","text":"…"}` — links ride as markdown
+  `[label](href)` spans inside a text token (the retired `external_link`
+  token's replacement; SCHEMA.md render grammar).
 - **`--json` output is the contract** (additive-only). Drive scripts off it;
   human tables may change.
 

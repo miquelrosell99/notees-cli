@@ -1053,15 +1053,17 @@ describe("property schema verbs", () => {
     expect(await h.runCli("--json", "property", "get", "pg7-style")).toBe(EXIT.ok);
     expect((JSON.parse(h.io.stdoutText) as { propertySchema: { id: string } }).propertySchema.id).toBe(schemaId);
 
-    // bind to a class by title; unbind by name.
+    // bind to a class by title; unbind by name. The binding is
+    // presence-only since the property-definition batch — sequence,
+    // required, and the binding-level default retired from the wire.
     expect(await h.runCli("object", "create", "--isClass", "--name", "pg7-shelf")).toBe(EXIT.ok);
     const classId = h.io.stdoutText.trim();
     expect(
-      await h.runCli("--json", "property", "bind", "pg7-shelf", "pg7-style", "--sequence", "3", "--required", "--default", '"n/a"'),
+      await h.runCli("--json", "property", "bind", "pg7-shelf", "pg7-style"),
     ).toBe(EXIT.ok);
-    const bound = JSON.parse(h.io.stdoutText) as { classId: string; binding: { sequence: number; required: boolean; defaultValue: string } };
+    const bound = JSON.parse(h.io.stdoutText) as { classId: string; binding: { propertySchemaId: string; active: boolean } };
     expect(bound.classId).toBe(classId);
-    expect(bound.binding).toMatchObject({ sequence: 3, required: true, defaultValue: "n/a" });
+    expect(bound.binding).toMatchObject({ propertySchemaId: schemaId, active: true });
 
     expect(await h.runCli("property", "unbind", "pg7-shelf", "pg7-style")).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("unbound pg7-style from pg7-shelf");
@@ -1082,12 +1084,15 @@ describe("property schema verbs", () => {
     expect(await h.runCli("property", "get", "10000000-0000-4000-8000-00000000dead")).toBe(EXIT.domain);
     expect(await h.runCli("property", "rename", "citekey", "")).toBe(EXIT.usage);
 
-    // A wrong-typed binding default is a server-side 422 → exit 1.
-    expect(await h.runCli("property", "create", "pg7-num", "--type", "number")).toBe(EXIT.ok);
+    // The default is the schema's ONE global default (moved off the binding,
+    // owner 2026-10-20): set at create, typed per the schema type. A
+    // wrong-typed default is a server-side 422 → exit 1.
+    expect(await h.runCli("property", "create", "pg7-num", "--type", "number", "--default", "7")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "property", "get", "pg7-num")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).propertySchema as { defaultValue: unknown }).defaultValue).toBe(7);
     expect(await h.runCli("object", "create", "--isClass", "--name", "pg7-shelf-2")).toBe(EXIT.ok);
-    expect(
-      await h.runCli("property", "bind", "pg7-shelf-2", "pg7-num", "--default", '"not-a-number"'),
-    ).toBe(EXIT.domain);
+    expect(await h.runCli("property", "bind", "pg7-shelf-2", "pg7-num")).toBe(EXIT.ok);
+    expect(await h.runCli("property", "create", "pg7-num-bad", "--type", "number", "--default", '"not-a-number"')).toBe(EXIT.domain);
   });
 });
 
@@ -1179,6 +1184,7 @@ describe("shell (scripted mode)", () => {
         name: "shell-pg7-code",
         type: "text",
         multi: false,
+        defaultValue: "shell-def",
       });
       console.log("created " + schema.id);
       const renamed = await updatePropertySchema(schema.id, { name: "shell-pg7-key" });
@@ -1189,8 +1195,8 @@ describe("shell (scripted mode)", () => {
       console.log("got " + one.name);
       const klasses = await classes();
       const source = klasses.find((c) => c.name === "Source");
-      const binding = await setClassProperty(source.id, schema.id, { sequence: 99, defaultValue: "shell-def" });
-      console.log("bound " + binding.sequence + " " + binding.defaultValue);
+      const binding = await setClassProperty(source.id, schema.id, { active: true });
+      console.log("bound " + binding.active);
       const obj = await create({ isEmbedded: false, name: "shell-pg7-src", classIds: [source.id] });
       await setProperty(obj.id, schema.id, "shell-authored");
       const eff = await effective(obj.id);
@@ -1213,7 +1219,7 @@ describe("shell (scripted mode)", () => {
     expect(h.io.stdoutText).toContain("renamed shell-pg7-key");
     expect(h.io.stdoutText).toContain("listed true");
     expect(h.io.stdoutText).toContain("got shell-pg7-key");
-    expect(h.io.stdoutText).toContain("bound 99 shell-def");
+    expect(h.io.stdoutText).toContain("bound true");
     expect(h.io.stdoutText).toContain("shadowed shell-authored");
     expect(h.io.stdoutText).toContain("default-back shell-def");
     expect(h.io.stdoutText).toContain("deleted yes");
@@ -2175,16 +2181,17 @@ describe("property number formats", () => {
 
 
 describe("object create/update --content", () => {
-  it("create --content stores a rich contentAst (mention + external link tokens)", async () => {
+  it("create --content stores a rich contentAst (mention + markdown link span in text)", async () => {
     const h = harness;
     const target = await h.createPage("content-target", []);
     const holder = await h.createPage("content-holder", []);
     // Rich tokens survive on parented blocks; a root's content flattens to
-    // text-only by the page/class invariant.
+    // text-only by the page/class invariant. Links are markdown
+    // `[label](href)` spans inside text tokens (the retired external_link
+    // token's replacement — SCHEMA.md render grammar).
     const ast = JSON.stringify([
-      { type: "text", text: "See " },
+      { type: "text", text: "See [the example](https://example.com) and " },
       { type: "mention", targetNodeId: target, text: "content-target" },
-      { type: "external_link", href: "https://example.com", text: "the example" },
     ]);
     expect(await h.runCli("--json", "object", "create", "--parent", holder, "--content", ast)).toBe(EXIT.ok);
     const id = (JSON.parse(h.io.stdoutText) as { id: string }).id;
@@ -2192,9 +2199,8 @@ describe("object create/update --content", () => {
     expect(await h.runCli("--json", "object", "get", id)).toBe(EXIT.ok);
     const got = JSON.parse(h.io.stdoutText).object as { contentAst: Array<Record<string, unknown>> };
     expect(got.contentAst).toEqual([
-      { type: "text", text: "See " },
+      { type: "text", text: "See [the example](https://example.com) and " },
       { type: "mention", targetNodeId: target, text: "content-target" },
-      { type: "external_link", href: "https://example.com", text: "the example" },
     ]);
   });
 
