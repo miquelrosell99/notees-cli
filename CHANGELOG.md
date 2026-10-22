@@ -8,6 +8,22 @@ history.
 
 ## 2026-10-22
 
+- **fix(test): the suite blanks leaked `NOTEES_*` operator env for its
+  duration — the gate is environment-independent.** The fleet host's shell
+  exports `NOTEES_SERVER=http://localhost:8377`, which made the "missing
+  server → usage error (2)" test hit the live stack with the fake test key
+  and return auth (3) — a red gate that depended on what the operator shell
+  happened to carry, not on the code. `beforeAll` now saves and clears
+  `NOTEES_SERVER` / `NOTEES_WORKSPACE` / `NOTEES_API_KEY` / `NOTEES_EMAIL` /
+  `NOTEES_PASSWORD` (every var `src/` reads), `afterAll` restores them, and
+  `NOTEES_STATE_FILE` isolation is unchanged. Behavior change: none — test
+  harness only.
+  - **Verification**: `pnpm test` 87/87 **with the leak vars deliberately
+    exported** (`NOTEES_SERVER`, `NOTEES_WORKSPACE`, a decoy
+    `NOTEES_API_KEY`) — the exact combination that failed before the fix;
+    `pnpm typecheck` clean; `pnpm build` succeeds.
+  - **Files**: `test/cli.test.ts`.
+
 - **chore(vendor): vendor pin re-pointed at main `33e4af5e2 → bc3f856e7` —
   carrying the WS admission tickets (the `?token=` retirement).** The main
   repo retired the credential-in-URL fallback: the sync socket now admits
