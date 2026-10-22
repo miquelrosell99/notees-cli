@@ -8,6 +8,18 @@ history.
 
 ## 2026-10-22
 
+- **chore(vendor): vendor pin re-pointed AGAIN at the rewritten main — `a4796bda3 →
+  33e4af5e2` — the releases.md scrub.** The main repo's history was rewritten a
+  second time 2026-10-22 (every trace of the retired `docs/developers/releases.md`
+  scrubbed via `git filter-repo`; all SHAs changed again), invalidating the
+  morning's pin. The new pin's tree is content-identical at the tip (the scrub
+  only rewrites history, not content), so the vendored packages carry the same
+  system-extends lock — no functional delta.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm build` +
+    `pnpm typecheck` clean; `pnpm test` 87/87 (with `NOTEES_SERVER` unset —
+    see the previous entry's note).
+  - **Files**: `vendor/notees` (the pin).
+
 - **chore(vendor): vendor pin re-pointed at the rewritten main — `278fb7cfe →
   a4796bda3` — carrying the system-extends lock (and the readonly +
   binding-sequence retirements).** The main repo's history was rewritten
