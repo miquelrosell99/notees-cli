@@ -129,14 +129,36 @@ async function bootServer(): Promise<Harness> {
 }
 
 let harness: Harness;
+
+// The operator shell may export NOTEES_* defaults (the fleet host does) —
+// the suite asserts usage errors for exactly the cases those defaults would
+// silently satisfy ("no server configured" must not find one via the
+// environment). Blank them for the whole run and restore them afterwards.
+const LEAKED_ENV = [
+  "NOTEES_SERVER",
+  "NOTEES_WORKSPACE",
+  "NOTEES_API_KEY",
+  "NOTEES_EMAIL",
+  "NOTEES_PASSWORD",
+] as const;
+const savedEnv: Record<string, string | undefined> = {};
+
 beforeAll(async () => {
   harness = await bootServer();
   process.env.NOTEES_STATE_FILE = harness.stateFile;
+  for (const name of LEAKED_ENV) {
+    savedEnv[name] = process.env[name];
+    delete process.env[name];
+  }
 });
 afterAll(async () => {
   await harness.app.close();
   rmSync(harness.dataDir, { recursive: true, force: true });
   delete process.env.NOTEES_STATE_FILE;
+  for (const name of LEAKED_ENV) {
+    if (savedEnv[name] === undefined) delete process.env[name];
+    else process.env[name] = savedEnv[name];
+  }
 });
 
 describe("object lifecycle (json mode)", () => {
