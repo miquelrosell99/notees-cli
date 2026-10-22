@@ -6,6 +6,36 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-22
+
+- **chore(vendor): vendor pin re-pointed at the rewritten main — `278fb7cfe →
+  a4796bda3` — carrying the system-extends lock (and the readonly +
+  binding-sequence retirements).** The main repo's history was rewritten
+  2026-10-22 (every live compose file scrubbed from all commits via
+  `git filter-repo`; all old SHAs changed), so the recorded pin
+  `278fb7cfe` no longer exists upstream — this bump is also the repair that
+  makes a fresh `git submodule update --init` work again. The new pin rides
+  three slices, all with zero CLI-code delta (the lockstep law — the pin is
+  the boundary):
+  - **The system-extends lock** (owner ruling 2026-10-22): `class.setExtends`
+    on a system class applies only when the payload equals the seeded parent
+    set; deviations fail loud with `SystemExtendsLockError`. Applier-side in
+    the vendored `@notees/store`; the CLI's `class.extends`-family writes
+    ride it automatically (fixture gate 36→37, `class-extends-system-lock.json`;
+    GTK v4.3.0 / Flutter v4.2.0 converged byte-identical before the bump).
+  - **The `readonly` retirement** (owner ruling 2026-10-21): clients derive
+    readonly-ness from the system property list; the CLI never authored the
+    flag — no delta.
+  - **The binding-`sequence` retirement** (owner ruling 2026-10-21): the
+    binding is strictly `{classId, propertySchemaId, active?}` — the CLI
+    never authored `sequence` — no delta.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm build` +
+    `pnpm typecheck` clean; `pnpm test` 87/87 (run with `NOTEES_SERVER`
+    unset — a session-inherited `NOTEES_SERVER` pointing at a live stack
+    makes the "missing server → exit 2" test hit the real server and 401;
+    environmental, not a regression).
+  - **Files**: `vendor/notees` (the pin).
+
 ## 2026-10-21
 
 - **feat(content,model): the CLI rides the external_link retirement AND the
