@@ -8,6 +8,21 @@ history.
 
 ## 2026-10-22
 
+- **chore(vendor): vendor pin re-pointed at main `33e4af5e2 → bc3f856e7` —
+  carrying the WS admission tickets (the `?token=` retirement).** The main
+  repo retired the credential-in-URL fallback: the sync socket now admits
+  `Authorization: Bearer` (native clients) or a single-use `?ticket=ntk_…`
+  minted at `POST /api/relay/v2/tickets` (browsers), and `?token=` is rejected
+  on the whole API. Zero CLI-code delta (the lockstep law — the vendored
+  `packages/sync` transport mints tickets internally; its public options are
+  unchanged), and no CLI surface ever put a credential in a URL — the REST
+  client has always sent headers. GTK (`8269285`) and Flutter (`f9cfe75`)
+  converged the same day, closing the three-implementation lockstep.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm typecheck`
+    clean; `pnpm test` 87/87 (with `NOTEES_SERVER` unset — the known
+    env-leak note from the previous entry).
+  - **Files**: `vendor/notees` (the pin).
+
 - **chore(vendor): vendor pin re-pointed AGAIN at the rewritten main — `a4796bda3 →
   33e4af5e2` — the releases.md scrub.** The main repo's history was rewritten a
   second time 2026-10-22 (every trace of the retired `docs/developers/releases.md`
