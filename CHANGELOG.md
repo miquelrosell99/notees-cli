@@ -8,6 +8,25 @@ history.
 
 ## 2026-10-22
 
+- **chore(vendor): vendor pin re-pointed at main `bc3f856e7 → 1423ce2c2` —
+  carrying the classes gallery, the archival `active` bit, and the retired
+  `class.delete` op.** The main repo shipped the classes-gallery slice:
+  `object.update` gains `active` (archive/unarchive, a platform node field
+  like icon/color); `object.delete` on a class node routes four ways (locked
+  system classes fail loud, family bases route to the feature toggle, other
+  system classes archive, user classes trash — membership rides every path);
+  `class.delete` is retired outright; `workspace.feature.set` gains the
+  surfaces-only `journal` toggle (the date classes stay always-on, so the
+  CLI's `notees journal` read path is unaffected). Zero CLI-code delta (the
+  lockstep law): no CLI surface ever issued `class.delete` or a workspace
+  feature toggle, and the retired op's F4 delete-as-disable rule lives in the
+  vendored applier, which the CLI consumes whole. LOCKSTEP-PENDING for GTK +
+  Flutter on the `object-update-active` / `object-delete-class-routing`
+  fixtures.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm typecheck`
+    clean; `pnpm test` 87/87.
+  - **Files**: `vendor/notees` (the pin).
+
 - **fix(test): the suite blanks leaked `NOTEES_*` operator env for its
   duration — the gate is environment-independent.** The fleet host's shell
   exports `NOTEES_SERVER=http://localhost:8377`, which made the "missing
