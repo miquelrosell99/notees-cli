@@ -6,6 +6,11 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-23
+
+- **feat(object): `notees object move <id> --parent <id> [--after <id> | --before <id>]` — the missing placement command.** Moves a node under a new parent with optional sibling anchoring. Placement is log-only state with no REST surface: the write rides the `object.move` op through the relay batch endpoint (the one write path), same envelope discipline as the class-remap path (HLC clock, actor derived from the credential). MoveGuard invariants apply server-side (no standalone child under a non-page parent; no demoting a page with standalone children). Usage errors (missing `--parent`, `--after` with `--before`) exit 2. Prints the moved id; `--json` adds `{moved, parent, object}`.
+  - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new `object move` e2e (move + `--after` ordering across two pages, usage-error exit codes).
+
 ## 2026-10-22
 
 - **chore(vendor): vendor pin re-pointed at main `bc3f856e7 → 1423ce2c2` —

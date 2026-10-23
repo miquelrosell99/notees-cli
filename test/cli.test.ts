@@ -1718,6 +1718,34 @@ describe("class empty / delete-members", () => {
   });
 });
 
+describe("object move", () => {
+  it("moves a block under another parent and anchors next to a sibling", async () => {
+    const h = harness;
+    const pageA = await h.createPage("move-probe-a", []);
+    const pageB = await h.createPage("move-probe-b", []);
+    expect(await h.runCli("object", "create", "--name", "move-probe-block", "--parent", pageA)).toBe(EXIT.ok);
+    const blockId = h.io.stdoutText.trim();
+    expect(await h.runCli("object", "create", "--name", "move-probe-anchor", "--parent", pageB)).toBe(EXIT.ok);
+    const anchorId = h.io.stdoutText.trim();
+
+    expect(await h.runCli("--json", "object", "move", blockId, "--parent", pageB, "--after", anchorId)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText).parent).toBe(pageB);
+
+    expect(await h.runCli("--json", "object", "children", pageB)).toBe(EXIT.ok);
+    const children = JSON.parse(h.io.stdoutText).children as Array<{ id: string }>;
+    expect(children.map((c) => c.id)).toEqual([anchorId, blockId]);
+    expect(await h.runCli("--json", "object", "children", pageA)).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText).children as Array<{ id: string }>).map((c) => c.id)).not.toContain(blockId);
+  });
+
+  it("requires --parent and rejects --after with --before", async () => {
+    const h = harness;
+    const page = await h.createPage("move-usage-probe", []);
+    expect(await h.runCli("object", "move", page)).toBe(EXIT.usage);
+    expect(await h.runCli("object", "move", page, "--parent", page, "--after", page, "--before", page)).toBe(EXIT.usage);
+  });
+});
+
 describe("object restore + trash listing", () => {
   it("delete → list --trashed → restore brings the whole subtree back", async () => {
     const h = harness;
