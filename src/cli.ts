@@ -927,6 +927,48 @@ async function classRemap(
 }
 
 /**
+ * `notees object move <id> --parent <id>` — move a node under a new parent,
+ * optionally anchored next to a sibling (--after/--before). Placement is
+ * log-only state: the write rides the object.move op through the relay batch
+ * endpoint (the one write path), like every other client. The MoveGuard
+ * invariants apply server-side (no standalone child under a non-page parent,
+ * no demoting a page with standalone children).
+ */
+async function objectMove(ctx: CommandContext, id: string, options: {
+  parent?: string;
+  after?: string;
+  before?: string;
+}): Promise<void> {
+  if (options.parent === undefined) failUsage("object move requires --parent <id>");
+  if (options.after !== undefined && options.before !== undefined) {
+    failUsage("--after and --before are mutually exclusive");
+  }
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelope = newEnvelope({
+    workspaceId,
+    actorId,
+    deviceId: "notees-cli",
+    client: "cli",
+    hlc: clock.now(),
+    affectedNodeIds: [id, options.parent],
+    opType: "object.move",
+    payload: {
+      objectId: id,
+      parentId: options.parent,
+      ...(options.after !== undefined ? { afterId: options.after } : {}),
+      ...(options.before !== undefined ? { beforeId: options.before } : {}),
+    },
+  });
+  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  const body = await ctx.client.getJson<{
+    object: { id: string; parentId: string | null; name?: string | null };
+  }>(`/api/objects/${encodeURIComponent(id)}`);
+  emit(ctx, `${body.object.id}\n`, { moved: body.object.id, parent: body.object.parentId, object: body.object });
+}
+
+/**
  * `notees ops [opType]` — the op catalog (from @notees/protocol's OP_CATALOG):
  * the discovery layer for the shell's submitOp. No argument lists every op
  * type with a one-line description; an argument prints the full entry.
@@ -2255,6 +2297,15 @@ function buildProgram(): Command {
     .description("restore trashed objects (whole-tree; descendants trashed independently stay trashed)")
     .action(async (ids: string[], _options: object, command: Command) => {
       await objectRestore(ctxOf(command), ids);
+    });
+  object
+    .command("move <id>")
+    .description("move a node under a new parent (optionally anchored next to a sibling)")
+    .option("--parent <id>", "new parent object id (required)", undefined)
+    .option("--after <id>", "place right after this sibling", undefined)
+    .option("--before <id>", "place right before this sibling", undefined)
+    .action(async (id: string, options: { parent?: string; after?: string; before?: string }, command: Command) => {
+      await objectMove(ctxOf(command), id, options);
     });
   object
     .command("merge <source> <target>")
