@@ -8,6 +8,9 @@ history.
 
 ## 2026-10-26
 
+- **chore(release): v4.5.3 — `doctor` honors stored config defaults and the stored credential.** `notees doctor` resolves through the same shared path as every other command (flag > env > stored per-profile default for the server/workspace; the stored standing credential alongside `--key`/`NOTEES_API_KEY`), so a fully stored setup no longer FAILs a doctor run that would actually work (PR #10 / issue #9). The check failures now name the fix (`notees config set server <url>`, `notees auth login` / `auth store --key`).
+  - **Verification**: `pnpm typecheck && pnpm test && pnpm build` — all green (116/116); bundle sha256 `4ca8acbd…` recorded in the PKGBUILD.
+
 - **fix(doctor): honor stored config defaults and the stored credential (PR #9 / issue #9).** `notees doctor` read `--server` / `NOTEES_SERVER` and the flag/env credential only, so it FAILed setups that actually work — bare commands already resolve server/workspace/credential flag > env > stored. Doctor now resolves through the same shared path (`resolveServer` — extracted from `requireServer` so there is one resolution, not two — plus `resolveKey` with the same `${profile}:${server}` state key the command-context builder derives, so the stored server default selects the right credential slot): a fully stored setup reads all-ok, the `authentication:` check exercises the stored credential, and the FAIL hints name all three sources (`notees config set server`, `notees auth login` / `auth store`). Doctor also stops pre-empting its own report — with nothing configured it prints the failing checks and exits 2 instead of dying on a usage error before the report.
   - **Verification**: `pnpm install && pnpm -r --filter "@notees/*" build && pnpm typecheck && pnpm test && pnpm build` — all green (116/116).
 
