@@ -874,7 +874,335 @@ describe("bibliography round-trip (bibtex)", () => {
     const empty = join(h.dataDir, "bib-empty.bib");
     writeFileSync(empty, "% only a comment\n");
     expect(await h.runCli("import", "bibtex", empty)).toBe(EXIT.domain);
-    expect(h.io.stderrText).toContain("no BibTeX entries");
+    expect(h.io.stderrText).toContain("no importable entries");
+  });
+});
+
+describe("import adoption (title-is-content)", () => {
+  it("adopts a @citekey-titled node: renames it, sets Citekey, creates no duplicate", async () => {
+    const h = harness;
+    // The incident shape: a source-family node titled by its citekey, no
+    // Citekey property.
+    expect(
+      await h.runCli("--json", "object", "create", "--name", "@adoptkey1", "--class", SYSTEM_CLASS_UUIDS.book),
+    ).toBe(EXIT.ok);
+    const nodeId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    const file = join(h.dataDir, "adopt-1.bib");
+    writeFileSync(
+      file,
+      `@book{adoptkey1,
+  title  = {Adopted Book Title},
+  author = {Doe, Jane},
+  year   = {2020},
+}`,
+    );
+    expect(await h.runCli("--json", "import", "bibtex", file)).toBe(EXIT.ok);
+    const counts = JSON.parse(h.io.stdoutText);
+    expect(counts).toMatchObject({ created: 0, updated: 0, adopted: 1, ambiguous: 0 });
+
+    await h.runCli("--json", "object", "get", nodeId);
+    const obj = JSON.parse(h.io.stdoutText).object;
+    expect(obj.name).toBe("Adopted Book Title");
+    expect(obj.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
+    const props = obj.properties as { schemaId: string; value: unknown }[];
+    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("adoptkey1");
+
+    // No duplicate: exactly one object carries the citekey.
+    await h.runCli("--json", "object", "list", "--property", `${SYSTEM_PROPERTY_UUIDS.citekey}:adoptkey1`);
+    expect(JSON.parse(h.io.stdoutText).objects).toHaveLength(1);
+  });
+
+  it("adoption repairs eligibility: a Person-classed node gains the spec's source class", async () => {
+    const h = harness;
+    expect(
+      await h.runCli("--json", "object", "create", "--name", "@adoptkey2", "--class", SYSTEM_CLASS_UUIDS.person),
+    ).toBe(EXIT.ok);
+    const nodeId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    const file = join(h.dataDir, "adopt-2.bib");
+    writeFileSync(
+      file,
+      `@book{adoptkey2,
+  title  = {Person Shaped Book},
+  author = {Doe, John},
+  year   = {2021},
+}`,
+    );
+    expect(await h.runCli("--json", "import", "bibtex", file)).toBe(EXIT.ok);
+    expect(JSON.parse(h.io.stdoutText)).toMatchObject({ created: 0, adopted: 1 });
+
+    await h.runCli("--json", "object", "get", nodeId);
+    const obj = JSON.parse(h.io.stdoutText).object;
+    // The Person class stays; the spec's book class was assigned so the
+    // citekey write could land (the citekey scope is the source family).
+    expect(obj.classIds).toContain(SYSTEM_CLASS_UUIDS.person);
+    expect(obj.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
+    const props = obj.properties as { schemaId: string; value: unknown }[];
+    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("adoptkey2");
+  });
+
+  it("--dry-run plans the adoption and writes nothing", async () => {
+    const h = harness;
+    expect(
+      await h.runCli("--json", "object", "create", "--name", "@adoptkey3", "--class", SYSTEM_CLASS_UUIDS.book),
+    ).toBe(EXIT.ok);
+    const nodeId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+
+    const file = join(h.dataDir, "adopt-3.bib");
+    writeFileSync(
+      file,
+      `@book{adoptkey3,
+  title  = {Dry Run Title},
+  author = {Doe, Jane},
+  year   = {2022},
+}`,
+    );
+    expect(await h.runCli("--json", "import", "bibtex", file, "--dry-run")).toBe(EXIT.ok);
+    const plan = JSON.parse(h.io.stdoutText) as {
+      dryRun: boolean;
+      entries: Array<{ citekey: string; action: string; nodeId?: string; title: string }>;
+      counts: { adopted: number; created: number };
+    };
+    expect(plan.dryRun).toBe(true);
+    expect(plan.entries[0]).toMatchObject({ citekey: "adoptkey3", action: "adopt", nodeId, title: "Dry Run Title" });
+    expect(plan.counts).toMatchObject({ adopted: 1, created: 0 });
+
+    // Nothing was written: still titled by the citekey, no Citekey property.
+    await h.runCli("--json", "object", "get", nodeId);
+    const obj = JSON.parse(h.io.stdoutText).object;
+    expect(obj.name).toBe("@adoptkey3");
+    expect(
+      (obj.properties as { schemaId: string }[]).some((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey),
+    ).toBe(false);
+  });
+
+  it("--no-create updates matches and reports would-create entries as skipped", async () => {
+    const h = harness;
+    const seed = join(h.dataDir, "nocreate-seed.bib");
+    writeFileSync(
+      seed,
+      `@book{nc-existing,
+  title = {Existing Source},
+  year  = {1999},
+}`,
+    );
+    expect(await h.runCli("--json", "import", "bibtex", seed)).toBe(EXIT.ok);
+
+    const file = join(h.dataDir, "nocreate-run.bib");
+    writeFileSync(
+      file,
+      `@book{nc-existing,
+  title = {Existing Source, 2nd ed.},
+  year  = {2001},
+}
+@book{nc-missing,
+  title = {Not Imported},
+  year  = {2002},
+}`,
+    );
+    expect(await h.runCli("--json", "import", "bibtex", file, "--no-create")).toBe(EXIT.ok);
+    const counts = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      updated: number;
+      skipped: number;
+      skippedEntries: Array<{ citekey: string; title: string }>;
+    };
+    expect(counts).toMatchObject({ created: 0, updated: 1, skipped: 1 });
+    expect(counts.skippedEntries).toEqual([{ citekey: "nc-missing", title: "Not Imported" }]);
+
+    // The skipped source was not created (citekey-property lookup is exact —
+    // the full-text q= search is not).
+    await h.runCli("--json", "object", "list", "--property", `${SYSTEM_PROPERTY_UUIDS.citekey}:nc-missing`);
+    expect(JSON.parse(h.io.stdoutText).objects).toHaveLength(0);
+    // The matched source took the update.
+    await h.runCli("--json", "object", "list", "--property", `${SYSTEM_PROPERTY_UUIDS.citekey}:nc-existing`);
+    const objects = JSON.parse(h.io.stdoutText).objects as { id: string }[];
+    expect(objects).toHaveLength(1);
+    await h.runCli("--json", "object", "get", objects[0]!.id);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("Existing Source, 2nd ed.");
+  });
+});
+
+describe("import csl-json", () => {
+  it("imports a 2-item CSL-JSON file with classes, citekeys, and find-or-created authors", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "csl-import-1.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        items: [
+          {
+            id: "csl-book-1",
+            type: "book",
+            title: "CSL Book",
+            author: [{ family: "Curie", given: "Marie" }],
+            issued: { "date-parts": [[1903]] },
+            ISBN: "9781234567890",
+          },
+          {
+            id: "csl-article-1",
+            type: "article-journal",
+            title: "CSL Article",
+            author: [{ family: "Noether", given: "Emmy" }, { family: "Weil", given: "Simone" }],
+            issued: { "date-parts": [[1935]] },
+            DOI: "10.1234/csl",
+            "container-title": "Journal of CSL",
+          },
+        ],
+      }),
+    );
+    expect(await h.runCli("--json", "import", "csl-json", file)).toBe(EXIT.ok);
+    const counts = JSON.parse(h.io.stdoutText) as { created: number; persons: number; personsCreated: number; entries: string[] };
+    expect(counts).toMatchObject({ created: 2, persons: 3, personsCreated: 3 });
+
+    // Book → book class; citekey + ISBN landed.
+    await h.runCli("--json", "object", "get", counts.entries[0]!);
+    const book = JSON.parse(h.io.stdoutText).object;
+    expect(book.name).toBe("CSL Book");
+    expect(book.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
+    const bookProps = book.properties as { schemaId: string; value: unknown }[];
+    expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("csl-book-1");
+    expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9781234567890");
+
+    // article-journal → the paper class (the owner family naming); two author refs.
+    await h.runCli("--json", "object", "get", counts.entries[1]!);
+    const paper = JSON.parse(h.io.stdoutText).object;
+    expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.paper);
+    const paperProps = paper.properties as { schemaId: string; value: unknown }[];
+    expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.doi)?.value).toBe("10.1234/csl");
+    const authorRefs = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors);
+    expect(authorRefs).toHaveLength(2);
+
+    // One author person resolved by name (the book's single author).
+    const bookAuthorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as {
+      nodeId: string;
+    };
+    await h.runCli("--json", "object", "get", bookAuthorRef.nodeId);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("Curie, Marie");
+  });
+
+  it("errors: missing file → 2, malformed JSON → 2, no items → 1", async () => {
+    const h = harness;
+    expect(await h.runCli("import", "csl-json", join(h.dataDir, "does-not-exist.json"))).toBe(EXIT.usage);
+
+    const malformed = join(h.dataDir, "csl-malformed.json");
+    writeFileSync(malformed, "{ not json");
+    expect(await h.runCli("import", "csl-json", malformed)).toBe(EXIT.usage);
+
+    const notItems = join(h.dataDir, "csl-not-items.json");
+    writeFileSync(notItems, JSON.stringify({ hello: "world" }));
+    expect(await h.runCli("import", "csl-json", notItems)).toBe(EXIT.usage);
+
+    const empty = join(h.dataDir, "csl-empty.json");
+    writeFileSync(empty, "[]");
+    expect(await h.runCli("import", "csl-json", empty)).toBe(EXIT.domain);
+    expect(h.io.stderrText).toContain("no importable entries");
+  });
+});
+
+const ZOTERO_RDF_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/">
+  <bib:Article rdf:about="#item_article">
+    <z:citationKey>rdf-article-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>Article Title Wins</dc:title>
+    <dcterms:isPartOf>
+      <bib:Journal>
+        <dc:title>Some Journal With Its Own Title</dc:title>
+      </bib:Journal>
+    </dcterms:isPartOf>
+    <dc:date>2019-05-01</dc:date>
+  </bib:Article>
+  <bib:Book rdf:about="#item_book">
+    <z:citationKey>rdf-book-1</z:citationKey>
+    <z:itemType>book</z:itemType>
+    <dc:title>The RDF Book</dc:title>
+    <bib:Authors>
+      <rdf:Seq>
+        <rdf:li>
+          <foaf:Person>
+            <foaf:surname>Roe</foaf:surname>
+            <foaf:givenName>Richard</foaf:givenName>
+          </foaf:Person>
+        </rdf:li>
+      </rdf:Seq>
+    </bib:Authors>
+    <dc:date>2015</dc:date>
+    <dc:identifier>ISBN 9780123456789</dc:identifier>
+  </bib:Book>
+  <bib:Journal rdf:about="#item_journal">
+    <dc:title>Journal Without Key</dc:title>
+  </bib:Journal>
+  <z:Attachment rdf:about="#item_attachment">
+    <z:citationKey>attachment-key</z:citationKey>
+    <dc:title>file.pdf</dc:title>
+  </z:Attachment>
+</rdf:RDF>`;
+
+describe("import zotero-rdf", () => {
+  it("imports keyed bib entries; the nested journal title never wins; unkeyed journals are skipped", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "zotero-import-1.rdf");
+    writeFileSync(file, ZOTERO_RDF_FIXTURE);
+
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const counts = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      skipped: number;
+      entries: string[];
+    };
+    // Two keyed bib entries; the keyless top-level journal counts as skipped
+    // (the z:Attachment is not a bib entry and is never considered).
+    expect(counts).toMatchObject({ created: 2, skipped: 1 });
+    expect(counts.entries).toHaveLength(2);
+
+    // The article's real (direct-child) dc:title won over the nested
+    // bib:Journal's own title.
+    await h.runCli("--json", "object", "get", counts.entries[0]!);
+    const article = JSON.parse(h.io.stdoutText).object;
+    expect(article.name).toBe("Article Title Wins");
+    expect(article.name).not.toBe("Some Journal With Its Own Title");
+    // journalArticle → the paper class; the 2019 date landed on the chain.
+    expect(article.classIds).toContain(SYSTEM_CLASS_UUIDS.paper);
+    const articleProps = article.properties as { schemaId: string; value: unknown }[];
+    expect(articleProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("rdf-article-1");
+    const pubRef = articleProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value as {
+      nodeId: string;
+    };
+    await h.runCli("--json", "object", "get", pubRef.nodeId);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("2019");
+
+    // The book: author person via foaf surname/givenName, year, ISBN.
+    await h.runCli("--json", "object", "get", counts.entries[1]!);
+    const book = JSON.parse(h.io.stdoutText).object;
+    expect(book.name).toBe("The RDF Book");
+    expect(book.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
+    const bookProps = book.properties as { schemaId: string; value: unknown }[];
+    const authorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as { nodeId: string };
+    await h.runCli("--json", "object", "get", authorRef.nodeId);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("Roe, Richard");
+    expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9780123456789");
+  });
+
+  it("errors: missing file → 2, malformed XML → 2, no entries → 1", async () => {
+    const h = harness;
+    expect(await h.runCli("import", "zotero-rdf", join(h.dataDir, "does-not-exist.rdf"))).toBe(EXIT.usage);
+
+    const malformed = join(h.dataDir, "zotero-malformed.rdf");
+    writeFileSync(malformed, "<rdf:RDF><bib:Book></rdf:RDF>");
+    expect(await h.runCli("import", "zotero-rdf", malformed)).toBe(EXIT.usage);
+
+    const empty = join(h.dataDir, "zotero-empty.rdf");
+    writeFileSync(empty, "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'></rdf:RDF>");
+    expect(await h.runCli("import", "zotero-rdf", empty)).toBe(EXIT.domain);
+    expect(h.io.stderrText).toContain("no importable entries");
   });
 });
 

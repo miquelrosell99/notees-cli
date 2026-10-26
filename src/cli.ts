@@ -44,6 +44,7 @@ import {
   serializeBibEntry,
   sourceClassOf,
   yearFromDate,
+  type CslItem,
 } from "@notees/export";
 import { OP_CATALOG, describeOp, newEnvelope, Clock } from "@notees/protocol";
 import {
@@ -53,6 +54,7 @@ import {
 } from "@notees/query";
 
 import { ApiClient } from "./client.js";
+import { parseCslJson } from "./csl-json.js";
 import { CliError, EXIT } from "./exit-codes.js";
 import {
   buildMarkdownBundle,
@@ -65,6 +67,7 @@ import { runShell } from "./shell.js";
 import { defaultStatePath, serverState, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
+import { parseZoteroRdf, type ZoteroRdfParseResult } from "./zotero-rdf.js";
 
 export interface CliIo {
   stdout: { write(chunk: string): unknown };
@@ -1915,43 +1918,197 @@ async function ensurePropertySchema(ctx: CommandContext, name: SystemPropertyNam
   });
 }
 
-async function importBibtex(ctx: CommandContext, filePath: string): Promise<void> {
-  let text: string;
+// --- source imports (bibtex / csl-json / zotero-rdf) -----------------------------
+
+interface SourceImportOptions {
+  dryRun?: boolean;
+  /** Match-only mode (the --no-create flag): apply updates/adoptions, skip entries that would create a source. */
+  create?: boolean;
+}
+
+interface SourceImportCounts {
+  created: number;
+  updated: number;
+  /** Title-matched nodes adopted into the bibliography (renamed + citekey set). */
+  adopted: number;
+  /** Entries not imported (match-only mode + unkeyed top-level RDF items). */
+  skipped: number;
+  /** Extra nodes sharing an adopted title (adopted the first, counted the rest). */
+  ambiguous: number;
+  persons: number;
+  personsCreated: number;
+}
+
+interface ImportEntryPlan {
+  citekey: string | null;
+  action: "create" | "update" | "adopt" | "skip";
+  nodeId?: string;
+  title: string;
+  persons: Array<{ literal: string; action: "existing" | "create"; nodeId?: string }>;
+  /** Class the adoption would assign (eligibility repair) — absent when not needed. */
+  classAssign?: string;
+}
+
+function readImportFile(filePath: string): string {
   try {
-    text = readFileSync(filePath, "utf8");
+    return readFileSync(filePath, "utf8");
   } catch (error) {
     throw new CliError(EXIT.usage, `cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const entries = parseBibtex(text);
-  if (entries.length === 0) {
-    throw new CliError(EXIT.domain, `no BibTeX entries found in ${filePath}`);
-  }
+}
 
-  // Schemas the import may touch (citekey always; the rest only when used).
-  const usedNames = new Set<SystemPropertyName>(["citekey"]);
-  for (const entry of entries) {
-    const fields = entry.fields;
-    if (fields.doi !== undefined) usedNames.add("doi");
-    if (fields.isbn !== undefined) usedNames.add("isbn");
-    if (fields.url !== undefined) usedNames.add("url");
-    if (fields.publisher !== undefined || fields.school !== undefined || fields.institution !== undefined) {
-      usedNames.add("publisher");
+/** The property schemas an import may touch (citekey always; the rest only when used). */
+function usedSchemaNames(items: CslItem[]): Set<SystemPropertyName> {
+  const used = new Set<SystemPropertyName>(["citekey"]);
+  for (const item of items) {
+    if (item.DOI !== undefined) used.add("doi");
+    if (item.ISBN !== undefined) used.add("isbn");
+    if (item.URL !== undefined) used.add("url");
+    if (item.publisher !== undefined) used.add("publisher");
+    if (item.issued !== undefined) used.add("publicationDate");
+    if ((item.author ?? []).length > 0) used.add("authors");
+  }
+  return used;
+}
+
+async function importBibtex(ctx: CommandContext, filePath: string, options: SourceImportOptions): Promise<void> {
+  const entries = parseBibtex(readImportFile(filePath));
+  await runSourceImport(ctx, "bibtex", filePath, entries.map(bibToCsl), 0, options);
+}
+
+async function importCslJson(ctx: CommandContext, filePath: string, options: SourceImportOptions): Promise<void> {
+  const items = parseCslJson(readImportFile(filePath), (message) => {
+    throw new CliError(EXIT.usage, `cannot import ${filePath}: ${message}`);
+  });
+  await runSourceImport(ctx, "csl-json", filePath, items, 0, options);
+}
+
+async function importZoteroRdf(ctx: CommandContext, filePath: string, options: SourceImportOptions): Promise<void> {
+  let result: ZoteroRdfParseResult;
+  try {
+    result = parseZoteroRdf(readImportFile(filePath));
+  } catch (error) {
+    throw new CliError(
+      EXIT.usage,
+      `cannot import ${filePath}: not well-formed Zotero RDF (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  await runSourceImport(ctx, "zotero-rdf", filePath, result.items, result.skipped, options);
+}
+
+/**
+ * The shared source-import pipeline: schema ensure → authors find-or-create →
+ * source upsert/adopt → field writes. All three formats feed it as CslItem[].
+ *
+ * Lookup order per entry: (a) citekey-property match (authoritative);
+ * (b) exact node-title match on `citekey` / `@citekey` — adoption renames the
+ * node to the spec title, sets the Citekey property, repairs eligibility with
+ * the spec's source class when the node's class closure misses the citekey
+ * schema's scope, then takes the normal update path. `--dry-run` runs the
+ * whole match/plan phase and writes nothing (schemas included); `--no-create`
+ * skips would-create entries (match-only mode).
+ */
+async function runSourceImport(
+  ctx: CommandContext,
+  format: "bibtex" | "csl-json" | "zotero-rdf",
+  filePath: string,
+  items: CslItem[],
+  parserSkipped: number,
+  options: SourceImportOptions,
+): Promise<void> {
+  if (items.length === 0) {
+    throw new CliError(EXIT.domain, `no importable entries found in ${filePath}`);
+  }
+  const dryRun = options.dryRun === true;
+  const specs = items.map(cslToNodeSpecs);
+
+  // Schema ensure — part of the plan under --dry-run (write nothing).
+  const schemaPlan: Array<{ name: SystemPropertyName; status: "present" | "ensured" | "would-ensure" }> = [];
+  for (const name of usedSchemaNames(items)) {
+    if (!dryRun) {
+      await ensurePropertySchema(ctx, name);
+      schemaPlan.push({ name, status: "ensured" });
+      continue;
     }
-    if (fields.year !== undefined || fields.date !== undefined) usedNames.add("publicationDate");
-    if (fields.author !== undefined || fields.editor !== undefined) usedNames.add("authors");
+    try {
+      await ctx.client.getJson(`/api/property-schemas/${SYSTEM_PROPERTY_UUIDS[name]}`);
+      schemaPlan.push({ name, status: "present" });
+    } catch {
+      schemaPlan.push({ name, status: "would-ensure" });
+    }
   }
-  for (const name of usedNames) await ensurePropertySchema(ctx, name);
 
-  const counts = { created: 0, updated: 0, persons: 0, personsCreated: 0 };
-  const personIds = new Map<string, string>(); // literal name → person id (per-run dedupe)
+  // Adoption eligibility: the citekey schema's scope decides which class
+  // closures may carry it (resolveEligibleClasses is the Slice-B helper,
+  // lifted to module scope for exactly this reuse).
+  const citekeySchema = await ctx.client.getJson<{ propertySchema: ApiPropertySchema }>(
+    `/api/property-schemas/${SYSTEM_PROPERTY_UUIDS.citekey}`,
+  );
+  const eligible = await resolveEligibleClasses(ctx, citekeySchema.propertySchema);
+  const eligibleIds = eligible === null ? null : new Set(eligible.map((entry) => entry.id));
+
+  const counts: SourceImportCounts = {
+    created: 0,
+    updated: 0,
+    adopted: 0,
+    skipped: parserSkipped,
+    ambiguous: 0,
+    persons: 0,
+    personsCreated: 0,
+  };
+  const personIds = new Map<string, string>(); // per-run dedupe (real mode)
+  const personPlans = new Map<string, ImportEntryPlan["persons"][number]>(); // per-run dedupe (plan mode)
   const importedIds: string[] = [];
-  for (const entry of entries) {
-    const spec = cslToNodeSpecs(bibToCsl(entry));
-    // Authors are node-typed to agent nodes (SCHEMA.md "Citations", FINAL
-    // owner decision 2026-09-27): find-or-create one person per name string.
+  const skippedEntries: Array<{ citekey: string | null; title: string }> = [];
+  const plans: ImportEntryPlan[] = [];
+
+  for (const spec of specs) {
+    // (a) citekey-property match stays authoritative; (b) title match adopts.
+    const existing = await findSourceByCitekey(ctx, spec.citekey);
+    let matched = existing;
+    let action: "create" | "update" | "adopt";
+    if (existing !== undefined) {
+      action = "update";
+    } else {
+      const titleMatches = await findSourcesByTitle(ctx, spec.citekey);
+      if (titleMatches.length > 0) {
+        matched = titleMatches[0];
+        action = "adopt";
+        counts.ambiguous += titleMatches.length - 1;
+      } else {
+        action = "create";
+      }
+    }
+
+    if (action === "create" && options.create === false) {
+      counts.skipped += 1;
+      skippedEntries.push({ citekey: spec.citekey, title: spec.title });
+      plans.push({ citekey: spec.citekey, action: "skip", title: spec.title, persons: [] });
+      continue;
+    }
+
+    // Authors: node-typed to agent nodes — find-or-create one person per name
+    // string (FINAL owner decision 2026-09-27). Dry-run resolves without
+    // creating and reports the plan.
     const authorIds: string[] = [];
+    const entryPersons: ImportEntryPlan["persons"] = [];
     for (const literal of spec.authors) {
       if (literal.length === 0) continue;
+      if (dryRun) {
+        let plan = personPlans.get(literal);
+        if (plan === undefined) {
+          const personId = await findPersonByName(ctx, literal);
+          plan =
+            personId !== undefined
+              ? { literal, action: "existing", nodeId: personId }
+              : { literal, action: "create" };
+          personPlans.set(literal, plan);
+          counts.persons += 1;
+          if (plan.action === "create") counts.personsCreated += 1;
+        }
+        entryPersons.push(plan);
+        continue;
+      }
       let personId = personIds.get(literal);
       if (personId === undefined) {
         personId = await findOrCreatePerson(ctx, literal, counts);
@@ -1960,16 +2117,163 @@ async function importBibtex(ctx: CommandContext, filePath: string): Promise<void
       }
       authorIds.push(personId);
     }
-    importedIds.push(await upsertSourceByCitekey(ctx, spec, authorIds, counts));
+
+    const needsClassAssign =
+      action === "adopt" &&
+      eligibleIds !== null &&
+      matched !== undefined &&
+      !matched.classIds.some((classId) => eligibleIds.has(classId));
+
+    if (dryRun) {
+      plans.push({
+        citekey: spec.citekey,
+        action,
+        ...(matched !== undefined ? { nodeId: matched.id } : {}),
+        title: spec.title,
+        persons: entryPersons,
+        ...(needsClassAssign ? { classAssign: spec.className } : {}),
+      });
+      if (action === "create") counts.created += 1;
+      else if (action === "adopt") counts.adopted += 1;
+      else counts.updated += 1;
+      continue;
+    }
+
+    const id = await upsertSource(ctx, spec, authorIds, counts, action, matched, needsClassAssign);
+    importedIds.push(id);
   }
 
-  const machine = { ...counts, entries: importedIds };
+  if (dryRun) {
+    const summary =
+      `${counts.created} create, ${counts.updated} update, ${counts.adopted} adopt, ` +
+      `${counts.skipped} skip (${counts.ambiguous} ambiguous title collisions)`;
+    const rows = plans.map((plan) => [
+      plan.citekey ?? "(unkeyed)",
+      plan.action,
+      plan.nodeId ?? "",
+      plan.title,
+      ...(plans.some((p) => p.classAssign !== undefined) ? [plan.classAssign ?? ""] : []),
+    ]);
+    const headers = ["CITEKEY", "ACTION", "NODE", "TITLE"];
+    if (plans.some((p) => p.classAssign !== undefined)) headers.push("CLASS ASSIGN");
+    const wouldEnsure = schemaPlan.filter((s) => s.status === "would-ensure").map((s) => s.name);
+    const personNew = plans.flatMap((p) => p.persons).filter((p) => p.action === "create").length;
+    emit(
+      ctx,
+      `dry run (${format}, ${filePath}) — no writes\n` +
+        `${formatTable([headers, ...rows])}\n` +
+        `persons: ${counts.persons} planned (${personNew} would be created)\n` +
+        `schemas: ${schemaPlan.map((s) => s.name).join(", ")}` +
+        (wouldEnsure.length > 0 ? ` (${wouldEnsure.join(", ")} would be ensured)` : " (all present)") +
+        `\nplanned: ${plans.length} entries — ${summary}\n`,
+      { dryRun: true, format, filePath, schemas: schemaPlan, entries: plans, counts },
+    );
+    return;
+  }
+
+  const machine: Record<string, unknown> = { ...counts, entries: importedIds };
+  if (skippedEntries.length > 0) machine.skippedEntries = skippedEntries;
   emit(
     ctx,
-    `imported ${entries.length} entries: ${counts.created} created, ${counts.updated} updated, ` +
+    `imported ${importedIds.length} entries: ${counts.created} created, ${counts.updated} updated, ` +
+      `${counts.adopted} adopted, ${counts.skipped} skipped, ${counts.ambiguous} ambiguous, ` +
       `${counts.persons} persons (${counts.personsCreated} new)\n`,
     machine,
   );
+}
+
+/**
+ * Title-match lookup for adoption: exact node-title equality on `citekey` or
+ * `@citekey` after trim (these strings are distinctive — substring matching
+ * would be wrong). The objects?q= full-text search narrows the candidate set;
+ * the exact filter is the authority.
+ */
+async function findSourcesByTitle(ctx: CommandContext, citekey: string): Promise<FullApiObject[]> {
+  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/objects${queryString({ q: citekey })}`);
+  const seen = new Set<string>();
+  const matches: FullApiObject[] = [];
+  for (const object of body.objects) {
+    const name = object.name?.trim();
+    if (name !== citekey && name !== `@${citekey}`) continue;
+    if (seen.has(object.id)) continue;
+    seen.add(object.id);
+    matches.push(object);
+  }
+  return matches;
+}
+
+async function upsertSource(
+  ctx: CommandContext,
+  spec: ReturnType<typeof cslToNodeSpecs>,
+  authorIds: string[],
+  counts: SourceImportCounts,
+  action: "create" | "update" | "adopt",
+  matched: FullApiObject | undefined,
+  needsClassAssign: boolean,
+): Promise<string> {
+  let id: string;
+  if (action === "create") {
+    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
+      isEmbedded: false,
+      name: spec.title,
+      classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
+    });
+    id = created.id;
+    counts.created += 1;
+  } else {
+    id = matched!.id;
+    if (action === "adopt") {
+      counts.adopted += 1;
+      // Eligibility repair: the node's class closure misses the citekey
+      // scope — assign the spec's source class first (the write would fail
+      // loud otherwise).
+      if (needsClassAssign) {
+        await ctx.client.putJson(`/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(SYSTEM_CLASS_UUIDS[spec.className])}`);
+      }
+    } else {
+      counts.updated += 1;
+    }
+    if (matched!.name !== spec.title) {
+      // Title-is-content: the title update rewrites the node's text content.
+      await ctx.client.patchJson(`/api/objects/${encodeURIComponent(id)}`, {
+        contentAst: [{ type: "text", text: spec.title }],
+      });
+    }
+  }
+  const properties = matched === undefined ? [] : fullPropertiesOf(matched);
+  const setIfChanged = async (schemaId: string, value: unknown): Promise<void> => {
+    const current = properties.find((p) => p.schemaId === schemaId && (p.idx ?? 0) === 0)?.value;
+    if (JSON.stringify(current ?? null) === JSON.stringify(value)) return;
+    await setProperty(ctx, id, schemaId, value);
+  };
+  await setIfChanged(SYSTEM_PROPERTY_UUIDS.citekey, spec.citekey);
+  if (spec.doi !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.doi, spec.doi);
+  if (spec.isbn !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.isbn, spec.isbn);
+  if (spec.url !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.url, spec.url);
+  if (spec.publisher !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.publisher, spec.publisher);
+  if (spec.publicationDate !== undefined) {
+    // Date-chain ref, not a bare string: the year node
+    // backlinks everything dated that year. The year node's id is
+    // content-addressed (deterministic), so ensure-then-link is idempotent.
+    const year = yearFromDate(spec.publicationDate);
+    if (year !== undefined) {
+      const yearId = dateNodeId(`${year}-01-01`, "year");
+      await ensureYearNode(ctx, yearId, String(year));
+      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, { nodeId: yearId });
+    } else {
+      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
+    }
+  }
+  // Authors: node-typed list, replace wholesale — set the new {nodeId} refs,
+  // unset the stale tail.
+  const previousCount = properties.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).length;
+  for (let idx = 0; idx < authorIds.length; idx += 1) {
+    await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, { nodeId: authorIds[idx] }, idx);
+  }
+  for (let idx = authorIds.length; idx < previousCount; idx += 1) {
+    await deleteProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, idx);
+  }
+  return id;
 }
 
 /** Person match: exact display name via the objects?q= title search. */
@@ -2092,68 +2396,6 @@ async function findSourceByCitekey(
   const first = body.objects[0];
   if (first === undefined) return undefined;
   return getFullObject(ctx, first.id);
-}
-
-async function upsertSourceByCitekey(
-  ctx: CommandContext,
-  spec: ReturnType<typeof cslToNodeSpecs>,
-  authorIds: string[],
-  counts: { created: number; updated: number },
-): Promise<string> {
-  const existing = await findSourceByCitekey(ctx, spec.citekey);
-  let id: string;
-  if (existing === undefined) {
-    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-      isEmbedded: false,
-      name: spec.title,
-      classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
-    });
-    id = created.id;
-    counts.created += 1;
-  } else {
-    id = existing.id;
-    counts.updated += 1;
-    if (existing.name !== spec.title) {
-      // Title-is-content: the title update rewrites the node's text content.
-      await ctx.client.patchJson(`/api/objects/${encodeURIComponent(id)}`, {
-        contentAst: [{ type: "text", text: spec.title }],
-      });
-    }
-  }
-  const properties = existing === undefined ? [] : fullPropertiesOf(existing);
-  const setIfChanged = async (schemaId: string, value: unknown): Promise<void> => {
-    const current = properties.find((p) => p.schemaId === schemaId && (p.idx ?? 0) === 0)?.value;
-    if (JSON.stringify(current ?? null) === JSON.stringify(value)) return;
-    await setProperty(ctx, id, schemaId, value);
-  };
-  await setIfChanged(SYSTEM_PROPERTY_UUIDS.citekey, spec.citekey);
-  if (spec.doi !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.doi, spec.doi);
-  if (spec.isbn !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.isbn, spec.isbn);
-  if (spec.url !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.url, spec.url);
-  if (spec.publisher !== undefined) await setIfChanged(SYSTEM_PROPERTY_UUIDS.publisher, spec.publisher);
-  if (spec.publicationDate !== undefined) {
-    // Date-chain ref, not a bare string: the year node
-    // backlinks everything dated that year. The year node's id is
-    // content-addressed (deterministic), so ensure-then-link is idempotent.
-    const year = yearFromDate(spec.publicationDate);
-    if (year !== undefined) {
-      const yearId = dateNodeId(`${year}-01-01`, "year");
-      await ensureYearNode(ctx, yearId, String(year));
-      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, { nodeId: yearId });
-    } else {
-      await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
-    }
-  }
-  // Authors: node-typed list, replace wholesale — set the new {nodeId} refs,
-  // unset the stale tail.
-  const previousCount = properties.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).length;
-  for (let idx = 0; idx < authorIds.length; idx += 1) {
-    await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, { nodeId: authorIds[idx] }, idx);
-  }
-  for (let idx = authorIds.length; idx < previousCount; idx += 1) {
-    await deleteProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, idx);
-  }
-  return id;
 }
 
 async function exportBibtex(ctx: CommandContext, options: {
@@ -2888,12 +3130,27 @@ function buildProgram(): Command {
       },
     );
 
-  const importCmd = program.command("import").description("import operations");
-  importCmd
-    .command("bibtex <file>")
-    .description("import a .bib file (find-or-create author persons, upsert sources by citekey)")
-    .action(async (filePath: string, _options: object, command: Command) => {
-      await importBibtex(ctxOf(command), filePath);
+  const importCmd = program.command("import").description("import operations (bibtex / csl-json / zotero-rdf sources)");
+  const importOptions = (cmd: Command): Command =>
+    cmd
+      .option("--dry-run", "plan only: report per-entry actions and planned persons/schemas, write nothing", false)
+      .addOption(new Option("--no-create", "match only: skip entries that would create a new source"));
+  importOptions(importCmd.command("bibtex <file>"))
+    .description(
+      "import a .bib file (find-or-create author persons; upsert by citekey, adopt @citekey-titled nodes)",
+    )
+    .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
+      await importBibtex(ctxOf(command), filePath, options);
+    });
+  importOptions(importCmd.command("csl-json <file>"))
+    .description("import a CSL-JSON file (top-level array or an object with an items array)")
+    .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
+      await importCslJson(ctxOf(command), filePath, options);
+    });
+  importOptions(importCmd.command("zotero-rdf <file>"))
+    .description("import a Zotero RDF export (bib:* entries; unkeyed top-level items are skipped)")
+    .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
+      await importZoteroRdf(ctxOf(command), filePath, options);
     });
 
   return program;
