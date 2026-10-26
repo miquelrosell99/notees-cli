@@ -8,6 +8,37 @@ history.
 
 ## 2026-10-26
 
+- **chore(vendor): vendor pin re-pointed at main `1423ce2c2 → a216b07db` — the
+  source-library roster, the dual-track authorship contract, and the mention
+  customLabel ruling.** A large jump (487 files in main across several
+  slices); the CLI adapts, the pin is law. Seed renames the gate caught:
+  `article` → `journal_article` (same uuid, never reuse) with new subtypes
+  `encyclopedia_article`/`magazine_article`/`newspaper_article`; `paper`,
+  `movie`, `weblink` retired (→ journal_article/film/web_page). Adaptations:
+  (1) import + export tests follow the new class vocabulary (`@article` →
+  journal_article, CSL `article-journal` → journal_article, new
+  `article-magazine` → magazine_article coverage in the csl-json suite);
+  (2) authorship is dual-track (SCHEMA.md "Citations", owner 2026-10-23) —
+  the import now writes the `authors` free-text rows (the citation track) AND
+  the `linkedAuthors` {nodeId} refs (the people-graph track, persons still
+  find-or-created), plus the reinstated `editors` text rows; `export bibtex`
+  resolves both through the new `NodeToCslOptions` (`resolveName` /
+  `resolveAgentName`), with the text rows the read-precedence winners;
+  (3) `import zotero-rdf` maps z:itemType through the vendored
+  `ZOTERO_ITEM_TYPE_TO_CLASS` manifest + `CLASS_NAME_TO_CSL_TYPE` instead of a
+  hand-rolled table; (4) the test harness config gains the new required
+  `resolverTimeoutMs`; (5) the query-language fixtures move from the retired
+  `paper` class to `journal_article` (`class:"journal article"` by title).
+  Per the main repo's seed-alignment law: the sibling manifests (GTK/Flutter)
+  already carry this seed change from main — no client code needed beyond
+  this adaptation.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` (done with the
+    bump) + `pnpm typecheck && pnpm test` — all green (104/104), incl. the
+    rewritten dual-track author round-trip (text rows win; linkedAuthors
+    resolves live once the text rows are cleared).
+  - **Files**: `vendor/notees` (the pin), `src/cli.ts`, `src/zotero-rdf.ts`,
+    `test/cli.test.ts`.
+
 - **feat(shell): `pool(items, concurrency, fn)` — the built-in worker pool for bulk-driver scripts.** The manipulation playbook prescribes "N-way concurrency pool + per-call retry + JSONL progress" for every bulk job, but each script hand-rolled its own pool (and died on the first item failure until it grew retry/collect). `pool` runs `fn` over `items` with 1–32 workers (validated — bad args/non-function fn exit 2 as usage), and NEVER throws on item failure: it resolves to per-item results in INPUT ORDER, `[{index, item, ok:true, value} | {index, item, ok:false, error}]`. Per-item JSONL progress stays in userland — `fn` may console.log per item and lines interleave across workers (documented in the interface + HELP_TEXT). Dependency-free (~30 lines); exposed as a script/REPL global like the other helpers.
   - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new e2e (10 items at concurrency 3 with one throwing item → `ok 9 failed 1`, input-order results, captured error message; bad concurrency exits 2).
 

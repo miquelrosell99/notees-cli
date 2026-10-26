@@ -78,6 +78,7 @@ async function bootServer(): Promise<Harness> {
       maxDocumentBytes: 100 * 1024 * 1024,
       loginPerMinute: 10,
       signupEnabled: false,
+      resolverTimeoutMs: 10_000,
       corsOrigins: [],
     },
     { logger: false },
@@ -690,21 +691,25 @@ describe("bibliography round-trip (bibtex)", () => {
     await h.runCli("--json", "object", "get", pubRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.classIds).toContain(SYSTEM_CLASS_UUIDS.year);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("1962");
-    // Authors are the node-typed property — {nodeId} refs to agent nodes, one per author.
-    const authorRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as {
+    // Authorship is dual-track (SCHEMA.md "Citations", owner 2026-10-23): the
+    // `authors` text rows are the citation track; `linkedAuthors` carries the
+    // {nodeId} refs to the agent nodes, one per author.
+    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("Kuhn, Thomas S.");
+    const authorRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as {
       nodeId: string;
     };
     expect(authorRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
 
-    // The paper source maps article → article class (owner family naming).
+    // The journal-article source maps @article → the journal_article class.
     const paperId = counts.entries[1] as string;
     await h.runCli("--json", "object", "get", paperId);
     const paper = JSON.parse(h.io.stdoutText).object;
-    expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.article);
+    expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.journal_article);
     const paperProps = paper.properties as { schemaId: string; value: unknown }[];
     expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.doi)?.value).toBe("10.2307/2333763");
+    expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("David, F. N.");
     expect(
-      paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).map((p) => p.value),
+      paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors).map((p) => p.value),
     ).toEqual([{ nodeId: expect.stringMatching(/^[0-9a-f-]{36}$/) }, { nodeId: expect.stringMatching(/^[0-9a-f-]{36}$/) }]);
 
     // The author person node: person class + the verbatim display name.
@@ -805,7 +810,7 @@ describe("bibliography round-trip (bibtex)", () => {
     expect(kuhn.issued).toEqual({ "date-parts": [[1962]] });
     expect(kuhn.ISBN).toBe("9780226458120");
     const david = byKey.get("cli-exp-david1962")!;
-    expect(david.type).toBe("article"); // article class → CSL article (owner family naming)
+    expect(david.type).toBe("article-journal"); // journal_article class → CSL article-journal
     expect(david.author).toEqual([
       { family: "David", given: "F. N." },
       { family: "Barton", given: "D. E." },
@@ -835,13 +840,13 @@ describe("bibliography round-trip (bibtex)", () => {
     expect(machine.bib).not.toContain("bib-notes");
   });
 
-  it("export resolves author node ids to current display names", async () => {
+  it("export reads the dual-track authorship contract (text authors win; linkedAuthors resolves live)", async () => {
     const h = harness;
     const file = join(h.dataDir, "bib-import-6.bib");
     writeFileSync(
       file,
       `@book{cli-link-kuhn1962,
-  title  = {The {Structure} of {Scientific} {Revolutions}},
+  title  = {The {Structure} of {Scientific} Revolutions},
   author = {Kuhn, Thomas S.},
   year   = 1962,
 }`,
@@ -850,19 +855,28 @@ describe("bibliography round-trip (bibtex)", () => {
     const { entries } = JSON.parse(h.io.stdoutText) as { entries: string[] };
     const bookId = entries[0]!;
 
-    // The authors property points at the person node; export must resolve
-    // the current display name, not a snapshot taken at import time.
+    // Import writes BOTH tracks: the authors text literal and the
+    // linkedAuthors {nodeId} ref to the find-or-created person node.
     await h.runCli("--json", "object", "get", bookId);
     const book = JSON.parse(h.io.stdoutText).object;
-    const authorRef = (book.properties as { schemaId: string; value: { nodeId: string } }[]).find(
-      (p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors,
-    )!.value;
+    const bookProps = book.properties as { schemaId: string; value: { nodeId?: string } }[];
+    const linkedRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)!.value;
+    expect(linkedRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
 
+    // The citation track (authors text) renders.
     expect(await h.runCli("export", "bibtex", "--ids", bookId)).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("author = {Kuhn, Thomas S.}");
 
-    // Rename the person node; the next export renders the new name.
-    expect(await h.runCli("object", "update", authorRef.nodeId, "--name", "Sagan, Carl")).toBe(EXIT.ok);
+    // Renaming the person moves the people-graph track but NOT the citation
+    // text — the authors rows are the source of truth (owner 2026-10-23 read
+    // precedence).
+    expect(await h.runCli("object", "update", linkedRef.nodeId!, "--name", "Sagan, Carl")).toBe(EXIT.ok);
+    expect(await h.runCli("export", "bibtex", "--ids", bookId)).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("author = {Kuhn, Thomas S.}");
+
+    // With the text rows cleared, export falls back to linkedAuthors and
+    // resolves the person's CURRENT display name.
+    expect(await h.runCli("object", "property", "delete", bookId, "authors")).toBe(EXIT.ok);
     expect(await h.runCli("export", "bibtex", "--ids", bookId)).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("author = {Sagan, Carl}");
     expect(h.io.stdoutText).not.toContain("Kuhn, Thomas S.");
@@ -1025,7 +1039,7 @@ describe("import adoption (title-is-content)", () => {
 });
 
 describe("import csl-json", () => {
-  it("imports a 2-item CSL-JSON file with classes, citekeys, and find-or-created authors", async () => {
+  it("imports a 3-item CSL-JSON file with classes, citekeys, and find-or-created authors", async () => {
     const h = harness;
     const file = join(h.dataDir, "csl-import-1.json");
     writeFileSync(
@@ -1049,12 +1063,18 @@ describe("import csl-json", () => {
             DOI: "10.1234/csl",
             "container-title": "Journal of CSL",
           },
+          {
+            id: "csl-mag-1",
+            type: "article-magazine",
+            title: "CSL Magazine Piece",
+            issued: { "date-parts": [[1940]] },
+          },
         ],
       }),
     );
     expect(await h.runCli("--json", "import", "csl-json", file)).toBe(EXIT.ok);
     const counts = JSON.parse(h.io.stdoutText) as { created: number; persons: number; personsCreated: number; entries: string[] };
-    expect(counts).toMatchObject({ created: 2, persons: 3, personsCreated: 3 });
+    expect(counts).toMatchObject({ created: 3, persons: 3, personsCreated: 3 });
 
     // Book → book class; citekey + ISBN landed.
     await h.runCli("--json", "object", "get", counts.entries[0]!);
@@ -1065,20 +1085,28 @@ describe("import csl-json", () => {
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("csl-book-1");
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9781234567890");
 
-    // article-journal → the paper class (the owner family naming); two author refs.
+    // article-journal → the journal_article class (the roster naming); the
+    // dual-track authorship: two authors text rows + two linkedAuthors refs.
     await h.runCli("--json", "object", "get", counts.entries[1]!);
     const paper = JSON.parse(h.io.stdoutText).object;
-    expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.paper);
+    expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.journal_article);
     const paperProps = paper.properties as { schemaId: string; value: unknown }[];
     expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.doi)?.value).toBe("10.1234/csl");
-    const authorRefs = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors);
-    expect(authorRefs).toHaveLength(2);
+    const authorRows = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors);
+    expect(authorRows.map((p) => p.value)).toEqual(["Noether, Emmy", "Weil, Simone"]);
+    const linkedRefs = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors);
+    expect(linkedRefs).toHaveLength(2);
 
-    // One author person resolved by name (the book's single author).
-    const bookAuthorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as {
+    // article-magazine → the new magazine_article subtype.
+    await h.runCli("--json", "object", "get", counts.entries[2]!);
+    expect(JSON.parse(h.io.stdoutText).object.classIds).toContain(SYSTEM_CLASS_UUIDS.magazine_article);
+
+    // One author person resolved by name (the book's single author, via the
+    // linkedAuthors track).
+    const bookLinkedRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as {
       nodeId: string;
     };
-    await h.runCli("--json", "object", "get", bookAuthorRef.nodeId);
+    await h.runCli("--json", "object", "get", bookLinkedRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("Curie, Marie");
   });
 
@@ -1169,8 +1197,8 @@ describe("import zotero-rdf", () => {
     const article = JSON.parse(h.io.stdoutText).object;
     expect(article.name).toBe("Article Title Wins");
     expect(article.name).not.toBe("Some Journal With Its Own Title");
-    // journalArticle → the paper class; the 2019 date landed on the chain.
-    expect(article.classIds).toContain(SYSTEM_CLASS_UUIDS.paper);
+    // journalArticle → the journal_article class; the 2019 date landed on the chain.
+    expect(article.classIds).toContain(SYSTEM_CLASS_UUIDS.journal_article);
     const articleProps = article.properties as { schemaId: string; value: unknown }[];
     expect(articleProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("rdf-article-1");
     const pubRef = articleProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate)?.value as {
@@ -1179,15 +1207,17 @@ describe("import zotero-rdf", () => {
     await h.runCli("--json", "object", "get", pubRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("2019");
 
-    // The book: author person via foaf surname/givenName, year, ISBN.
+    // The book: author person via foaf surname/givenName (the linkedAuthors
+    // track), year, ISBN.
     await h.runCli("--json", "object", "get", counts.entries[1]!);
     const book = JSON.parse(h.io.stdoutText).object;
     expect(book.name).toBe("The RDF Book");
     expect(book.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
     const bookProps = book.properties as { schemaId: string; value: unknown }[];
-    const authorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value as { nodeId: string };
+    const authorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as { nodeId: string };
     await h.runCli("--json", "object", "get", authorRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("Roe, Richard");
+    expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("Roe, Richard");
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9780123456789");
   });
 
@@ -1222,7 +1252,7 @@ describe("search (query language)", () => {
   }
 
   let yearSchemaId = "";
-  async function makePaper(name: string, year?: number): Promise<string> {
+  async function makeJournalArticle(name: string, year?: number): Promise<string> {
     if (yearSchemaId === "") {
       yearSchemaId = (
         await apiPost<{ propertySchema: { id: string } }>("/api/property-schemas", {
@@ -1234,9 +1264,9 @@ describe("search (query language)", () => {
     }
     const { id } = await apiPost<{ id: string }>("/api/objects", {
       isEmbedded: false,
-      // Title-is-content: the paper's own content IS its title.
+      // Title-is-content: the article's own content IS its title.
       contentAst: [{ type: "text", text: name }],
-      classIds: [SYSTEM_CLASS_UUIDS.paper],
+      classIds: [SYSTEM_CLASS_UUIDS.journal_article],
     });
     await apiPost<{ id: string }>("/api/objects", {
       isEmbedded: true,
@@ -1253,13 +1283,13 @@ describe("search (query language)", () => {
     return id;
   }
 
-  it("class:paper AND year:>2010 returns the right pages (DSL → AST → POST /query)", async () => {
+  it('class:"journal article" AND year:>2010 returns the right pages (DSL → AST → POST /query)', async () => {
     const h = harness;
-    const old = await makePaper("dslpaper1901", 1901);
-    const modern = await makePaper("dslpaper2015", 2015);
-    await makePaper("dslplainpage");
+    const old = await makeJournalArticle("dslpaper1901", 1901);
+    const modern = await makeJournalArticle("dslpaper2015", 2015);
+    await makeJournalArticle("dslplainpage");
 
-    expect(await h.runCli("--json", "search", "class:paper AND year:>2010")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "search", 'class:"journal article" AND year:>2010')).toBe(EXIT.ok);
     const body = JSON.parse(h.io.stdoutText) as { ids: string[]; rows: { id: string; name: string | null }[] };
     expect(body.ids).toEqual([modern]);
     expect(body.rows.map((row) => row.name)).toEqual(["dslpaper2015"]);
@@ -1268,10 +1298,10 @@ describe("search (query language)", () => {
 
   it("prop: comparison operators and bare-schema shorthand select by year", async () => {
     const h = harness;
-    const a = await makePaper("dslyear1937", 1937);
-    const b = await makePaper("dslyear2060", 2060);
+    const a = await makeJournalArticle("dslyear1937", 1937);
+    const b = await makeJournalArticle("dslyear2060", 2060);
 
-    // Earlier tests' papers share the workspace; assert containment.
+    // Earlier tests' journal articles share the workspace; assert containment.
     expect(await h.runCli("--json", "search", "prop:year:>=1900")).toBe(EXIT.ok);
     const all = JSON.parse(h.io.stdoutText).ids as string[];
     expect(all).toContain(a);
@@ -1285,7 +1315,7 @@ describe("search (query language)", () => {
 
   it("text:, quoted phrases, boolean composition and linked:Name", async () => {
     const h = harness;
-    const target = await makePaper("dsllinktarget");
+    const target = await makeJournalArticle("dsllinktarget");
     // Title-is-content: page content IS the title, so the prose lives on a
     // child block; the block is what text:/linked: match against.
     const notes = await h.createPage("dsllinknotes", []);
@@ -1328,8 +1358,8 @@ describe("search (query language)", () => {
 
   it("human mode lists result names; plain text still routes to FTS", async () => {
     const h = harness;
-    await makePaper("dslhuman2015", 2015);
-    expect(await h.runCli("search", "class:paper AND year:>=2010")).toBe(EXIT.ok);
+    await makeJournalArticle("dslhuman2015", 2015);
+    expect(await h.runCli("search", 'class:"journal article" AND year:>=2010')).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("dslhuman2015");
     expect(h.io.stdoutText).not.toContain("{");
 
@@ -2840,15 +2870,15 @@ describe("search by uuid", () => {
   it("class:/prop:/linked: accept uuids verbatim, no name resolution needed", async () => {
     const h = harness;
     // Seeded system classes carry fixed uuids — query one by id.
-    const paperId = SYSTEM_CLASS_UUIDS.paper;
-    expect(await h.runCli("--json", "search", `class:${paperId}`)).toBe(EXIT.ok);
+    const journalArticleId = SYSTEM_CLASS_UUIDS.journal_article;
+    expect(await h.runCli("--json", "search", `class:${journalArticleId}`)).toBe(EXIT.ok);
     const byClassId = JSON.parse(h.io.stdoutText).ids as string[];
     expect(byClassId.length).toBeGreaterThan(0);
 
     // Schema by uuid: the description system property exists on every row
     // only when set — assert the query compiles and runs, not the count.
     expect(
-      await h.runCli("--json", "search", `class:${paperId} AND prop:${SYSTEM_PROPERTY_UUIDS.description}:=x`),
+      await h.runCli("--json", "search", `class:${journalArticleId} AND prop:${SYSTEM_PROPERTY_UUIDS.description}:=x`),
     ).toBe(EXIT.ok);
 
     // linked:<uuid> matches the referring block without a name lookup (the
