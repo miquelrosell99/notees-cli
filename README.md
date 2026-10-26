@@ -48,6 +48,13 @@ notees config list                          # print both
 ```
 
 The defaults live in the CLI state file (`~/.notees/state.json`, mode 0600) under a top-level per-profile record — separate from the `servers` map, which is keyed `profile:server`. `notees config` itself needs no server, credential, or env: it only touches the local state file.
+## Authentication
+
+Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back to the one stored per profile+server in `~/.notees/state.json` (mode 0600):
+
+- `notees auth login --email <email> --password-stdin` — email + password; mints a dedicated CLI API key (revocable from the app) and stores it.
+- `notees auth store --key <credential>` (or `--key-stdin`) — probe-verify an existing API key against the server, then store it as the standing credential. Stored keys are not CLI-minted, so `auth logout` clears them locally only — server-side revocation applies to login-minted keys.
+- `notees auth status` / `notees auth logout` — probe / clear the stored credential.
 
 ## Installing
 

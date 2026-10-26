@@ -2020,6 +2020,120 @@ describe("config (per-profile defaults)", () => {
         delete process.env.NOTEES_WORKSPACE;
       }
     });
+describe("auth store (existing API keys)", () => {
+  // Mint a fresh user API key for the shared test account (the workspace-
+  // selection describe created it). Independent of any stored credential.
+  async function mintUserKey(): Promise<string> {
+    const h = harness;
+    const login = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { "content-type": "application/json" },
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    expect(login.statusCode).toBe(200);
+    const session = login.json().token as string;
+    const minted = await h.app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      headers: { "x-api-key": session, "content-type": "application/json" },
+      payload: { name: "auth-store-test" },
+    });
+    expect(minted.statusCode).toBe(201);
+    return minted.json().token as string;
+  }
+
+  it("rejects an invalid key (exit 3) and writes nothing to the state file", async () => {
+    const h = harness;
+    const io = new Capture();
+    const code = await run(["--server", h.baseUrl, "auth", "store", "--key", `nk_${"q".repeat(32)}`], io);
+    expect(code).toBe(EXIT.auth);
+    expect(io.stderrText).toContain("invalid or missing credentials");
+    const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { credential?: unknown }>;
+    };
+    expect(state.servers[`default:${h.baseUrl}`]?.credential).toBeUndefined();
+  });
+
+  it("accepts a valid key: stores { kind: apiKey, token, createdAt } (no keyId) and later commands use it", async () => {
+    const h = harness;
+    const token = await mintUserKey();
+    const storeIo = new Capture();
+    const storeCode = await run(["--server", h.baseUrl, "auth", "store", "--key", token], storeIo);
+    expect(storeCode).toBe(EXIT.ok);
+    expect(storeIo.stdoutText).toContain("stored API key");
+    expect(storeIo.stdoutText).toContain("clears it locally");
+    // The key never lands on stdout/stderr.
+    expect(storeIo.stdoutText + storeIo.stderrText).not.toContain(token);
+
+    // The state file holds exactly the StoredCredential shape, without keyId.
+    const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { credential?: { kind: string; token: string; keyId?: string; createdAt: string } }>;
+    };
+    const credential = state.servers[`default:${h.baseUrl}`]?.credential;
+    expect(credential).toBeDefined();
+    expect(credential?.kind).toBe("apiKey");
+    expect(credential?.token).toBe(token);
+    expect(credential?.keyId).toBeUndefined();
+    expect(typeof credential?.createdAt).toBe("string");
+
+    // The stored key becomes the standing credential (no --key, no env)…
+    const createIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "--json", "object", "create", "--name", "auth-store-obj"], createIo)).toBe(
+      EXIT.ok,
+    );
+    const created = JSON.parse(createIo.stdoutText) as { id: string };
+    // …a user key addresses the server default workspace, readable there.
+    const fetched = await h.app.inject({
+      method: "GET",
+      url: `/api/objects/${created.id}`,
+      headers: { "x-api-key": API_KEY },
+    });
+    expect(fetched.statusCode).toBe(200);
+
+    const statusIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "auth", "status"], statusIo)).toBe(EXIT.ok);
+    expect(statusIo.stdoutText).toContain("valid");
+  });
+
+  it("--key-stdin reads the key; --key with --key-stdin is a usage error", async () => {
+    const h = harness;
+    const token = await mintUserKey();
+
+    const io = new Capture();
+    io.stdin = Readable.from([`${token}\n`]);
+    const code = await run(["--server", h.baseUrl, "auth", "store", "--key-stdin"], io);
+    io.stdin = undefined;
+    expect(code).toBe(EXIT.ok);
+    expect(io.stdoutText).toContain("stored API key");
+
+    // --profile isolates the second store from the first.
+    const io2 = new Capture();
+    expect(
+      await run(["--server", h.baseUrl, "--profile", "second", "auth", "store", "--key", token, "--key-stdin"], io2),
+    ).toBe(EXIT.usage);
+    expect(io2.stderrText).toContain("not both");
+
+    const io3 = new Capture();
+    expect(await run(["--server", h.baseUrl, "auth", "store"], io3)).toBe(EXIT.usage);
+    expect(io3.stderrText).toContain("--key");
+  });
+
+  it("logout clears a stored key locally but does not revoke it server-side (no keyId)", async () => {
+    const h = harness;
+    const token = await mintUserKey();
+    expect(await run(["--server", h.baseUrl, "--profile", "revprobe", "auth", "store", "--key", token], new Capture())).toBe(
+      EXIT.ok,
+    );
+    const logoutIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "--profile", "revprobe", "auth", "logout"], logoutIo)).toBe(EXIT.ok);
+    // Not CLI-minted: no server-side revocation — the key still authenticates.
+    const probe = await h.app.inject({ method: "GET", url: "/api/classes", headers: { "x-api-key": token } });
+    expect(probe.statusCode).toBe(200);
+    // …and locally it is gone.
+    const afterIo = new Capture();
+    expect(await run(["--server", h.baseUrl, "--profile", "revprobe", "auth", "status"], afterIo)).toBe(EXIT.ok);
+    expect(afterIo.stdoutText).toContain("not logged in");
   });
 });
 
