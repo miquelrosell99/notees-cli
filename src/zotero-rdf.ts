@@ -19,7 +19,14 @@
 
 import sax from "sax";
 
-import { type CslItem, type CslName, type CslType } from "@notees/export";
+import { ZOTERO_ITEM_TYPE_TO_CLASS } from "@notees/domain";
+import {
+  CLASS_NAME_TO_CSL_TYPE,
+  type CslItem,
+  type CslName,
+  type CslType,
+  type SourceClassName,
+} from "@notees/export";
 
 export interface ZoteroRdfParseResult {
   items: CslItem[];
@@ -37,27 +44,8 @@ interface DraftEntry {
   authors: CslName[];
 }
 
-/** z:itemType value → CSL type (best-effort; the fallback class for anything
- *  unmapped is `document`, same as the bibtex importer's default). */
-const ITEM_TYPE_TO_CSL: Record<string, CslType> = {
-  book: "book",
-  journalArticle: "article-journal",
-  magazineArticle: "article-journal",
-  newspaperArticle: "article-journal",
-  conferencePaper: "paper-conference",
-  thesis: "thesis",
-  dissertation: "thesis",
-  report: "report",
-  statute: "report",
-  patent: "report",
-  webpage: "report",
-  document: "report",
-  bill: "report",
-  standard: "report",
-};
-
 /** Fallback when z:itemType is absent: the bib element name itself
- * (bib:Book → book, …; anything else → report → the document class). */
+ * (bib:Book → book, …; anything else → report → the report class). */
 const BIB_TAG_TO_CSL: Record<string, CslType> = {
   book: "book",
   article: "article-journal",
@@ -66,6 +54,18 @@ const BIB_TAG_TO_CSL: Record<string, CslType> = {
   thesis: "thesis",
   dissertation: "thesis",
 };
+
+/** z:itemType → CSL type via the vendored Zotero manifest (the item type maps
+ *  to a source class, the class maps to its CSL type — magazineArticle lands
+ *  on magazine_article → article-magazine, etc.). Unknown → the report
+ *  fallback (the best-effort class for unmapped imports). */
+function itemTypeToCsl(itemType: string | undefined, entryTag: string): CslType {
+  if (itemType !== undefined) {
+    const className = (ZOTERO_ITEM_TYPE_TO_CLASS as Record<string, SourceClassName>)[itemType];
+    if (className !== undefined) return CLASS_NAME_TO_CSL_TYPE[className];
+  }
+  return BIB_TAG_TO_CSL[entryTag.replace(/^bib:/i, "").toLowerCase()] ?? "report";
+}
 
 const textOf = (value: string | undefined): string | undefined => {
   const trimmed = value?.trim();
@@ -87,12 +87,10 @@ function identifierOf(kind: "ISBN" | "DOI", value: string | undefined): string |
 }
 
 function entryToCsl(entryTag: string, draft: DraftEntry): CslItem {
-  const fromItemType = draft.itemType !== undefined ? ITEM_TYPE_TO_CSL[draft.itemType] : undefined;
-  const fromTag = BIB_TAG_TO_CSL[entryTag.replace(/^bib:/i, "").toLowerCase()];
   const title = textOf(draft.title);
   const item: CslItem = {
     id: draft.citekey!,
-    type: fromItemType ?? fromTag ?? "report",
+    type: itemTypeToCsl(draft.itemType, entryTag),
     ...(title !== undefined ? { title } : {}),
     ...(draft.authors.length > 0 ? { author: draft.authors } : {}),
   };

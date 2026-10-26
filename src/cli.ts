@@ -1967,6 +1967,7 @@ function usedSchemaNames(items: CslItem[]): Set<SystemPropertyName> {
     if (item.publisher !== undefined) used.add("publisher");
     if (item.issued !== undefined) used.add("publicationDate");
     if ((item.author ?? []).length > 0) used.add("authors");
+    if ((item.editor ?? []).length > 0) used.add("editors");
   }
   return used;
 }
@@ -2087,9 +2088,11 @@ async function runSourceImport(
       continue;
     }
 
-    // Authors: node-typed to agent nodes — find-or-create one person per name
-    // string (FINAL owner decision 2026-09-27). Dry-run resolves without
-    // creating and reports the plan.
+    // Authors: dual-track (SCHEMA.md "Citations") — the
+    // persons are still find-or-created (one per name string; the
+    // linkedAuthors people-graph track), and the same literals land on the
+    // free-text `authors` citation track in upsertSource. Dry-run resolves
+    // without creating and reports the plan.
     const authorIds: string[] = [];
     const entryPersons: ImportEntryPlan["persons"] = [];
     for (const literal of spec.authors) {
@@ -2264,14 +2267,36 @@ async function upsertSource(
       await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
     }
   }
-  // Authors: node-typed list, replace wholesale — set the new {nodeId} refs,
-  // unset the stale tail.
-  const previousCount = properties.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).length;
-  for (let idx = 0; idx < authorIds.length; idx += 1) {
-    await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, { nodeId: authorIds[idx] }, idx);
-  }
-  for (let idx = authorIds.length; idx < previousCount; idx += 1) {
-    await deleteProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.authors, idx);
+  // Authorship is dual-track (SCHEMA.md "Citations"):
+  // `authors` carries the "Family, Given" text literals (the citation track
+  // export reads first); `linkedAuthors` carries the {nodeId} refs to the
+  // find-or-created agent nodes (the people-graph track). Both lists are
+  // replaced wholesale — set the new values, unset the stale tail.
+  const replaceList = async (
+    schemaId: string,
+    values: unknown[],
+  ): Promise<void> => {
+    const previousCount = properties.filter((p) => p.schemaId === schemaId).length;
+    for (let idx = 0; idx < values.length; idx += 1) {
+      await setProperty(ctx, id, schemaId, values[idx], idx);
+    }
+    for (let idx = values.length; idx < previousCount; idx += 1) {
+      await deleteProperty(ctx, id, schemaId, idx);
+    }
+  };
+  await replaceList(
+    SYSTEM_PROPERTY_UUIDS.authors,
+    spec.authors.filter((literal) => literal.length > 0),
+  );
+  await replaceList(
+    SYSTEM_PROPERTY_UUIDS.linkedAuthors,
+    authorIds.map((personId) => ({ nodeId: personId })),
+  );
+  if (spec.editors !== undefined) {
+    await replaceList(
+      SYSTEM_PROPERTY_UUIDS.editors,
+      spec.editors.filter((literal) => literal.length > 0),
+    );
   }
   return id;
 }
@@ -2416,18 +2441,21 @@ async function exportBibtex(ctx: CommandContext, options: {
   const entryIds: string[] = [];
   let skipped = 0;
 
-  // The `authors` property is node-typed ({nodeId} refs, agent-filtered) —
-  // resolve every referenced author to its current display name up front,
-  // batched through the objects API (the resolver caches per id). Date-node
-  // refs (publicationDate) resolve through the same batch.
-  const authorIds = new Set<string>();
+  // The authorship read contract is dual-track (SCHEMA.md "Citations", owner
+  // 2026-10-23): `authors` text rows ("Family, Given") are the citation
+  // source of truth; `linkedAuthors` ({nodeId} refs to agent nodes) is the
+  // people-graph track that nodeToCsl resolves through resolveAgentName only
+  // when no authors row resolves. Both ref kinds resolve to current display
+  // names up front, batched through the objects API (the resolver caches per
+  // id). Date-node refs (publicationDate) resolve through resolveName.
+  const agentRefIds = new Set<string>();
   const dateRefIds = new Set<string>();
   for (const node of included.values()) {
     if (sourceClassOf(node.classIds) === undefined) continue;
     for (const property of node.properties) {
-      if (property.schemaId !== SYSTEM_PROPERTY_UUIDS.authors) continue;
+      if (property.schemaId !== SYSTEM_PROPERTY_UUIDS.linkedAuthors) continue;
       if (isRecord(property.value) && typeof property.value.nodeId === "string") {
-        authorIds.add(property.value.nodeId);
+        agentRefIds.add(property.value.nodeId);
       }
     }
     const pub = node.properties.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publicationDate);
@@ -2435,12 +2463,12 @@ async function exportBibtex(ctx: CommandContext, options: {
       dateRefIds.add(pub.value.nodeId);
     }
   }
-  const authorNames = new Map<string, string>();
-  for (const authorId of authorIds) {
-    const authorNode = await resolver.getObject(authorId);
-    if (authorNode === undefined) continue;
-    const displayName = deriveDisplayName(authorNode) || authorNode.name?.trim() || "";
-    if (displayName.length > 0) authorNames.set(authorId, displayName);
+  const agentNames = new Map<string, string>();
+  for (const agentId of agentRefIds) {
+    const agentNode = await resolver.getObject(agentId);
+    if (agentNode === undefined) continue;
+    const displayName = deriveDisplayName(agentNode) || agentNode.name?.trim() || "";
+    if (displayName.length > 0) agentNames.set(agentId, displayName);
   }
   const dateNames = new Map<string, string>();
   for (const refId of dateRefIds) {
@@ -2455,17 +2483,14 @@ async function exportBibtex(ctx: CommandContext, options: {
       skipped += 1;
       continue;
     }
-    const authors = node.properties
-      .filter((property) => property.schemaId === SYSTEM_PROPERTY_UUIDS.authors)
-      .map((property) =>
-        isRecord(property.value) && typeof property.value.nodeId === "string"
-          ? authorNames.get(property.value.nodeId)
-          : undefined,
-      )
-      .filter((name): name is string => name !== undefined);
     rendered.push(
       serializeBibEntry(
-        cslToBib(nodeToCsl(node, node.properties, authors, (refId) => dateNames.get(refId))),
+        cslToBib(
+          nodeToCsl(node, node.properties, {
+            resolveName: (refId) => dateNames.get(refId),
+            resolveAgentName: (refId) => agentNames.get(refId),
+          }),
+        ),
       ),
     );
     entryIds.push(node.id);
