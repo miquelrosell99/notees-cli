@@ -3567,3 +3567,51 @@ describe("shell script file", () => {
     expect(h.io.stderrText).toContain("cannot read script");
   });
 });
+
+describe("help command", () => {
+  it("prints the overview with every top-level command and exits 0 — no server needed", async () => {
+    const io = new Capture();
+    // Deliberately bare argv: help must resolve nothing (no --server, no
+    // credential) — the suite blanks the NOTEES_* env for exactly this.
+    const code = await run(["help"], io);
+    expect(code).toBe(EXIT.ok);
+    for (const name of [
+      "object", "cover", "property", "search", "today", "date", "journal",
+      "class", "auth", "config", "ops", "backlinks", "asset", "sync",
+      "doctor", "shell", "export", "import", "help",
+    ]) {
+      expect(io.stdoutText).toMatch(new RegExp(`^${name}\\s\\s`, "m"));
+    }
+    // Header contract: usage line, the global flags, the exit-code legend.
+    expect(io.stdoutText).toContain("notees help <command> [subcommand]");
+    expect(io.stdoutText).toContain("--json");
+    expect(io.stdoutText).toContain("0 ok");
+  });
+
+  it("delegates to the --help renderer for a subcommand path", async () => {
+    const io = new Capture();
+    const code = await run(["help", "object", "merge"], io);
+    expect(code).toBe(EXIT.ok);
+    // The same text `notees object merge --help` prints — the merge flags
+    // must come through, from the command's own help, not a copy.
+    expect(io.stdoutText).toContain("Usage:");
+    expect(io.stdoutText).toContain("--dry-run");
+    expect(io.stdoutText).toContain("--yes");
+
+    const top = new Capture();
+    expect(await run(["help", "object"], top)).toBe(EXIT.ok);
+    expect(top.stdoutText).toContain("merge");
+    expect(top.stdoutText).toContain("children");
+  });
+
+  it("unknown command path is a usage error (exit 2) naming the path", async () => {
+    const io = new Capture();
+    expect(await run(["help", "frobnicate"], io)).toBe(EXIT.usage);
+    expect(io.stderrText).toContain("frobnicate");
+    expect(io.stderrText).toContain("notees help");
+
+    const partial = new Capture();
+    expect(await run(["help", "object", "frobnicate"], partial)).toBe(EXIT.usage);
+    expect(partial.stderrText).toContain("object frobnicate");
+  });
+});

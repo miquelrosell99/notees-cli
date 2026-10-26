@@ -3084,6 +3084,73 @@ async function configList(ctx: ConfigContext): Promise<void> {
   );
 }
 
+// --- help --------------------------------------------------------------------
+
+/**
+ * `notees help` — the command overview. One row per top-level command. The
+ * one-line description is derived from each command's own description() (the
+ * --help strings stay the single source of truth; only the key-flags column
+ * is curated here). A top-level command without a HELP_ROWS entry — or a
+ * stale entry for a removed command — fails loud at render time, so the
+ * overview can never silently drift from the program.
+ */
+const HELP_ROWS: Record<string, { flags: string }> = {
+  object: { flags: "create --batch · get --ids · merge --dry-run" },
+  cover: { flags: "set --asset · get · clear" },
+  property: { flags: "create --type · bind · delete --yes" },
+  search: { flags: "(the query grammar — see search --help)" },
+  today: { flags: "--append" },
+  date: { flags: "ensure <YYYY-MM-DD>" },
+  journal: { flags: "--limit" },
+  class: { flags: "list --tree · remap --dry-run · set-extends" },
+  auth: { flags: "login · store --key-stdin · status" },
+  config: { flags: "set · get · list" },
+  ops: { flags: "[opType]" },
+  backlinks: { flags: "<id>" },
+  asset: { flags: "add --object · get --output" },
+  sync: { flags: "status" },
+  doctor: { flags: "(resolves flag > env > stored)" },
+  shell: { flags: "[script]" },
+  export: { flags: "markdown · json · bibtex" },
+  import: { flags: "bibtex · csl-json · logseq-db" },
+  help: { flags: "<command> [subcommand]" },
+};
+
+function renderCommandOverview(program: Command): string {
+  const known = new Set(program.commands.map((command) => command.name()));
+  for (const name of Object.keys(HELP_ROWS)) {
+    if (!known.has(name)) {
+      throw new Error(`notees help: HELP_ROWS entry "${name}" has no top-level command — remove the stale entry`);
+    }
+  }
+  const rows: string[][] = [["COMMAND", "WHAT IT DOES", "KEY FLAGS"]];
+  for (const command of program.commands) {
+    const entry = HELP_ROWS[command.name()];
+    if (entry === undefined) {
+      throw new Error(
+        `notees help: top-level command "${command.name()}" has no HELP_ROWS entry — the overview must stay complete`,
+      );
+    }
+    // First sentence of the command's own description — the full text lives
+    // in --help and `notees help <command>`, never duplicated here.
+    const description = command.description().split(/(?<=[.!?])\s/u, 1)[0] ?? "";
+    rows.push([command.name(), description, entry.flags]);
+  }
+  return [
+    "notees — the Notees CLI",
+    "",
+    "Usage: notees <command> [options]  |  notees help <command> [subcommand]  (the same text as --help)",
+    "",
+    "Every command: --json (stable machine output) · --server <url> · --key <credential> ·",
+    "               --workspace <name|id> · --profile <name>  (env: NOTEES_SERVER / NOTEES_API_KEY / NOTEES_WORKSPACE)",
+    "Exit codes:    0 ok · 1 domain · 2 usage · 3 auth · 4 conflict · 5 network",
+    "Destructive commands refuse without --yes (they print a blast-radius preview and exit 2).",
+    "",
+    formatTable(rows),
+    "",
+  ].join("\n");
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -3734,6 +3801,37 @@ function buildProgram(): Command {
       dryRun?: boolean;
     }, command: Command) => {
       await importLogseqDb(ctxOf(command), filePath, options);
+    });
+
+  // `notees help` replaces commander's built-in help command (addHelpCommand
+  // off): no argument prints the grouped overview; a command path delegates
+  // to the target's own --help renderer, so the help strings have a single
+  // source of truth. It resolves nothing — no server, no credential — so it
+  // works offline like `notees config`.
+  program.addHelpCommand(false);
+  program
+    .command("help [commandPath...]")
+    .description("command overview (no argument), or the full --help text for one command: `notees help object merge`")
+    .action((commandPath: string[], _options: object, command: Command) => {
+      const root = rootOf(command);
+      const io = (root.getOptionValue("__io") as CliIo | undefined) ?? defaultIo;
+      if (commandPath.length === 0) {
+        io.stdout.write(renderCommandOverview(root));
+        return;
+      }
+      let current: Command = root;
+      for (const part of commandPath) {
+        const next = current.commands.find((candidate) => candidate.name() === part);
+        if (next === undefined) {
+          throw new CliError(
+            EXIT.usage,
+            `unknown command "${commandPath.join(" ")}" — \`notees help\` lists every command`,
+          );
+        }
+        current = next;
+      }
+      const text = current.helpInformation();
+      io.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
     });
 
   return program;

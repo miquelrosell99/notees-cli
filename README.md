@@ -2,7 +2,7 @@
 
 The `notees` command-line client for [Notees](https://github.com/miquelrosell99/notees) — the object/property/search surface over the server's public API. Split out of the main monorepo (`apps/cli`) to live alongside the other first-class clients ([GTK](https://github.com/miquelrosell99/notees-gtk), [Flutter](https://github.com/miquelrosell99/notees-flutter)).
 
-The CLI talks to a running `notees-sync` server over HTTP. It holds no state of its own beyond a session credential.
+The CLI talks to a running `notees-sync` server over HTTP. It holds no state of its own beyond a session credential. `notees help` prints the full command overview; `notees help <command> [subcommand]` prints the full help for one command — see Command reference below.
 
 ## Layout
 
@@ -57,6 +57,33 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 - `notees auth status` / `notees auth logout` — probe / clear the stored credential.
 
 `notees doctor` exercises the same resolution chain: it resolves server, workspace, and credential flag > env > stored (a stored credential counts, and the `authentication:` probe sends it), reports every check as ok/FAIL — failing checks report FAILs, not a bare usage error — and exits non-zero when any check fails.
+
+## Command reference
+
+`notees help` prints the full overview — every top-level command with a one-line purpose and key flags. `notees help <command> [subcommand]` prints one command's complete help (the same text as `--help`, which stays the canonical source; this table is only the index). Every command also takes the global flags `--json`, `--server <url>`, `--key <credential>`, `--workspace <name|id>`, `--profile <name>`.
+
+| Command | Purpose | Common flags |
+|---|---|---|
+| `object` | create / read / update / move / merge / list objects | `create --batch`, `get --ids`, `merge --dry-run` |
+| `cover` | the one-gesture node cover (image) | `set --asset`, `clear` |
+| `property` | property schemas and class bindings | `create --type`, `bind`, `delete --yes` |
+| `search` | plain-text (FTS) or query-language search | (grammar in `search --help`) |
+| `today` | open today's daily note | `--append` |
+| `date` | the deterministic date chain | `ensure <YYYY-MM-DD>` |
+| `journal` | list daily notes, newest first | `--limit` |
+| `class` | class membership, extends, bulk remap | `list --tree`, `remap --dry-run` |
+| `auth` | sign in / store / probe the credential | `login`, `store --key-stdin`, `status` |
+| `config` | per-profile default server / workspace | `set`, `get`, `list` |
+| `ops` | the operation catalog (or one op's shape) | `[opType]` |
+| `backlinks` | list backlinks to an object | — |
+| `asset` | upload / download files | `add --object`, `get --output` |
+| `sync` | server stats + local cursor | `status` |
+| `doctor` | auth + reachability + version probe | (resolves flag > env > stored) |
+| `shell` | scripting REPL over the object API | `[script]` |
+| `export` | Markdown / JSON archive / BibTeX bundles | `markdown --ids`, `json --class` |
+| `import` | bibtex / csl-json / zotero-rdf / logseq-db sources | `--dry-run` |
+
+Destructive commands refuse without `--yes`: they print a blast-radius preview and exit 2. Exit codes: 0 ok, 1 domain, 2 usage, 3 auth, 4 conflict, 5 network.
 
 ## Installing
 
