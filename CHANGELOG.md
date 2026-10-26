@@ -8,6 +8,9 @@ history.
 
 ## 2026-10-26
 
+- **fix(doctor): honor stored config defaults and the stored credential (PR #9 / issue #9).** `notees doctor` read `--server` / `NOTEES_SERVER` and the flag/env credential only, so it FAILed setups that actually work — bare commands already resolve server/workspace/credential flag > env > stored. Doctor now resolves through the same shared path (`resolveServer` — extracted from `requireServer` so there is one resolution, not two — plus `resolveKey` with the same `${profile}:${server}` state key the command-context builder derives, so the stored server default selects the right credential slot): a fully stored setup reads all-ok, the `authentication:` check exercises the stored credential, and the FAIL hints name all three sources (`notees config set server`, `notees auth login` / `auth store`). Doctor also stops pre-empting its own report — with nothing configured it prints the failing checks and exits 2 instead of dying on a usage error before the report.
+  - **Verification**: `pnpm install && pnpm -r --filter "@notees/*" build && pnpm typecheck && pnpm test && pnpm build` — all green (116/116).
+
 - **chore(release): v4.5.2 — the merged PR queue: `auth store`, per-profile `config` defaults, `today --append` block id, Windows shim.** Rides the 4.5.x train (server 4.5.0): `notees auth store --key|--key-stdin` persists an existing API key (probe-verified; logout clears locally only for non-CLI-minted keys — PR #8 / issue #1); `notees config set|get|list` stores a per-profile default server/workspace with resolution flag > env > stored (PR #7 / issue #2); `notees today --append` reports the created block id (PR #6 / issue #4); `install.sh` emits a `notees.cmd` shim on Windows (PR #5 / issue #3).
   - **Verification**: `pnpm typecheck && pnpm test && pnpm build` — all green (113/113); bundle sha256 `a874279e…` recorded in the PKGBUILD.
 
