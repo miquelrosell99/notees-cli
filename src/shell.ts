@@ -83,6 +83,12 @@ export interface ShellHelpers {
   props(id: string): Promise<unknown>;
   effective(id: string): Promise<unknown>;
   create(partial: Record<string, unknown>): Promise<unknown>;
+  /**
+   * PATCH fields (isEmbedded, icon, color, contentAst). `name` is accepted as
+   * the title-is-content shorthand: it becomes a single text token
+   * (`contentAst: [{type:"text",text: name}]`), so it is mutually exclusive
+   * with an explicit `contentAst` in the same call.
+   */
   update(id: string, fields: Record<string, unknown>): Promise<unknown>;
   del(id: string, opts?: DeleteOptions): Promise<unknown>;
   setProperty(id: string, schemaId: string, value: unknown, opts?: SetPropertyOptions): Promise<unknown>;
@@ -135,7 +141,7 @@ giant heredoc):
   props(id)                                  authored properties of an object
   effective(id)                              authored + class-default effective properties
   create(partial)                            POST /objects -> created object (fields: isClass, isEmbedded, name, contentAst, classIds, parentId)
-  update(id, fields)                         PATCH fields (name, isEmbedded, icon, color, contentAst) -> updated object
+  update(id, fields)                         PATCH fields (isEmbedded, icon, color, contentAst; name becomes a single text token) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   unsetProperty(id, schemaId, idx?)          unset a property slot (idx defaults 0) -> updated object
@@ -224,8 +230,23 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       (await client.getJson<{ properties: unknown[] }>(`${objectUrl(id)}/effective-properties`)).properties,
     create: async (partial) =>
       (await client.postJson<{ object: unknown }>("/api/objects", partial)).object,
-    update: async (id, fields) =>
-      (await client.patchJson<{ object: unknown }>(objectUrl(id), fields)).object,
+    update: async (id, fields) => {
+      const body = { ...fields };
+      // Title-is-content: `name` rewrites the node's text content (its title),
+      // mirroring `object update --name` (cli.ts) — the server rejects a bare
+      // `name` key.
+      if (body.name !== undefined) {
+        if (body.contentAst !== undefined) {
+          throw new CliError(
+            EXIT.usage,
+            "update: name and contentAst are mutually exclusive (name becomes one text token; contentAst carries the whole content)",
+          );
+        }
+        body.contentAst = [{ type: "text", text: String(body.name) }];
+        delete body.name;
+      }
+      return (await client.patchJson<{ object: unknown }>(objectUrl(id), body)).object;
+    },
     del: async (id, opts = {}) => {
       const permanent = opts.permanent === true;
       const query = permanent ? `?permanent=true&confirm=${encodeURIComponent(id)}` : "";
@@ -461,7 +482,7 @@ function makeAsyncEval(): repl.REPLEval {
 
 // --- modes ----------------------------------------------------------------------
 
-/** Run one script (piped stdin or a file). Throws CliError(EXIT.domain) on script failure. */
+/** Run one script (piped stdin or a file). Throws CliError(EXIT.domain) on script failure — a CliError thrown by a helper keeps its own exit code (e.g. a usage error exits 2). */
 async function runScript(helpers: ShellHelpers, options: ShellOptions, source: string, filename: string): Promise<void> {
   // runInThisContext keeps the real Node globals (Buffer, process, …) but sees
   // only globals, so the helpers (and a console bound to the injected io, so
@@ -492,7 +513,10 @@ async function runScript(helpers: ShellHelpers, options: ShellOptions, source: s
     const script = new vm.Script(wrapper, { filename });
     await script.runInThisContext({ breakOnSigint: true });
   } catch (error) {
-    throw new CliError(EXIT.domain, `shell: script failed: ${errorMessage(error)}`);
+    throw new CliError(
+      error instanceof CliError ? error.exitCode : EXIT.domain,
+      `shell: script failed: ${errorMessage(error)}`,
+    );
   } finally {
     delete globals[slot];
   }
