@@ -47,6 +47,8 @@ curl -fsSL https://raw.githubusercontent.com/miquelrosell99/notees-cli/main/scri
 
 Requirements: bash, curl, node ≥ 22. The bundle is standalone — no pnpm toolchain, no `vendor/` checkout. Installing from source (above) is the other supported path; there is no npm or docker distribution.
 
+**On Windows:** the installer also writes a `notees.cmd` shim next to the installed files, so cmd/PowerShell can run `notees` directly (Git Bash/MSYS executes the extensionless `notees` via its shebang either way).
+
 **On Arch (pacman):** `packaging/arch/PKGBUILD` builds an installable package from the same release assets — checksum-verified by pacman itself:
 
 ```bash
