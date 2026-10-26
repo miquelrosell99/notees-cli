@@ -76,7 +76,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `config` | per-profile default server / workspace | `set`, `get`, `list` |
 | `ops` | the operation catalog (or one op's shape) | `[opType]` |
 | `backlinks` | list backlinks to an object | — |
-| `asset` | upload / download files | `add --object`, `get --output` |
+| `asset` | bulk upload / attach / list / download files | `add <path…> --object --jobs`, `attach --object`, `list --object --limit`, `get --output` |
 | `sync` | server stats + local cursor | `status` |
 | `doctor` | auth + reachability + version probe | (resolves flag > env > stored) |
 | `shell` | scripting REPL over the object API | `[script]` |

@@ -54,6 +54,7 @@ import {
 } from "@notees/query";
 
 import { ApiClient } from "./client.js";
+import { expandAssetInputs, uploadAssetFile, assertObjectExists } from "./assets-lib.js";
 import { parseCslJson } from "./csl-json.js";
 import { CliError, EXIT } from "./exit-codes.js";
 import {
@@ -1284,22 +1285,163 @@ async function backlinks(ctx: CommandContext, id: string): Promise<void> {
 
 /** Upload bytes (optionally attaching to a node) — returns the CAS asset id, no output. */
 async function uploadAsset(ctx: CommandContext, filePath: string, objectId?: string): Promise<string> {
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(filePath);
-  } catch (error) {
-    throw new CliError(EXIT.usage, `cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  const form = new FormData();
-  form.append("file", new Blob([bytes]), basename(filePath));
-  if (objectId !== undefined) form.append("objectId", objectId);
-  const body = await ctx.client.postMultipart<{ assetId: string }>("/api/assets", form);
-  return body.assetId;
+  return uploadAssetFile(ctx.client, filePath, objectId);
 }
 
-async function assetAdd(ctx: CommandContext, filePath: string, options: { object?: string }): Promise<void> {
-  const assetId = await uploadAsset(ctx, filePath, options.object);
-  emit(ctx, `${assetId}\n`, { assetId });
+/**
+ * `notees asset add <path…>` — bulk upload: one or more files and/or
+ * directories (a directory adds every regular file in it, recursively).
+ * Batch semantics mirror `object create --batch`: --jobs 1–32 (default 8),
+ * per-item failures collected into a `failures` array (with file + error;
+ * exit 1 when any item failed), --stop-on-error aborts the remaining files.
+ * `--object <nodeId>` attaches every uploaded asset to that node (the
+ * multipart objectId idiom, one upload per file). Human output: one line
+ * per uploaded asset (id + filename), then the counts.
+ */
+async function assetAdd(ctx: CommandContext, inputs: string[], options: {
+  object?: string;
+  jobs?: string;
+  stopOnError?: boolean;
+}): Promise<void> {
+  if (inputs.length === 0) failUsage("asset add requires at least one file or directory");
+  const jobs = Number.parseInt(options.jobs ?? "8", 10);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32) failUsage("--jobs must be an integer between 1 and 32");
+
+  const { files, failures } = expandAssetInputs(inputs);
+  if (files.length === 0 && failures.length === 0) {
+    failUsage("asset add found no regular files in the given paths");
+  }
+  const objectId = options.object;
+  // The multipart attach is dangling-id-tolerant server-side (the asset.attach
+  // applier upserts node_asset rows without validating the node), so verify
+  // the target up front instead of uploading bytes that attach to nothing.
+  if (objectId !== undefined) await assertObjectExists(ctx.client, objectId);
+  const uploaded: { index: number; file: string; assetId: string }[] = [];
+  let stopped = false;
+  const queue = files.map((file, index) => ({ file, index }));
+
+  await Promise.all(
+    Array.from({ length: Math.min(jobs, Math.max(queue.length, 1)) }, async () => {
+      for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+        const { file, index } = item;
+        if (stopped) {
+          failures.push({ file, error: "skipped (--stop-on-error)" });
+          continue;
+        }
+        try {
+          const assetId = await uploadAsset(ctx, file, objectId);
+          uploaded.push({ index, file, assetId });
+        } catch (error) {
+          failures.push({ file, error: error instanceof Error ? error.message : String(error) });
+          if (options.stopOnError === true) stopped = true;
+        }
+      }
+    }),
+  );
+
+  const assets = [...uploaded].sort((a, b) => a.index - b.index).map(({ file, assetId }) => ({ assetId, file }));
+  const machine = {
+    added: assets.length,
+    assets,
+    failures,
+    // Additive-only --json: the pre-bulk single-file shape carried a
+    // top-level assetId; keep it when exactly one asset was added.
+    ...(assets.length === 1 ? { assetId: assets[0]!.assetId } : {}),
+    ...(objectId !== undefined ? { objectId } : {}),
+  };
+  const human =
+    assets.map((entry) => `${entry.assetId}  ${basename(entry.file)}\n`).join("") +
+    `added ${assets.length}/${files.length} files (${failures.length} failures)\n`;
+  emit(ctx, human, machine);
+  if (failures.length > 0) {
+    const detail = failures
+      .slice(0, 5)
+      .map((failure) => `${failure.file}: ${failure.error}`)
+      .join("; ");
+    throw new CliError(EXIT.domain, `asset add: ${failures.length} failed (${detail}${failures.length > 5 ? "; …" : ""})`, machine);
+  }
+}
+
+/**
+ * `notees asset attach <assetId> --object <nodeId>` — link an EXISTING asset
+ * to a node: the asset.attach op rides the relay batch endpoint (the one
+ * write path), the same envelope the server submits when a multipart upload
+ * carries an objectId and the web client's attachAsset enqueues. Asset
+ * metadata (hash/mime/size/name) comes from GET /api/assets/:id/info, so a
+ * dangling asset id fails loud before anything is written. Idempotent: the
+ * derived node_asset row is keyed (node_id, asset_id) — re-attaching upserts
+ * the same row, a state no-op.
+ */
+async function assetAttach(ctx: CommandContext, assetId: string, options: { object?: string }): Promise<void> {
+  if (options.object === undefined) failUsage("asset attach requires --object <nodeId>");
+  // Both ids verified before anything is written: the asset (dangling ids
+  // fail here) and the node (the asset.attach applier upserts node_asset
+  // rows without validating it — an attach to a dangling node id would
+  // otherwise silently succeed and leave an orphan row).
+  await assertObjectExists(ctx.client, options.object);
+  const info = await ctx.client.getJson<{
+    assetId: string;
+    hash: string;
+    mimeType: string;
+    size: number;
+    originalName: string;
+  }>(`/api/assets/${encodeURIComponent(assetId)}/info`);
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelope = newEnvelope({
+    workspaceId,
+    actorId,
+    deviceId: "notees-cli",
+    client: "cli",
+    hlc: clock.now(),
+    affectedNodeIds: [options.object, info.assetId],
+    opType: "asset.attach",
+    payload: {
+      objectId: options.object,
+      assetId: info.assetId,
+      hash: info.hash,
+      mimeType: info.mimeType,
+      size: info.size,
+      originalName: info.originalName,
+    },
+  });
+  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  emit(ctx, `attached ${info.assetId} to ${options.object}\n`, {
+    assetId: info.assetId,
+    objectId: options.object,
+    attached: true,
+  });
+}
+
+/**
+ * `notees asset list [--object <id>] [--limit n]` — the workspace asset
+ * index (GET /api/assets, newest first; server-capped at 1000 per page).
+ * `--object` filters client-side to the assets attached to that node (the
+ * index carries each asset's attached object ids).
+ */
+async function assetList(ctx: CommandContext, options: { object?: string; limit?: string }): Promise<void> {
+  if (options.limit !== undefined) {
+    const parsed = Number.parseInt(options.limit, 10);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 1000) {
+      failUsage("--limit must be an integer between 1 and 1000");
+    }
+  }
+  const query = options.limit !== undefined ? `?limit=${encodeURIComponent(options.limit)}` : "";
+  const body = await ctx.client.getJson<{
+    assets: Array<{ assetId: string; mimeType: string; size: number; originalName: string; objects: string[] }>;
+    limit: number;
+    total: number;
+  }>(`/api/assets${query}`);
+  const listing =
+    options.object !== undefined
+      ? { assets: body.assets.filter((asset) => asset.objects.includes(options.object!)), limit: body.limit, total: body.assets.filter((asset) => asset.objects.includes(options.object!)).length }
+      : body;
+  const human =
+    listing.assets
+      .map((asset) => `${asset.assetId}  ${asset.originalName} (${asset.mimeType}, ${asset.size} bytes)\n`)
+      .join("") + `${listing.total} assets (page limit ${listing.limit})\n`;
+  emit(ctx, human, listing);
 }
 
 async function assetGet(ctx: CommandContext, id: string, options: { output?: string }): Promise<void> {
@@ -3107,7 +3249,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   config: { flags: "set · get · list" },
   ops: { flags: "[opType]" },
   backlinks: { flags: "<id>" },
-  asset: { flags: "add --object · get --output" },
+  asset: { flags: "add <path…> --object --jobs --stop-on-error · attach --object · list --object --limit · get --output" },
   sync: { flags: "status" },
   doctor: { flags: "(resolves flag > env > stored)" },
   shell: { flags: "[script]" },
@@ -3622,11 +3764,29 @@ function buildProgram(): Command {
 
   const asset = program.command("asset").description("asset operations");
   asset
-    .command("add <file>")
-    .description("upload a file (prints the asset id)")
-    .option("--object <id>", "attach to this object")
-    .action(async (filePath: string, options: { object?: string }, command: Command) => {
-      await assetAdd(ctxOf(command), filePath, options);
+    .command("add")
+    .argument("<path...>", "files and/or directories — a directory adds every regular file in it, recursively")
+    .description("upload files (bulk: per-item failures, exit 1; --object attaches every uploaded asset to a node)")
+    .option("--object <id>", "attach every uploaded asset to this node")
+    .option("--jobs <n>", "upload concurrency 1–32 (default 8)", "8")
+    .option("--stop-on-error", "abort the remaining files on the first failure", false)
+    .action(async (paths: string[], options: { object?: string; jobs?: string; stopOnError?: boolean }, command: Command) => {
+      await assetAdd(ctxOf(command), paths, options);
+    });
+  asset
+    .command("attach <assetId>")
+    .description("link an EXISTING asset to a node (idempotent — re-attach is a state no-op)")
+    .requiredOption("--object <id>", "the node to attach the asset to")
+    .action(async (assetId: string, options: { object: string }, command: Command) => {
+      await assetAttach(ctxOf(command), assetId, options);
+    });
+  asset
+    .command("list")
+    .description("list workspace assets, newest first (needs the server's asset index route)")
+    .option("--object <id>", "only assets attached to this node (client-side filter)")
+    .option("--limit <n>", "max assets 1–1000 (server default 100)")
+    .action(async (options: { object?: string; limit?: string }, command: Command) => {
+      await assetList(ctxOf(command), options);
     });
   asset
     .command("get <id>")

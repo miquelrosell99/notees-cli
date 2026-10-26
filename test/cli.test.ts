@@ -1,11 +1,12 @@
 import { createServer } from "node:http";
 import { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 
 // One real server per file (was: per test — repeated boots accumulated
 // handles in the worker and beforeEach intermittently blew the 10 s hook
@@ -3613,5 +3614,251 @@ describe("help command", () => {
     const partial = new Capture();
     expect(await run(["help", "object", "frobnicate"], partial)).toBe(EXIT.usage);
     expect(partial.stderrText).toContain("object frobnicate");
+  });
+});
+
+describe("asset bulk add / attach / list", () => {
+  const PNG_A = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from("bulk-a"),
+  ]);
+  const PNG_B = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from("bulk-b"),
+  ]);
+  // No magic-byte signature — the server allowlist rejects it (per-item
+  // failure material for the batch tests).
+  const OPAQUE_BIN = Buffer.concat([Buffer.alloc(16, 0), Buffer.from("opaque")]);
+  // ADTS frame header + payload — accepted only once the server ships the
+  // audio extension fallback (see the pending test below).
+  const AAC = Buffer.concat([
+    Buffer.from([0xff, 0xf1, 0x50, 0x80, 0x00, 0x1f, 0xfc]),
+    Buffer.from("voice-memo"),
+  ]);
+
+  function writeFile(dir: string, name: string, bytes: Buffer): string {
+    const path = join(dir, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+    return path;
+  }
+
+  /** The derived node_asset rows for a node (the workspace derived SQLite). */
+  function attachedAssets(dataDir: string, nodeId: string): Array<{ asset_id: string }> {
+    const db = new Database(join(dataDir, "derived", `${defaultWorkspaceId()}.db`), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return db.prepare("SELECT asset_id FROM node_asset WHERE node_id = ?").all(nodeId) as Array<{ asset_id: string }>;
+    } finally {
+      db.close();
+    }
+  }
+
+  it("asset add accepts multiple files: one line per asset, counts, --json report", async () => {
+    const h = harness;
+    const a = writeFile(h.dataDir, "bulk/first.png", PNG_A);
+    const b = writeFile(h.dataDir, "bulk/second.png", PNG_B);
+    const c = writeFile(h.dataDir, "bulk/third.png", PNG_A);
+
+    expect(await h.runCli("--json", "asset", "add", a, b, c)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      added: number;
+      assets: Array<{ assetId: string; file: string }>;
+      failures: Array<{ file: string; error: string }>;
+      assetId?: string;
+    };
+    expect(report.added).toBe(3);
+    expect(report.failures).toEqual([]);
+    expect(report.assets.map((entry) => entry.file)).toEqual([a, b, c]);
+    expect(report.assets.every((entry) => /^[0-9a-f-]{36}$/.test(entry.assetId))).toBe(true);
+    // Additive-only: the single-file shape keeps its top-level assetId; a
+    // multi-file add does not fabricate one.
+    expect(report.assetId).toBeUndefined();
+
+    // Human output: one line per uploaded asset (id + filename), then counts.
+    expect(await h.runCli("asset", "add", a, b)).toBe(EXIT.ok);
+    const lines = h.io.stdoutText.trimEnd().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^[0-9a-f-]{36}  first\.png$/);
+    expect(lines[1]).toMatch(/^[0-9a-f-]{36}  second\.png$/);
+    expect(lines[2]).toContain("added 2/2 files");
+  });
+
+  it("asset add expands directories recursively (regular files only)", async () => {
+    const h = harness;
+    const dir = join(h.dataDir, "bulk-dir");
+    writeFile(dir, "top.png", PNG_A);
+    writeFile(dir, "nested/deep.png", PNG_B);
+    writeFile(dir, "nested/deeper/leaf.png", PNG_A);
+
+    expect(await h.runCli("--json", "asset", "add", dir)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as { added: number; assets: Array<{ file: string }> };
+    expect(report.added).toBe(3);
+    expect(report.assets.map((entry) => basename(entry.file)).sort()).toEqual(["deep.png", "leaf.png", "top.png"]);
+  });
+
+  it("asset add collects per-item failures (exit 1); --stop-on-error skips the rest", async () => {
+    const h = harness;
+    const good1 = writeFile(h.dataDir, "bulk-mix/ok-1.png", PNG_A);
+    const bad = writeFile(h.dataDir, "bulk-mix/bad.bin", OPAQUE_BIN);
+    const good2 = writeFile(h.dataDir, "bulk-mix/ok-2.png", PNG_B);
+
+    expect(await h.runCli("--json", "asset", "add", good1, bad, good2)).toBe(EXIT.domain);
+    const report = JSON.parse(h.io.stdoutText) as {
+      added: number;
+      failures: Array<{ file: string; error: string }>;
+    };
+    expect(report.added).toBe(2);
+    expect(report.failures).toHaveLength(1);
+    expect(report.failures[0]!.file).toBe(bad);
+    expect(report.failures[0]!.error).toContain("unsupported file type");
+
+    // --stop-on-error --jobs 1: the bad item aborts the remaining ones.
+    expect(
+      await h.runCli("--json", "asset", "add", bad, good1, good2, "--stop-on-error", "--jobs", "1"),
+    ).toBe(EXIT.domain);
+    const stopped = JSON.parse(h.io.stdoutText) as {
+      added: number;
+      failures: Array<{ file: string; error: string }>;
+    };
+    expect(stopped.added).toBe(0);
+    expect(stopped.failures).toHaveLength(3);
+    expect(stopped.failures[0]!.error).toContain("unsupported file type");
+    expect(stopped.failures[1]!.error).toBe("skipped (--stop-on-error)");
+    expect(stopped.failures[2]!.error).toBe("skipped (--stop-on-error)");
+  });
+
+  it("asset add validates --jobs and requires at least one path", async () => {
+    const h = harness;
+    const good = writeFile(h.dataDir, "bulk-jobs/ok.png", PNG_A);
+    for (const jobs of ["0", "33", "x"]) {
+      expect(await h.runCli("asset", "add", good, "--jobs", jobs)).toBe(EXIT.usage);
+    }
+    expect(await h.runCli("asset", "add")).toBe(EXIT.usage);
+  });
+
+  it("asset add keeps the single-file --json shape (top-level assetId)", async () => {
+    const h = harness;
+    const good = writeFile(h.dataDir, "bulk-one/only.png", PNG_A);
+    expect(await h.runCli("--json", "asset", "add", good)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as { assetId: string; added: number };
+    expect(report.added).toBe(1);
+    expect(report.assetId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("asset add --object attaches every uploaded asset to the node", async () => {
+    const h = harness;
+    const page = await h.createPage("bulk-attach-host", []);
+    const a = writeFile(h.dataDir, "bulk-attach/a.png", PNG_A);
+    const b = writeFile(h.dataDir, "bulk-attach/b.png", PNG_B);
+
+    expect(await h.runCli("--json", "asset", "add", a, b, "--object", page)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      added: number;
+      objectId?: string;
+      assets: Array<{ assetId: string }>;
+    };
+    expect(report.added).toBe(2);
+    expect(report.objectId).toBe(page);
+
+    const rows = attachedAssets(h.dataDir, page);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.asset_id))).toEqual(
+      new Set(report.assets.map((entry) => entry.assetId)),
+    );
+  });
+
+  it("asset attach links an existing asset to a node; re-attach no-ops", async () => {
+    const h = harness;
+    const file = writeFile(h.dataDir, "attach/standalone.png", PNG_A);
+    expect(await h.runCli("--json", "asset", "add", file)).toBe(EXIT.ok);
+    const { assetId } = JSON.parse(h.io.stdoutText) as { assetId: string };
+    const page = await h.createPage("attach-host", []);
+
+    expect(await h.runCli("--json", "asset", "attach", assetId, "--object", page)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as { assetId: string; objectId: string; attached: boolean };
+    expect(report).toMatchObject({ assetId, objectId: page, attached: true });
+    expect(attachedAssets(h.dataDir, page).map((row) => row.asset_id)).toEqual([assetId]);
+
+    // Re-attach: exit 0, no duplicate node_asset row (the applier upserts on
+    // the (node_id, asset_id) key — re-attaching is a state no-op).
+    expect(await h.runCli("--json", "asset", "attach", assetId, "--object", page)).toBe(EXIT.ok);
+    expect(attachedAssets(h.dataDir, page)).toHaveLength(1);
+
+    // Usage + domain guards.
+    expect(await h.runCli("asset", "attach", assetId)).toBe(EXIT.usage);
+    expect(
+      await h.runCli("asset", "attach", "00000000-0000-0000-0000-00000000cafe", "--object", page),
+    ).toBe(EXIT.domain);
+    expect(
+      await h.runCli("asset", "attach", assetId, "--object", "00000000-0000-0000-0000-00000000cafe"),
+    ).toBe(EXIT.domain);
+  });
+
+  it("shell addAssets(pathOrPaths, objectId?) and attachAsset(assetId, objectId) mirror the commands", async () => {
+    const h = harness;
+    const a = writeFile(h.dataDir, "shell-assets/a.png", PNG_A);
+    const b = writeFile(h.dataDir, "shell-assets/b.png", PNG_B);
+    const dir = join(h.dataDir, "shell-assets");
+    const script = `
+      const host = await create({ isEmbedded: false, contentAst: [{ type: "text", text: "shell-assets-host" }] });
+      const res = await addAssets("${dir}", host.id);
+      console.log("added " + res.added + " failures " + res.failures.length);
+      const other = await create({ isEmbedded: false, contentAst: [{ type: "text", text: "shell-assets-other" }] });
+      const one = await addAssets("${a}");
+      console.log("single " + (one.assets.length === 1 && typeof one.assetId === "string"));
+      const attached = await attachAsset(one.assetId, other.id);
+      console.log("attached " + attached.attached);
+      const again = await attachAsset(one.assetId, other.id);
+      console.log("reattach " + again.attached);
+    `;
+    expect(await h.runCliWithStdin(script, "shell")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("added 2 failures 0");
+    expect(h.io.stdoutText).toContain("single true");
+    expect(h.io.stdoutText).toContain("attached true");
+    expect(h.io.stdoutText).toContain("reattach true");
+  });
+
+  // PENDING on the vendor bump: the pinned @notees/server predates the audio
+  // extension fallback (lands in the main repo's asset-upload slice — see the
+  // main-repo CHANGELOG), so the vendored server still rejects ADTS .aac.
+  // Enable this test once the vendor pin moves past that slice.
+  it("asset add accepts a real .aac (ADTS) voice memo", async () => {
+    const h = harness;
+    const memo = writeFile(h.dataDir, "bulk-aac/2024-11-08-10-47-00.aac", AAC);
+    expect(await h.runCli("--json", "asset", "add", memo)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as { added: number };
+    expect(report.added).toBe(1);
+  });
+
+  // PENDING on the vendor bump: GET /api/assets (the workspace asset index)
+  // is added in the same main-repo slice; the vendored server 404s it today.
+  it("asset list reports workspace assets (--object filter, --limit)", async () => {
+    const h = harness;
+    const page = await h.createPage("list-host", []);
+    const a = writeFile(h.dataDir, "bulk-list/a.png", PNG_A);
+    const b = writeFile(h.dataDir, "bulk-list/b.png", PNG_B);
+    expect(await h.runCli("--json", "asset", "add", a, b, "--object", page)).toBe(EXIT.ok);
+
+    expect(await h.runCli("--json", "asset", "list")).toBe(EXIT.ok);
+    const listing = JSON.parse(h.io.stdoutText) as {
+      assets: Array<{ assetId: string; mimeType: string; originalName: string; objects: string[] }>;
+      total: number;
+    };
+    expect(listing.assets.length).toBeGreaterThanOrEqual(2);
+
+    expect(await h.runCli("--json", "asset", "list", "--object", page)).toBe(EXIT.ok);
+    const filtered = JSON.parse(h.io.stdoutText) as {
+      assets: Array<{ assetId: string; objects: string[] }>;
+      total: number;
+    };
+    expect(filtered.total).toBe(2);
+    expect(filtered.assets.every((entry) => entry.objects.includes(page))).toBe(true);
+
+    expect(await h.runCli("--json", "asset", "list", "--limit", "1")).toBe(EXIT.ok);
+    const limited = JSON.parse(h.io.stdoutText) as { assets: unknown[]; total: number };
+    expect(limited.assets).toHaveLength(1);
   });
 });

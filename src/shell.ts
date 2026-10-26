@@ -26,6 +26,7 @@ import { concatBundleMarkdown } from "@notees/export";
 import { Clock, describeOp, newEnvelope, OP_CATALOG, type Envelope } from "@notees/protocol";
 
 import type { ApiClient } from "./client.js";
+import { expandAssetInputs, uploadAssetFile, assertObjectExists } from "./assets-lib.js";
 import { CliError, EXIT } from "./exit-codes.js";
 import { buildMarkdownBundle } from "./markdown-export.js";
 import { queryString, readStdin } from "./util.js";
@@ -114,6 +115,24 @@ export interface ShellHelpers {
   /** class.property.unset — remove the binding (authored values survive). */
   unsetClassProperty(classId: string, propertySchemaId: string): Promise<unknown>;
   upload(filePath: string): Promise<string>;
+  /**
+   * `notees asset add` as a helper: one path or an array (files and/or
+   * directories — a directory adds every regular file in it, recursively).
+   * Per-item failures land in `failures`; never throws on item failure.
+   * `objectId` attaches every uploaded asset to that node.
+   */
+  addAssets(
+    pathOrPaths: string | string[],
+    objectId?: string,
+  ): Promise<{
+    added: number;
+    assets: Array<{ file: string; assetId: string }>;
+    failures: Array<{ file: string; error: string }>;
+    assetId?: string;
+    objectId?: string;
+  }>;
+  /** `notees asset attach` as a helper: link an EXISTING asset to a node (idempotent — the node_asset row upserts). */
+  attachAsset(assetId: string, objectId: string): Promise<{ assetId: string; objectId: string; attached: boolean }>;
   /** Markdown bundle text for the given object ids. `export` is a reserved
    * word in JS, so the callable alias is `exportMd`; the spec-named property
    * stays reachable as `helpers.export(ids)` in scripts / `globalThis.export`
@@ -171,6 +190,8 @@ giant heredoc):
   setClassProperty(classId, schemaId, fields)  class.property.set (presence-only binding upsert) -> binding
   unsetClassProperty(classId, schemaId)      class.property.unset (authored values survive)
   upload(filePath)                           upload a file from disk -> asset id
+  addAssets(pathOrPaths, objectId?)          bulk upload: files and/or directories (recursive) -> {added, assets, failures}; objectId attaches each upload
+  attachAsset(assetId, objectId)             link an EXISTING asset to a node (idempotent — re-attach is a no-op)
   exportMd(ids) (alias: export)              markdown bundle text for the given object ids
   makeOp(opType, payload, affected?)         build an envelope-v3 op (HLC-stamped; NOT submitted)
   submitOp(opType, payload, affected?)       submit one op via the relay batch endpoint -> {savedCount, savedIds}
@@ -336,6 +357,56 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       form.append("file", new Blob([bytes]), basename(filePath));
       const body = await client.postMultipart<{ assetId: string }>("/api/assets", form);
       return body.assetId;
+    },
+    // Mirrors `notees asset add` / `notees asset attach` — same shapes, same
+    // idempotency story (see the command docs in cli.ts). Sequential by
+    // design: scripts that need concurrency use pool() over upload().
+    addAssets: async (pathOrPaths, objectId) => {
+      const inputs = Array.isArray(pathOrPaths) ? pathOrPaths : [pathOrPaths];
+      if (inputs.length === 0 || inputs.some((input) => typeof input !== "string" || input.length === 0)) {
+        throw new CliError(EXIT.usage, "addAssets: pass one path or a non-empty array of paths");
+      }
+      const { files, failures } = expandAssetInputs(inputs);
+      if (objectId !== undefined) await assertObjectExists(client, objectId);
+      const uploaded: Array<{ file: string; assetId: string }> = [];
+      for (const file of files) {
+        try {
+          uploaded.push({ file, assetId: await uploadAssetFile(client, file, objectId) });
+        } catch (error) {
+          failures.push({ file, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      return {
+        added: uploaded.length,
+        assets: uploaded,
+        failures,
+        ...(uploaded.length === 1 ? { assetId: uploaded[0]!.assetId } : {}),
+        ...(objectId !== undefined ? { objectId } : {}),
+      };
+    },
+    attachAsset: async (assetId, objectId) => {
+      await assertObjectExists(client, objectId);
+      const info = await client.getJson<{
+        assetId: string;
+        hash: string;
+        mimeType: string;
+        size: number;
+        originalName: string;
+      }>(`/api/assets/${encodeURIComponent(assetId)}/info`);
+      const envelope = await makeOp(
+        "asset.attach",
+        {
+          objectId,
+          assetId: info.assetId,
+          hash: info.hash,
+          mimeType: info.mimeType,
+          size: info.size,
+          originalName: info.originalName,
+        },
+        [objectId, info.assetId],
+      );
+      await submitOps([envelope]);
+      return { assetId: info.assetId, objectId, attached: true };
     },
     export: exportMarkdown,
     exportMd: exportMarkdown,

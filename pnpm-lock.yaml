@@ -30,12 +30,18 @@ importers:
       '@notees/server':
         specifier: workspace:*
         version: link:vendor/notees/apps/server
+      '@types/better-sqlite3':
+        specifier: ^7.6.11
+        version: 7.6.13
       '@types/node':
         specifier: ^22.13.0
         version: 22.20.5
       '@types/sax':
         specifier: ^1.2.7
         version: 1.2.7
+      better-sqlite3:
+        specifier: ^11.0.0
+        version: 11.10.0
       transit-js:
         specifier: ^0.8.874
         version: 0.8.874
@@ -133,7 +139,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^2.1.0
-        version: 2.1.9(@types/node@20.19.43)
+        version: 2.1.9(@types/node@22.20.5)
 
   vendor/notees/packages/export:
     dependencies:
@@ -161,7 +167,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^2.1.0
-        version: 2.1.9(@types/node@20.19.43)
+        version: 2.1.9(@types/node@22.20.5)
 
   vendor/notees/packages/protocol:
     dependencies:
@@ -2073,7 +2079,7 @@ snapshots:
 
   '@types/better-sqlite3@7.6.13':
     dependencies:
-      '@types/node': 20.19.43
+      '@types/node': 22.20.5
 
   '@types/emscripten@1.41.6': {}
 
