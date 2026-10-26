@@ -64,7 +64,7 @@ import {
 } from "./markdown-export.js";
 import { buildJsonArchiveDocument } from "./json-export.js";
 import { runShell } from "./shell.js";
-import { defaultStatePath, serverState, updateServerState, type StoredCredential } from "./state.js";
+import { defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
 import { parseZoteroRdf, type ZoteroRdfParseResult } from "./zotero-rdf.js";
@@ -111,11 +111,22 @@ function failUsage(message: string): never {
   throw new CliError(EXIT.usage, message);
 }
 
-function requireServer(opts: GlobalOptions): { server: string; workspace: string | undefined } {
-  const server = opts.server ?? process.env.NOTEES_SERVER;
-  const workspace = opts.workspace ?? process.env.NOTEES_WORKSPACE;
+/**
+ * Server/workspace resolution order: flag (`--server` / `--workspace`) >
+ * env (`NOTEES_SERVER` / `NOTEES_WORKSPACE`) > the stored per-profile
+ * defaults from `notees config set` (server: and workspace:).
+ */
+function requireServer(
+  opts: GlobalOptions,
+  statePath: string,
+): { server: string; workspace: string | undefined } {
+  const defaults = profileDefaults(statePath, opts.profile ?? "default");
+  const server = opts.server ?? process.env.NOTEES_SERVER ?? defaults.server;
+  const workspace = opts.workspace ?? process.env.NOTEES_WORKSPACE ?? defaults.workspace;
   if (server === undefined || server.length === 0) {
-    failUsage("server URL required: pass --server <url> or set NOTEES_SERVER");
+    failUsage(
+      "server URL required: pass --server <url>, set NOTEES_SERVER, or run `notees config set server <url>`",
+    );
   }
   return { server, workspace };
 }
@@ -2529,8 +2540,8 @@ function rootOf(command: Command): Command {
 function ctxOf(command: Command, options: { allowMissingKey?: boolean } = {}): CommandContext {
   const root = rootOf(command);
   const opts = root.opts<GlobalOptions>();
-  const { server, workspace } = requireServer(opts);
   const statePath = defaultStatePath();
+  const { server, workspace } = requireServer(opts, statePath);
   const stateKey = `${opts.profile ?? "default"}:${server}`;
   const { apiKey } = resolveKey(opts, statePath, stateKey, options.allowMissingKey === true);
   return {
@@ -2646,6 +2657,88 @@ async function authStatus(ctx: CommandContext): Promise<void> {
   );
 }
 
+// --- config --------------------------------------------------------------------
+
+interface ConfigContext {
+  io: CliIo;
+  opts: GlobalOptions;
+  statePath: string;
+  profile: string;
+}
+
+function emitConfig(ctx: ConfigContext, human: string, machine: unknown): void {
+  if (ctx.opts.json === true) {
+    ctx.io.stdout.write(`${JSON.stringify(machine, null, 2)}\n`);
+  } else {
+    ctx.io.stdout.write(human);
+  }
+}
+
+/**
+ * `notees config` never needs a server — it only touches the local state
+ * file, so it resolves just io/profile/statePath (no requireServer, no
+ * client, no credential).
+ */
+function configCtxOf(command: Command): ConfigContext {
+  const root = rootOf(command);
+  const opts = root.opts<GlobalOptions>();
+  return {
+    io: (root.getOptionValue("__io") as CliIo | undefined) ?? defaultIo,
+    opts,
+    statePath: defaultStatePath(),
+    profile: opts.profile ?? "default",
+  };
+}
+
+const CONFIG_KEYS = ["server", "workspace"] as const;
+type ConfigKey = (typeof CONFIG_KEYS)[number];
+
+function configKeyOf(key: string): ConfigKey {
+  if ((CONFIG_KEYS as readonly string[]).includes(key)) return key as ConfigKey;
+  failUsage(`unknown config key ${key} (expected: ${CONFIG_KEYS.join(" or ")})`);
+}
+
+/** `notees config set server|workspace <value>` — persist the per-profile default. */
+async function configSet(ctx: ConfigContext, key: ConfigKey, value: string): Promise<void> {
+  if (value.length === 0) failUsage(`config set ${key} requires a non-empty value`);
+  updateProfileDefaults(ctx.statePath, ctx.profile, (current) => ({
+    ...current,
+    [key]: value,
+    updatedAt: new Date().toISOString(),
+  }));
+  emitConfig(ctx, `${key} default set to ${value} (profile ${ctx.profile})\n`, {
+    key,
+    value,
+    profile: ctx.profile,
+  });
+}
+
+/** `notees config get server|workspace` — print the stored default (null when unset). */
+async function configGet(ctx: ConfigContext, key: ConfigKey): Promise<void> {
+  const value = profileDefaults(ctx.statePath, ctx.profile)[key];
+  if (value === undefined) {
+    emitConfig(ctx, `no default ${key} set (profile ${ctx.profile})\n`, {
+      key,
+      value: null,
+      profile: ctx.profile,
+    });
+    return;
+  }
+  emitConfig(ctx, `${key}: ${value} (profile ${ctx.profile})\n`, { key, value, profile: ctx.profile });
+}
+
+/** `notees config list` — both stored defaults for this profile. */
+async function configList(ctx: ConfigContext): Promise<void> {
+  const defaults = profileDefaults(ctx.statePath, ctx.profile);
+  const server = defaults.server ?? null;
+  const workspace = defaults.workspace ?? null;
+  emitConfig(
+    ctx,
+    `profile ${ctx.profile}\nserver: ${server ?? "(not set)"}\nworkspace: ${workspace ?? "(not set)"}\n`,
+    { profile: ctx.profile, server, workspace },
+  );
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -2653,9 +2746,9 @@ function buildProgram(): Command {
     .description("Notees CLI")
     .version(CLI_VERSION)
     .option("--json", "stable machine-readable output")
-    .option("--server <url>", "server base URL (env NOTEES_SERVER)")
+    .option("--server <url>", "server base URL (env NOTEES_SERVER, else `notees config set server`; required if neither)")
     .option("--key <credential>", "operator key, user API key, or session token (env NOTEES_API_KEY)")
-    .option("--workspace <name|id>", "workspace for the object API (env NOTEES_WORKSPACE; default: the server's default workspace)", undefined)
+    .option("--workspace <name|id>", "workspace for the object API (env NOTEES_WORKSPACE, else `notees config set workspace`; default: the server's default workspace)", undefined)
     .option("--profile <name>", "profile name for local state", "default")
     .exitOverride();
 
@@ -3017,6 +3110,28 @@ function buildProgram(): Command {
     .description("is a stored credential present for this server, and does it still authenticate?")
     .action(async (_options: object, command: Command) => {
       await authStatus(ctxOf(command, { allowMissingKey: true }));
+    });
+
+  const config = program
+    .command("config")
+    .description("per-profile defaults (default server, default workspace) so bare `notees <cmd>` works without env vars");
+  config
+    .command("set <key> <value>")
+    .description("store a default for this profile: key is `server` (base URL) or `workspace` (name|id)")
+    .action(async (key: string, value: string, _options: object, command: Command) => {
+      await configSet(configCtxOf(command), configKeyOf(key), value);
+    });
+  config
+    .command("get <key>")
+    .description("print the stored default for `server` or `workspace` (nothing stored → empty value, exit 0)")
+    .action(async (key: string, _options: object, command: Command) => {
+      await configGet(configCtxOf(command), configKeyOf(key));
+    });
+  config
+    .command("list")
+    .description("print both stored defaults for this profile")
+    .action(async (_options: object, command: Command) => {
+      await configList(configCtxOf(command));
     });
 
   program
