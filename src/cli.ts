@@ -37,6 +37,7 @@ import {
   concatBundleMarkdown,
   cslToBib,
   cslToNodeSpecs,
+  cslTypeToClassName,
   deriveDisplayName,
   nodeToCsl,
   parseBibtex,
@@ -69,7 +70,7 @@ import { runShell } from "./shell.js";
 import { defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
-import { parseZoteroRdf, type ZoteroRdfParseResult } from "./zotero-rdf.js";
+import { parseZoteroRdf, type ZoteroItem, type ZoteroRdfParseResult } from "./zotero-rdf.js";
 
 export interface CliIo {
   stdout: { write(chunk: string): unknown };
@@ -2324,6 +2325,22 @@ interface SourceImportOptions {
   dryRun?: boolean;
   /** Match-only mode (the --no-create flag): apply updates/adoptions, skip entries that would create a source. */
   create?: boolean;
+  /** Notees-wins fill (zotero-rdf): write only the properties the matched node does not already hold a value for. */
+  fillOnlyEmpty?: boolean;
+  /** Per-item extra schema fills beyond the shared CSL spec (zotero-rdf). */
+  extraFills?: (item: CslItem) => SourceFieldFill[];
+  /** zotero-rdf parser counters/reports folded into the machine report. */
+  parserExtras?: {
+    keylessSkipped: Array<{ id: string; title: string }>;
+    tagsSkipped: number;
+    attachmentsSkipped: number;
+  };
+}
+
+/** One planned/applied schema fill (the report's per-entry `fills` rows). */
+interface SourceFieldFill {
+  name: SystemPropertyName;
+  value: unknown;
 }
 
 interface SourceImportCounts {
@@ -2337,6 +2354,10 @@ interface SourceImportCounts {
   ambiguous: number;
   persons: number;
   personsCreated: number;
+  /** zotero-rdf: dc:subject tags seen but never mapped (class tags differ). */
+  tagsSkipped?: number;
+  /** zotero-rdf: z:Attachment items + link:link attachment entries skipped. */
+  attachmentsSkipped?: number;
 }
 
 interface ImportEntryPlan {
@@ -2347,6 +2368,73 @@ interface ImportEntryPlan {
   persons: Array<{ literal: string; action: "existing" | "create"; nodeId?: string }>;
   /** Class the adoption would assign (eligibility repair) — absent when not needed. */
   classAssign?: string;
+  /** Per-field schema fills planned for this entry (zotero-rdf) — [] when nothing would fill. */
+  fills?: SourceFieldFill[];
+}
+
+/**
+ * zotero-rdf only: the schema fills beyond the shared CSL spec (the parser's
+ * ZoteroItem extras). The container title follows the CSL convention the
+ * schema names imply — a book_section's parent title is the Book title,
+ * everything else's is the Publication title.
+ */
+function zoteroExtraFills(item: CslItem): SourceFieldFill[] {
+  const z = item as ZoteroItem;
+  const fills: SourceFieldFill[] = [];
+  if (z.abstract !== undefined && z.abstract.length > 0) fills.push({ name: "abstract", value: z.abstract });
+  if (z.volume !== undefined && z.volume.length > 0) fills.push({ name: "volume", value: z.volume });
+  if (z.issue !== undefined && z.issue.length > 0) fills.push({ name: "issue", value: z.issue });
+  if (z.page !== undefined && z.page.length > 0) fills.push({ name: "pages", value: z.page });
+  if (z.ISSN !== undefined && z.ISSN.length > 0) fills.push({ name: "issn", value: z.ISSN });
+  if (z.language !== undefined && z.language.length > 0) fills.push({ name: "language", value: z.language });
+  if (z.shortTitle !== undefined && z.shortTitle.length > 0) fills.push({ name: "shortTitle", value: z.shortTitle });
+  if (z.extra !== undefined && z.extra.length > 0) fills.push({ name: "extra", value: z.extra });
+  if (z.identifiers !== undefined && z.identifiers.length > 0) {
+    fills.push({ name: "identifier", value: z.identifiers.join("; ") });
+  }
+  if (z["container-title"] !== undefined && z["container-title"].length > 0) {
+    fills.push({
+      name: cslTypeToClassName(item.type) === "book_section" ? "bookTitle" : "publicationTitle",
+      value: z["container-title"],
+    });
+  }
+  return fills;
+}
+
+/**
+ * zotero-rdf only: every schema write the entry plans beyond its identity —
+ * the shared CSL spec fields plus the parser's ZoteroItem extras. Notees-wins:
+ * only the fields the matched node does not already hold (`heldSchemaIds`;
+ * freshly created nodes hold nothing, so creation fills everything).
+ * `linkedRefs` is the resolved linkedAuthors refs in real mode; null in a
+ * dry-run (the plan's persons rows carry the targets instead).
+ */
+function plannedFills(
+  spec: ReturnType<typeof cslToNodeSpecs>,
+  linkedRefs: Array<{ nodeId: string }> | null,
+  item: CslItem,
+  heldSchemaIds: Set<string>,
+  fillOnlyEmpty: boolean,
+): SourceFieldFill[] {
+  const candidates: SourceFieldFill[] = [];
+  if (spec.doi !== undefined) candidates.push({ name: "doi", value: spec.doi });
+  if (spec.isbn !== undefined) candidates.push({ name: "isbn", value: spec.isbn });
+  if (spec.url !== undefined) candidates.push({ name: "url", value: spec.url });
+  if (spec.publisher !== undefined) candidates.push({ name: "publisher", value: spec.publisher });
+  if (spec.publicationDate !== undefined) {
+    candidates.push({ name: "publicationDate", value: spec.publicationDate });
+  }
+  const authorLiterals = spec.authors.filter((literal) => literal.length > 0);
+  if (authorLiterals.length > 0) candidates.push({ name: "authors", value: authorLiterals });
+  if (linkedRefs !== null && linkedRefs.length > 0) {
+    candidates.push({ name: "linkedAuthors", value: linkedRefs });
+  }
+  if (spec.editors !== undefined && spec.editors.some((literal) => literal.length > 0)) {
+    candidates.push({ name: "editors", value: spec.editors.filter((literal) => literal.length > 0) });
+  }
+  candidates.push(...zoteroExtraFills(item));
+  if (!fillOnlyEmpty) return candidates;
+  return candidates.filter((fill) => !heldSchemaIds.has(SYSTEM_PROPERTY_UUIDS[fill.name]));
 }
 
 function readImportFile(filePath: string): string {
@@ -2394,7 +2482,19 @@ async function importZoteroRdf(ctx: CommandContext, filePath: string, options: S
       `cannot import ${filePath}: not well-formed Zotero RDF (${error instanceof Error ? error.message : String(error)})`,
     );
   }
-  await runSourceImport(ctx, "zotero-rdf", filePath, result.items, result.skipped, options);
+  await runSourceImport(ctx, "zotero-rdf", filePath, result.items, result.skipped, {
+    ...options,
+    // Notees-wins (the fleet's drift-reconcile ruling): the import fills only
+    // the properties a matched (or freshly created) source does not already
+    // hold — owner-fixed values are never clobbered, and a re-run is a no-op.
+    fillOnlyEmpty: true,
+    extraFills: zoteroExtraFills,
+    parserExtras: {
+      keylessSkipped: result.keylessSkipped,
+      tagsSkipped: result.tagsSkipped,
+      attachmentsSkipped: result.attachmentsSkipped,
+    },
+  });
 }
 
 /**
@@ -2458,9 +2558,16 @@ async function runSourceImport(
   const dryRun = options.dryRun === true;
   const specs = items.map(cslToNodeSpecs);
 
-  // Schema ensure — part of the plan under --dry-run (write nothing).
+  // Schema ensure — part of the plan under --dry-run (write nothing). The
+  // extra-fill schemas (zotero-rdf) join the shared CSL schema set.
+  const schemaNames = new Set<SystemPropertyName>(usedSchemaNames(items));
+  if (options.extraFills !== undefined) {
+    for (const item of items) {
+      for (const fill of options.extraFills(item)) schemaNames.add(fill.name);
+    }
+  }
   const schemaPlan: Array<{ name: SystemPropertyName; status: "present" | "ensured" | "would-ensure" }> = [];
-  for (const name of usedSchemaNames(items)) {
+  for (const name of schemaNames) {
     if (!dryRun) {
       await ensurePropertySchema(ctx, name);
       schemaPlan.push({ name, status: "ensured" });
@@ -2491,14 +2598,22 @@ async function runSourceImport(
     ambiguous: 0,
     persons: 0,
     personsCreated: 0,
+    ...(options.parserExtras !== undefined
+      ? {
+          tagsSkipped: options.parserExtras.tagsSkipped,
+          attachmentsSkipped: options.parserExtras.attachmentsSkipped,
+        }
+      : {}),
   };
   const personIds = new Map<string, string>(); // per-run dedupe (real mode)
   const personPlans = new Map<string, ImportEntryPlan["persons"][number]>(); // per-run dedupe (plan mode)
   const importedIds: string[] = [];
   const skippedEntries: Array<{ citekey: string | null; title: string }> = [];
   const plans: ImportEntryPlan[] = [];
+  const fillOnlyEmpty = options.fillOnlyEmpty === true;
+  const entryFills: Array<{ citekey: string; nodeId: string; action: string; fills: SourceFieldFill[] }> = [];
 
-  for (const spec of specs) {
+  for (const [specIndex, spec] of specs.entries()) {
     // (a) citekey-property match stays authoritative; (b) title match adopts.
     const existing = await findSourceByCitekey(ctx, spec.citekey);
     let matched = existing;
@@ -2562,6 +2677,18 @@ async function runSourceImport(
       matched !== undefined &&
       !matched.classIds.some((classId) => eligibleIds.has(classId));
 
+    // Per-field fills (zotero-rdf): Notees-wins — only the fields the matched
+    // node does not already hold a value for. Freshly created nodes hold
+    // nothing, so creation fills everything. The same list drives the dry-run
+    // plan, the report, and the writes in upsertSource.
+    const heldSchemaIds = new Set(
+      (matched === undefined ? [] : fullPropertiesOf(matched)).map((p) => p.schemaId),
+    );
+    const fills =
+      options.extraFills === undefined
+        ? []
+        : plannedFills(spec, dryRun ? null : authorIds.map((personId) => ({ nodeId: personId })), items[specIndex]!, heldSchemaIds, fillOnlyEmpty);
+
     if (dryRun) {
       plans.push({
         citekey: spec.citekey,
@@ -2570,6 +2697,7 @@ async function runSourceImport(
         title: spec.title,
         persons: entryPersons,
         ...(needsClassAssign ? { classAssign: spec.className } : {}),
+        ...(options.extraFills !== undefined ? { fills } : {}),
       });
       if (action === "create") counts.created += 1;
       else if (action === "adopt") counts.adopted += 1;
@@ -2577,25 +2705,35 @@ async function runSourceImport(
       continue;
     }
 
-    const id = await upsertSource(ctx, spec, authorIds, counts, action, matched, needsClassAssign);
+    const id = await upsertSource(ctx, spec, authorIds, counts, action, matched, needsClassAssign, fillOnlyEmpty, fills);
     importedIds.push(id);
+    if (options.extraFills !== undefined) entryFills.push({ citekey: spec.citekey, nodeId: id, action, fills });
   }
 
   if (dryRun) {
     const summary =
       `${counts.created} create, ${counts.updated} update, ${counts.adopted} adopt, ` +
       `${counts.skipped} skip (${counts.ambiguous} ambiguous title collisions)`;
+    const withFills = options.extraFills !== undefined;
     const rows = plans.map((plan) => [
       plan.citekey ?? "(unkeyed)",
       plan.action,
       plan.nodeId ?? "",
       plan.title,
       ...(plans.some((p) => p.classAssign !== undefined) ? [plan.classAssign ?? ""] : []),
+      ...(withFills ? [(plan.fills ?? []).map((f) => f.name).join(", ")] : []),
     ]);
     const headers = ["CITEKEY", "ACTION", "NODE", "TITLE"];
     if (plans.some((p) => p.classAssign !== undefined)) headers.push("CLASS ASSIGN");
+    if (withFills) headers.push("FILLS (PLANNED)");
     const wouldEnsure = schemaPlan.filter((s) => s.status === "would-ensure").map((s) => s.name);
     const personNew = plans.flatMap((p) => p.persons).filter((p) => p.action === "create").length;
+    const keylessLines =
+      options.parserExtras !== undefined && options.parserExtras.keylessSkipped.length > 0
+        ? options.parserExtras.keylessSkipped
+            .map((k) => `keyless skipped: ${k.id || "(no rdf:about)"} — ${k.title || "(no title)"}`)
+            .join("\n") + "\n"
+        : "";
     emit(
       ctx,
       `dry run (${format}, ${filePath}) — no writes\n` +
@@ -2603,19 +2741,54 @@ async function runSourceImport(
         `persons: ${counts.persons} planned (${personNew} would be created)\n` +
         `schemas: ${schemaPlan.map((s) => s.name).join(", ")}` +
         (wouldEnsure.length > 0 ? ` (${wouldEnsure.join(", ")} would be ensured)` : " (all present)") +
+        (keylessLines.length > 0 ? `\n${keylessLines}` : "") +
         `\nplanned: ${plans.length} entries — ${summary}\n`,
-      { dryRun: true, format, filePath, schemas: schemaPlan, entries: plans, counts },
+      {
+        dryRun: true,
+        format,
+        filePath,
+        schemas: schemaPlan,
+        entries: plans,
+        counts,
+        ...(options.parserExtras !== undefined ? { keylessSkipped: options.parserExtras.keylessSkipped } : {}),
+      },
     );
     return;
   }
 
   const machine: Record<string, unknown> = { ...counts, entries: importedIds };
   if (skippedEntries.length > 0) machine.skippedEntries = skippedEntries;
+  if (options.extraFills !== undefined) machine.entryFills = entryFills;
+  if (options.parserExtras !== undefined) {
+    machine.keylessSkipped = options.parserExtras.keylessSkipped;
+  }
+  const entryLines =
+    entryFills.length > 0
+      ? entryFills
+          .map((entry) => {
+            const names = entry.fills.map((f) => f.name).join(", ");
+            return `${entry.citekey}: ${entry.action}, filled ${entry.fills.length}${names.length > 0 ? ` (${names})` : ""}`;
+          })
+          .join("\n") + "\n"
+      : "";
+  const extraSummary =
+    options.parserExtras !== undefined
+      ? `, ${options.parserExtras.tagsSkipped} tags skipped, ${options.parserExtras.attachmentsSkipped} attachments skipped` +
+        (options.parserExtras.keylessSkipped.length > 0
+          ? `\nkeyless skipped:\n` +
+            options.parserExtras.keylessSkipped
+              .map((k) => `  ${k.id || "(no rdf:about)"} — ${k.title || "(no title)"}`)
+              .join("\n")
+          : "")
+      : "";
   emit(
     ctx,
-    `imported ${importedIds.length} entries: ${counts.created} created, ${counts.updated} updated, ` +
+    entryLines +
+      `imported ${importedIds.length} entries: ${counts.created} created, ${counts.updated} updated, ` +
       `${counts.adopted} adopted, ${counts.skipped} skipped, ${counts.ambiguous} ambiguous, ` +
-      `${counts.persons} persons (${counts.personsCreated} new)\n`,
+      `${counts.persons} persons (${counts.personsCreated} new)` +
+      extraSummary +
+      `\n`,
     machine,
   );
 }
@@ -2648,6 +2821,8 @@ async function upsertSource(
   action: "create" | "update" | "adopt",
   matched: FullApiObject | undefined,
   needsClassAssign: boolean,
+  fillOnlyEmpty: boolean,
+  fills: SourceFieldFill[],
 ): Promise<string> {
   let id: string;
   if (action === "create") {
@@ -2679,6 +2854,35 @@ async function upsertSource(
     }
   }
   const properties = matched === undefined ? [] : fullPropertiesOf(matched);
+  if (fillOnlyEmpty) {
+    // Notees-wins fill mode (zotero-rdf): the caller planned every property
+    // write as a fill, already filtered against this pre-write snapshot — the
+    // node keeps every value it already holds (owner-fixed values survive).
+    if (!properties.some((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)) {
+      await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.citekey, spec.citekey);
+    }
+    for (const fill of fills) {
+      if (fill.name === "publicationDate") {
+        // Date-chain ref, not a bare string: the year node backlinks
+        // everything dated that year. The year node's id is content-addressed
+        // (deterministic), so ensure-then-link is idempotent.
+        const year = yearFromDate(fill.value);
+        if (year !== undefined) {
+          const yearId = dateNodeId(`${year}-01-01`, "year");
+          await ensureYearNode(ctx, yearId, String(year));
+          await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.publicationDate, { nodeId: yearId });
+        } else {
+          await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.publicationDate, fill.value);
+        }
+        continue;
+      }
+      const values = Array.isArray(fill.value) ? fill.value : [fill.value];
+      for (let idx = 0; idx < values.length; idx += 1) {
+        await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS[fill.name], values[idx], idx);
+      }
+    }
+    return id;
+  }
   const setIfChanged = async (schemaId: string, value: unknown): Promise<void> => {
     const current = properties.find((p) => p.schemaId === schemaId && (p.idx ?? 0) === 0)?.value;
     if (JSON.stringify(current ?? null) === JSON.stringify(value)) return;
@@ -2706,7 +2910,8 @@ async function upsertSource(
   // `authors` carries the "Family, Given" text literals (the citation track
   // export reads first); `linkedAuthors` carries the {nodeId} refs to the
   // find-or-created agent nodes (the people-graph track). Both lists are
-  // replaced wholesale — set the new values, unset the stale tail.
+  // replaced wholesale — set the new values, unset the stale tail. Notees-wins
+  // fill (zotero-rdf) instead keeps any list the node already holds.
   const replaceList = async (
     schemaId: string,
     values: unknown[],
@@ -3254,7 +3459,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   doctor: { flags: "(resolves flag > env > stored)" },
   shell: { flags: "[script]" },
   export: { flags: "markdown · json · bibtex" },
-  import: { flags: "bibtex · csl-json · logseq-db" },
+  import: { flags: "bibtex · csl-json · zotero-rdf · logseq-db" },
   help: { flags: "<command> [subcommand]" },
 };
 
@@ -3933,7 +4138,10 @@ function buildProgram(): Command {
       await importCslJson(ctxOf(command), filePath, options);
     });
   importOptions(importCmd.command("zotero-rdf <file>"))
-    .description("import a Zotero RDF export (bib:* entries; unkeyed top-level items are skipped)")
+    .description(
+      "import a Zotero RDF export as a value-filling upsert (Notees-wins: only properties a matched source does not already hold are filled; " +
+      "dc:subject tags and attachments are counted but never mapped; unkeyed items are skipped and listed)",
+    )
     .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
       await importZoteroRdf(ctxOf(command), filePath, options);
     });

@@ -1226,6 +1226,121 @@ const ZOTERO_RDF_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
   </z:Attachment>
 </rdf:RDF>`;
 
+const ZOTERO_RDF_FULL_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/"
+ xmlns:prism="http://prismstandard.org/namespaces/1.2/basic/"
+ xmlns:link="http://purl.org/rss/1.0/modules/link/">
+  <bib:Article rdf:about="#full_article">
+    <z:citationKey>rdf-full-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>The Full Article</dc:title>
+    <dcterms:abstract>The abstract of the full article.</dcterms:abstract>
+    <dc:publisher>
+      <foaf:Organization>
+        <foaf:name>Full Publishing House</foaf:name>
+      </foaf:Organization>
+    </dc:publisher>
+    <dc:date>2021-03-15</dc:date>
+    <prism:volume>7</prism:volume>
+    <prism:number>2</prism:number>
+    <bib:pages>101-115</bib:pages>
+    <dc:identifier>isbn:9780000000002</dc:identifier>
+    <dc:identifier>doi:10.5555/full.article</dc:identifier>
+    <dc:identifier>issn:1234-5678</dc:identifier>
+    <dc:identifier>pmid:12345678</dc:identifier>
+    <dcterms:URI>https://example.org/full-article</dcterms:URI>
+    <z:language>en</z:language>
+    <dcterms:alternative>Full Article Short</dcterms:alternative>
+    <dc:description>Handwritten extra note.</dc:description>
+    <dcterms:isPartOf>
+      <bib:Journal>
+        <dc:title>The Full Journal</dc:title>
+      </bib:Journal>
+    </dcterms:isPartOf>
+    <bib:Authors>
+      <rdf:Seq>
+        <rdf:li>
+          <foaf:Person>
+            <foaf:surname>Lovelace</foaf:surname>
+            <foaf:givenName>Ada</foaf:givenName>
+          </foaf:Person>
+        </rdf:li>
+        <rdf:li>
+          <foaf:Person>
+            <foaf:surname>Hopper</foaf:surname>
+            <foaf:givenName>Grace</foaf:givenName>
+          </foaf:Person>
+        </rdf:li>
+      </rdf:Seq>
+    </bib:Authors>
+    <bib:editors>
+      <rdf:Seq>
+        <rdf:li>
+          <foaf:Person>
+            <foaf:surname>Knuth</foaf:surname>
+            <foaf:givenName>Donald</foaf:givenName>
+          </foaf:Person>
+        </rdf:li>
+      </rdf:Seq>
+    </bib:editors>
+    <dc:subject>zotero-tag-one</dc:subject>
+    <dc:subject>zotero-tag-two</dc:subject>
+    <link:link rdf:resource="file:///full-article.pdf"/>
+  </bib:Article>
+  <bib:Book rdf:about="#keyless_book">
+    <z:itemType>book</z:itemType>
+    <dc:title>Keyless Book</dc:title>
+  </bib:Book>
+  <z:Attachment rdf:about="#full_attachment">
+    <z:citationKey>full-attachment-key</z:citationKey>
+    <dc:title>full.pdf</dc:title>
+  </z:Attachment>
+</rdf:RDF>`;
+
+const ZOTERO_RDF_IDEM_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#">
+  <bib:Article rdf:about="#idem_article">
+    <z:citationKey>rdf-idem-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>The Idem Article</dc:title>
+    <dcterms:abstract>Idem abstract.</dcterms:abstract>
+    <prism:volume xmlns:prism="http://prismstandard.org/namespaces/1.2/basic/">3</prism:volume>
+  </bib:Article>
+</rdf:RDF>`;
+
+const ZOTERO_RDF_CLASH_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/">
+  <bib:Article rdf:about="#clash_article">
+    <z:citationKey>rdf-clash-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>Clash Article</dc:title>
+    <dcterms:abstract>Clash abstract</dcterms:abstract>
+    <dc:publisher>
+      <foaf:Organization>
+        <foaf:name>Clash Publisher</foaf:name>
+      </foaf:Organization>
+    </dc:publisher>
+    <dc:identifier>doi:10.9999/clash</dc:identifier>
+  </bib:Article>
+</rdf:RDF>`;
+
 describe("import zotero-rdf", () => {
   it("imports keyed bib entries; the nested journal title never wins; unkeyed journals are skipped", async () => {
     const h = harness;
@@ -1285,6 +1400,168 @@ describe("import zotero-rdf", () => {
     writeFileSync(empty, "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'></rdf:RDF>");
     expect(await h.runCli("import", "zotero-rdf", empty)).toBe(EXIT.domain);
     expect(h.io.stderrText).toContain("no importable entries");
+  });
+
+  it("fills every mapped field on a full entry; tags/attachments/keyless counted and reported", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "zotero-import-full.rdf");
+    writeFileSync(file, ZOTERO_RDF_FULL_FIXTURE);
+
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      updated: number;
+      skipped: number;
+      tagsSkipped: number;
+      attachmentsSkipped: number;
+      keylessSkipped: Array<{ id: string; title: string }>;
+      entries: string[];
+      entryFills: Array<{
+        citekey: string;
+        nodeId: string;
+        action: string;
+        fills: Array<{ name: string; value: unknown }>;
+      }>;
+    };
+    // One keyed article; the keyless book counts as skipped AND is listed; the
+    // two dc:subject tags and the two attachment entries (one link:link, one
+    // top-level z:Attachment) are counted, never mapped.
+    expect(report).toMatchObject({ created: 1, updated: 0, skipped: 1, tagsSkipped: 2, attachmentsSkipped: 2 });
+    expect(report.keylessSkipped).toEqual([{ id: "#keyless_book", title: "Keyless Book" }]);
+    expect(report.entries).toHaveLength(1);
+
+    // The per-entry fills (the report shape) name every planned field.
+    expect(report.entryFills).toHaveLength(1);
+    expect(report.entryFills[0]).toMatchObject({ citekey: "rdf-full-1", action: "create" });
+    const fills = Object.fromEntries(report.entryFills[0]!.fills.map((f) => [f.name, f.value]));
+    expect(fills).toMatchObject({
+      abstract: "The abstract of the full article.",
+      publisher: "Full Publishing House",
+      volume: "7",
+      issue: "2",
+      pages: "101-115",
+      issn: "1234-5678",
+      identifier: "pmid:12345678",
+      language: "en",
+      shortTitle: "Full Article Short",
+      extra: "Handwritten extra note.",
+      publicationTitle: "The Full Journal",
+    });
+
+    // The values actually landed on the node (the standard CSL fields too).
+    await h.runCli("--json", "object", "get", report.entries[0]!);
+    const node = JSON.parse(h.io.stdoutText).object;
+    const props = node.properties as { schemaId: string; value: unknown }[];
+    const byName = (name: string) =>
+      props.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(byName("abstract")).toBe("The abstract of the full article.");
+    expect(byName("publisher")).toBe("Full Publishing House");
+    expect(byName("volume")).toBe("7");
+    expect(byName("issue")).toBe("2");
+    expect(byName("pages")).toBe("101-115");
+    expect(byName("isbn")).toBe("9780000000002");
+    expect(byName("doi")).toBe("10.5555/full.article");
+    expect(byName("issn")).toBe("1234-5678");
+    expect(byName("identifier")).toBe("pmid:12345678");
+    expect(byName("url")).toBe("https://example.org/full-article");
+    expect(byName("language")).toBe("en");
+    expect(byName("shortTitle")).toBe("Full Article Short");
+    expect(byName("extra")).toBe("Handwritten extra note.");
+    expect(byName("publicationTitle")).toBe("The Full Journal");
+    // Date handling follows the bibtex importer's date-else-year precedent:
+    // the year lands as a date-chain node ref.
+    const pubRef = byName("publicationDate") as { nodeId: string };
+    await h.runCli("--json", "object", "get", pubRef.nodeId);
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("2021");
+    // Dual-track authorship (the bibtex precedent): text literals + idx-ordered
+    // linkedAuthors node refs; editors as "Last, First" text rows.
+    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).map((p) => p.value)).toEqual([
+      "Lovelace, Ada",
+      "Hopper, Grace",
+    ]);
+    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(2);
+    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.editors).map((p) => p.value)).toEqual([
+      "Knuth, Donald",
+    ]);
+  });
+
+  it("matched node keeps its existing values; only empty fields fill (no clobber)", async () => {
+    const h = harness;
+    // A pre-existing source matched by citekey, with the owner's hand-fixed DOI.
+    const response = await fetch(`${h.baseUrl}/api/objects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({
+        isEmbedded: false,
+        name: "Clash Article",
+        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
+      }),
+    });
+    const { id } = (await response.json()) as { id: string };
+    for (const [propertySchemaId, value] of [
+      [SYSTEM_PROPERTY_UUIDS.citekey, "rdf-clash-1"],
+      [SYSTEM_PROPERTY_UUIDS.doi, "10.0000/hand-fixed"],
+    ] as const) {
+      await fetch(`${h.baseUrl}/api/objects/${id}/properties`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": API_KEY },
+        body: JSON.stringify({ propertySchemaId, value }),
+      });
+    }
+
+    const file = join(h.dataDir, "zotero-import-clash.rdf");
+    writeFileSync(file, ZOTERO_RDF_CLASH_FIXTURE);
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+
+    await h.runCli("--json", "object", "get", id);
+    const node = JSON.parse(h.io.stdoutText).object;
+    const props = node.properties as { schemaId: string; value: unknown }[];
+    const byName = (name: string) =>
+      props.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(byName("doi")).toBe("10.0000/hand-fixed"); // NOT clobbered by doi:10.9999/clash
+    expect(byName("publisher")).toBe("Clash Publisher"); // the empty field filled
+    expect(byName("abstract")).toBe("Clash abstract");
+  });
+
+  it("dry-run plans per-field fills; a second run writes nothing (idempotent)", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "zotero-import-idem.rdf");
+    writeFileSync(file, ZOTERO_RDF_IDEM_FIXTURE);
+
+    // Dry-run first: the mapped fields are planned, nothing is written.
+    expect(await h.runCli("--json", "import", "zotero-rdf", file, "--dry-run")).toBe(EXIT.ok);
+    const plan = JSON.parse(h.io.stdoutText) as {
+      entries: Array<{ citekey: string; action: string; fills: Array<{ name: string }> }>;
+    };
+    const planned = plan.entries.find((e) => e.citekey === "rdf-idem-1")!;
+    expect(planned.action).toBe("create");
+    expect(planned.fills.map((f) => f.name)).toEqual(
+      expect.arrayContaining(["abstract", "volume"]),
+    );
+    const search = await fetch(`${h.baseUrl}/api/objects?q=Idem%20Article`, {
+      headers: { "x-api-key": API_KEY },
+    });
+    const found = ((await search.json()) as { objects: Array<{ name: string | null }> }).objects;
+    expect(found.filter((o) => o.name === "The Idem Article")).toHaveLength(0);
+
+    // Real import, then a second import: matched, zero fills.
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const second = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      updated: number;
+      entryFills: Array<{ fills: Array<{ name: string; value: unknown }> }>;
+    };
+    expect(second).toMatchObject({ created: 0, updated: 1 });
+    expect(second.entryFills).toHaveLength(1);
+    expect(second.entryFills[0]!.fills).toEqual([]);
+
+    // And a dry-run after the import also plans zero fills.
+    expect(await h.runCli("--json", "import", "zotero-rdf", file, "--dry-run")).toBe(EXIT.ok);
+    const after = JSON.parse(h.io.stdoutText) as {
+      entries: Array<{ citekey: string; fills: Array<{ name: string }> }>;
+    };
+    expect(after.entries.find((e) => e.citekey === "rdf-idem-1")!.fills).toEqual([]);
   });
 });
 
