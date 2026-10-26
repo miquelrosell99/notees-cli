@@ -2018,6 +2018,9 @@ describe("config (per-profile defaults)", () => {
         delete process.env.NOTEES_WORKSPACE;
       }
     });
+  });
+});
+
 describe("auth store (existing API keys)", () => {
   // Mint a fresh user API key for the shared test account (the workspace-
   // selection describe created it). Independent of any stored credential.
