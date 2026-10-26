@@ -792,12 +792,86 @@ function extractLinkedNames(text: string): string[] {
   return names;
 }
 
-async function classList(ctx: CommandContext): Promise<void> {
-  const body = await ctx.client.getJson<{
-    classes: Array<{ id: string; name: string; memberCount: number; parentClassIds: string[] }>;
-  }>("/api/classes");
+interface ApiClassRow {
+  id: string;
+  name: string;
+  memberCount: number;
+  parentClassIds: string[];
+}
+
+/** One node of the `--tree` machine surface (nested, additive-only field). */
+interface ClassTreeNode {
+  id: string;
+  name: string;
+  memberCount: number;
+  children: ClassTreeNode[];
+}
+
+const displayClassName = (name: string): string => (name.length > 0 ? name : "(untitled)");
+
+/**
+ * The `--tree` view of the class listing: the extends DAG rendered as an
+ * indented tree (two spaces per level). Roots are parentless classes; a class
+ * extending several parents renders under each, tagged with the others; a
+ * cycle on the current path renders `(cycle)` and stops.
+ */
+function buildClassTree(classes: ApiClassRow[]): { roots: ClassTreeNode[]; lines: string[] } {
+  const byId = new Map(classes.map((klass) => [klass.id, klass]));
+  const childrenOf = new Map<string, ClassTreeNode[]>();
+  const nodeOf = new Map<string, ClassTreeNode>();
+  for (const klass of classes) {
+    const node: ClassTreeNode = { id: klass.id, name: klass.name, memberCount: klass.memberCount, children: [] };
+    nodeOf.set(klass.id, node);
+    for (const parentId of klass.parentClassIds ?? []) {
+      const siblings = childrenOf.get(parentId) ?? [];
+      siblings.push(node);
+      childrenOf.set(parentId, siblings);
+    }
+  }
+  const byName = (a: ClassTreeNode, b: ClassTreeNode): number =>
+    displayClassName(a.name).localeCompare(displayClassName(b.name));
+  const roots = classes
+    .filter((klass) => (klass.parentClassIds ?? []).length === 0)
+    .map((klass) => nodeOf.get(klass.id)!)
+    .sort(byName);
+  for (const siblings of childrenOf.values()) siblings.sort(byName);
+  // The machine tree nests through the nodes' own children arrays — point
+  // them at the sorted adjacency lists (a multi-parent node is shared across
+  // its parents' lists; JSON serialization duplicates it, which is intended).
+  for (const [id, siblings] of childrenOf) nodeOf.get(id)!.children = siblings;
+
+  const lines: string[] = [];
+  const renderNode = (node: ClassTreeNode, depth: number, onPath: Set<string>): void => {
+    const indent = "  ".repeat(depth);
+    if (onPath.has(node.id)) {
+      lines.push(`${indent}${displayClassName(node.name)} (cycle)`);
+      return;
+    }
+    // Other parents beyond the one this rendering hangs under (cycles on the
+    // path excluded — the edge back to the ancestor is the cycle itself).
+    const otherParents = (byId.get(node.id)?.parentClassIds ?? [])
+      .filter((parentId) => !onPath.has(parentId))
+      .map((parentId) => displayClassName(byId.get(parentId)?.name ?? parentId))
+      .sort((a, b) => a.localeCompare(b));
+    const tag = depth > 0 && otherParents.length > 0 ? ` [also under: ${otherParents.join(", ")}]` : "";
+    lines.push(`${indent}${displayClassName(node.name)} (${node.memberCount})${tag}`);
+    const nextPath = new Set(onPath);
+    nextPath.add(node.id);
+    for (const child of node.children) renderNode(child, depth + 1, nextPath);
+  };
+  for (const root of roots) renderNode(root, 0, new Set());
+  return { roots, lines };
+}
+
+async function classList(ctx: CommandContext, options: { tree?: boolean }): Promise<void> {
+  const body = await ctx.client.getJson<{ classes: ApiClassRow[] }>("/api/classes");
+  if (options.tree === true) {
+    const { roots, lines } = buildClassTree(body.classes);
+    emit(ctx, `${lines.join("\n")}\n`, { ...body, tree: roots });
+    return;
+  }
   const rows = body.classes.map((klass) => [
-    klass.name.length > 0 ? klass.name : "(untitled)",
+    displayClassName(klass.name),
     String(klass.memberCount),
     klass.id,
   ]);
@@ -1611,7 +1685,69 @@ async function propertyGet(ctx: CommandContext, schemaRef: string): Promise<void
   const body = await ctx.client.getJson<{ propertySchema: ApiPropertySchema }>(
     `/api/property-schemas/${encodeURIComponent(schema.id)}`,
   );
-  emit(ctx, `${JSON.stringify(body.propertySchema, null, 2)}\n`, body);
+  const eligibleClasses = await resolveEligibleClasses(ctx, body.propertySchema);
+  emit(
+    ctx,
+    `${JSON.stringify({ ...body.propertySchema, eligibleClasses }, null, 2)}\n`,
+    { ...body, eligibleClasses },
+  );
+}
+
+/**
+ * Client-side eligibility resolution for `property get`: scope is the sole
+ * locality authority — `scopeClassIds: null` means global (every node), a
+ * non-empty list means the scoped classes plus every class whose transitive
+ * extends-closure reaches one. `via` is the shortest parent-chain from the
+ * class up to a scoped class as readable names, or `["(scoped directly)"]`
+ * when the class itself is in scope.
+ */
+async function resolveEligibleClasses(
+  ctx: CommandContext,
+  schema: ApiPropertySchema,
+): Promise<Array<{ id: string; name: string; via: string[] }> | null> {
+  if (schema.scopeClassIds === null) return null;
+  const scoped = new Set(schema.scopeClassIds);
+  const { classes } = await ctx.client.getJson<{ classes: ApiClassRow[] }>("/api/classes");
+  const byId = new Map(classes.map((klass) => [klass.id, klass]));
+  const eligible: Array<{ id: string; name: string; via: string[] }> = [];
+  for (const klass of classes) {
+    if (scoped.has(klass.id)) {
+      eligible.push({ id: klass.id, name: klass.name, via: ["(scoped directly)"] });
+      continue;
+    }
+    // BFS upward (extends may fan out) — the first scoped ancestor hit is the
+    // shortest chain; the visited set guards against extends cycles.
+    const visited = new Set<string>([klass.id]);
+    let frontier: Array<{ id: string; chain: string[] }> = (klass.parentClassIds ?? []).map((parentId) => ({
+      id: parentId,
+      chain: [parentId],
+    }));
+    let via: string[] | null = null;
+    while (frontier.length > 0) {
+      const next: Array<{ id: string; chain: string[] }> = [];
+      for (const step of frontier) {
+        if (visited.has(step.id)) continue;
+        visited.add(step.id);
+        if (scoped.has(step.id)) {
+          via = step.chain;
+          break;
+        }
+        for (const parentId of byId.get(step.id)?.parentClassIds ?? []) {
+          next.push({ id: parentId, chain: [...step.chain, parentId] });
+        }
+      }
+      if (via !== null) break;
+      frontier = next;
+    }
+    if (via !== null) {
+      eligible.push({
+        id: klass.id,
+        name: klass.name,
+        via: [klass.id, ...via].map((id) => displayClassName(byId.get(id)?.name ?? id)),
+      });
+    }
+  }
+  return eligible.sort((a, b) => displayClassName(a.name).localeCompare(displayClassName(b.name)));
 }
 
 /** `notees property create` — the server stamps the envelope; the schema id is
@@ -2369,7 +2505,7 @@ function buildProgram(): Command {
     });
   schemaCmd
     .command("get <schema>")
-    .description("show one property schema (schema: uuid or name)")
+    .description("show one property schema with its resolved eligible classes (schema: uuid or name)")
     .action(async (schema: string, _options: object, command: Command) => {
       await propertyGet(ctxOf(command), schema);
     });
@@ -2532,9 +2668,10 @@ function buildProgram(): Command {
   const klass = program.command("class").description("class operations");
   klass
     .command("list")
-    .description("list classes")
-    .action(async (_options: object, command: Command) => {
-      await classList(ctxOf(command));
+    .description("list classes (flat table; --tree renders the extends hierarchy)")
+    .option("--tree", "render the extends hierarchy as an indented tree", false)
+    .action(async (options: { tree?: boolean }, command: Command) => {
+      await classList(ctxOf(command), options);
     });
   klass
     .command("assign <objectId> <class>")

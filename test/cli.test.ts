@@ -1099,6 +1099,29 @@ describe("property schema verbs", () => {
     expect(await h.runCli("property", "get", "pg7-style")).toBe(EXIT.usage);
   });
 
+  it("get resolves eligible classes through the extends closure (citekey is scoped to Source)", async () => {
+    const h = harness;
+    // citekey seeds local to `source` + extensions (SYSTEM_PROPERTY specs);
+    // Document extends Source, Person extends Agent — a clean closure probe.
+    expect(await h.runCli("--json", "property", "get", SYSTEM_PROPERTY_UUIDS.citekey)).toBe(EXIT.ok);
+    const got = JSON.parse(h.io.stdoutText) as {
+      propertySchema: { id: string };
+      eligibleClasses: Array<{ id: string; name: string; via: string[] }>;
+    };
+    expect(got.propertySchema.id).toBe(SYSTEM_PROPERTY_UUIDS.citekey);
+    const source = got.eligibleClasses.find((entry) => entry.name === "Source");
+    expect(source?.via).toEqual(["(scoped directly)"]);
+    const document = got.eligibleClasses.find((entry) => entry.name === "Document");
+    expect(document).toBeDefined();
+    expect(document!.via.join(" → ")).toContain("Source");
+    // Person's closure (Agent) never reaches Source.
+    expect(got.eligibleClasses.some((entry) => entry.name === "Person")).toBe(false);
+
+    // Human mode prints the schema dump with the eligibleClasses section.
+    expect(await h.runCli("property", "get", "citekey")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain('"eligibleClasses"');
+  });
+
   it("usage and domain failures fail loud", async () => {
     const h = harness;
     expect(await h.runCli("property", "create", "x", "--type", "bogus")).toBe(EXIT.usage);
@@ -1151,6 +1174,36 @@ describe("shell (scripted mode)", () => {
 
     // The script really deleted the object.
     expect(await h.runCli("--json", "object", "get", id)).toBe(EXIT.domain);
+  });
+
+  it("scripted update(id, {name}) rewrites the title (title-is-content)", async () => {
+    const h = harness;
+    const script = `
+      const p = await create({
+        isEmbedded: false,
+        contentAst: [{ type: "text", text: "shell-rename-page" }],
+      });
+      await update(p.id, { name: "shell-renamed-page" });
+      const got = await get(p.id);
+      console.log("name " + got.name);
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("name shell-renamed-page");
+  });
+
+  it("scripted update(id, {name, contentAst}) exits 2 (usage)", async () => {
+    const h = harness;
+    const script = `
+      const p = await create({
+        isEmbedded: false,
+        contentAst: [{ type: "text", text: "shell-mutex-page" }],
+      });
+      await update(p.id, { name: "x", contentAst: [] });
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("mutually exclusive");
   });
 
   it("scripted helper sweep: list, classes, classInfo, backlinks, props, setProperty, upload, export", async () => {
@@ -1446,6 +1499,45 @@ describe("tabular human output", () => {
     expect(await h.runCli("object", "list", "--q", "table-output-probe")).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("KIND");
     expect(h.io.stdoutText).toContain("table-output-probe");
+  });
+});
+
+describe("class list --tree", () => {
+  it("renders the extends hierarchy indented (Document under Source); --json carries classes + tree", async () => {
+    const h = harness;
+    // Seeded hierarchy (SYSTEM_CLASS_EXTENDS in @notees/domain): Document
+    // extends Source, so Source is a root and Document sits one level in.
+    expect(await h.runCli("class", "list", "--tree")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toMatch(/^Source \(\d+\)$/m);
+    expect(h.io.stdoutText).toMatch(/^ {2}Document \(\d+\)$/m);
+    // A root never carries an indent or an "also under" tag.
+    expect(h.io.stdoutText).not.toMatch(/^ {2}Source/);
+
+    // Machine surface: the flat body is unchanged, `tree` is additive.
+    expect(await h.runCli("--json", "class", "list", "--tree")).toBe(EXIT.ok);
+    const body = JSON.parse(h.io.stdoutText) as {
+      classes: Array<{ id: string; name: string }>;
+      tree: Array<{ id: string; name: string; memberCount: number; children: Array<{ id: string; name: string }> }>;
+    };
+    expect(Array.isArray(body.classes)).toBe(true);
+    const source = body.tree.find((node) => node.name === "Source");
+    expect(source).toBeDefined();
+    expect(source!.children).toContainEqual(expect.objectContaining({ name: "Document" }));
+  });
+
+  it("multi-parent classes render under each parent with an [also under:] tag", async () => {
+    const h = harness;
+    // Two user classes; the child extends both. Extends is op-level state —
+    // the class.setExtends op rides the shell's submitOp (the one write path).
+    const script = `
+      const a = await create({ isClass: true, name: "tree-mp-a" });
+      const b = await create({ isClass: true, name: "tree-mp-b" });
+      const child = await create({ isClass: true, name: "tree-mp-child" });
+      await submitOp("class.setExtends", { classId: child.id, parentClassIds: [a.id, b.id] }, [child.id]);
+    `;
+    expect(await h.runCliWithStdin(script, "shell")).toBe(EXIT.ok);
+    expect(await h.runCli("class", "list", "--tree")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toMatch(/^ {2}tree-mp-child \(\d+\) \[also under: tree-mp-(a|b)\]$/m);
   });
 });
 
