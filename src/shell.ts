@@ -91,6 +91,11 @@ export interface ShellHelpers {
    */
   update(id: string, fields: Record<string, unknown>): Promise<unknown>;
   del(id: string, opts?: DeleteOptions): Promise<unknown>;
+  /** POST /objects/:sourceId/merge — merge source into target (the source
+   * trashes; the server's planner guards fail loud, 422 → CliError exit 1). */
+  merge(sourceId: string, targetId: string): Promise<unknown>;
+  /** POST /objects/:sourceId/merge?dryRun=true — the plan summary only, nothing written. */
+  mergePlan(sourceId: string, targetId: string): Promise<unknown>;
   setProperty(id: string, schemaId: string, value: unknown, opts?: SetPropertyOptions): Promise<unknown>;
   /** Unset one property slot (the missing partner of setProperty; idx defaults 0). */
   unsetProperty(id: string, schemaId: string, idx?: number): Promise<unknown>;
@@ -154,6 +159,8 @@ giant heredoc):
   create(partial)                            POST /objects -> created object (fields: isClass, isEmbedded, name, contentAst, classIds, parentId)
   update(id, fields)                         PATCH fields (isEmbedded, icon, color, contentAst; name becomes a single text token) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
+  merge(sourceId, targetId)                  POST /objects/:sourceId/merge — merge source into target (source trashes; guards fail loud)
+  mergePlan(sourceId, targetId)              the merge plan only (?dryRun=true) — summary, nothing written
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   unsetProperty(id, schemaId, idx?)          unset a property slot (idx defaults 0) -> updated object
   propertySchemas()                          list active property schemas
@@ -266,6 +273,16 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         `${objectUrl(id)}${query}`,
       );
     },
+    merge: async (sourceId, targetId) =>
+      client.postJson<{ merged: boolean; targetId: string; summary: unknown }>(
+        `${objectUrl(sourceId)}/merge`,
+        { targetId },
+      ),
+    mergePlan: async (sourceId, targetId) =>
+      client.postJson<{ dryRun: boolean; summary: unknown }>(
+        `${objectUrl(sourceId)}/merge?dryRun=true`,
+        { targetId },
+      ),
     setProperty: async (id, schemaId, value, opts = {}) =>
       (
         await client.postJson<{ object: unknown }>(`${objectUrl(id)}/properties`, {

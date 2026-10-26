@@ -290,12 +290,46 @@ describe("object merge", () => {
     expect(children.length).toBe(1);
   });
 
-  it("guard failures surface the server's 422 (source === target)", async () => {
+  it("guard failures surface the server's 422 → exit 1 (self-merge and descendant target)", async () => {
     const h = harness;
     const page = await h.createPage("merge-same", []);
-    const code = await h.runCli("--json", "object", "merge", page, page, "--yes");
-    expect(code).toBe(EXIT.usage);
-    expect(h.io.stderrText).toContain("same node");
+
+    // source === target: no client-side shortcut — the server's merge
+    // planner owns the guard and answers 422 → exit 1 (domain).
+    const selfCode = await h.runCli("--json", "object", "merge", page, page, "--yes");
+    expect(selfCode).toBe(EXIT.domain);
+    expect(h.io.stderrText).toContain("must be different nodes");
+
+    // target inside the source's subtree (trashing the source would trash
+    // the target) — the same 422 path.
+    const outer = await h.createPage("merge-outer", []);
+    const inner = await h.createPage("merge-inner", []);
+    expect(await h.runCli("--json", "object", "move", inner, "--parent", outer)).toBe(EXIT.ok);
+    const descendantCode = await h.runCli("--json", "object", "merge", outer, inner, "--yes");
+    expect(descendantCode).toBe(EXIT.domain);
+    expect(h.io.stderrText).toContain("subtree");
+  });
+
+  it("an unknown endpoint id follows the route-error mapping (404 → exit 1, not 3)", async () => {
+    const h = harness;
+    const target = await h.createPage("merge-404-target", []);
+    const code = await h.runCli("--json", "object", "merge", "00000000-0000-0000-0000-00000000dead", target, "--yes");
+    expect(code).toBe(EXIT.domain);
+    expect(h.io.stderrText).toContain("does not exist");
+  });
+
+  it("human output: one line per nonzero summary counter, then the Merged trailer", async () => {
+    const h = harness;
+    const source = await h.createPage("merge-human-src", [{ type: "text", text: "payload block" }]);
+    const target = await h.createPage("merge-human-tgt", []);
+
+    expect(await h.runCli("object", "merge", source, target, "--dry-run")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("dry run:");
+    expect(h.io.stdoutText).toMatch(/^\s+1 children moved$/m);
+
+    expect(await h.runCli("object", "merge", source, target, "--yes")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toMatch(/^\s+1 children moved$/m);
+    expect(h.io.stdoutText).toContain(`Merged "merge-human-src" into "merge-human-tgt"`);
   });
 });
 
@@ -1444,6 +1478,46 @@ describe("daily notes", () => {
   });
 });
 
+describe("date ensure", () => {
+  it("ensures an arbitrary date chain (deterministic ids), idempotent, --json shape", async () => {
+    const h = harness;
+    // A fixed past date: deterministic content-addressed ids from the domain.
+    const ids = chainNodeIds("2024-02-29");
+    expect(ids.year).toBe("00000000-0000-0000-00bb-202400000000");
+    expect(ids.month).toBe("00000000-0000-0000-00aa-202402000000");
+    expect(ids.day).toBe("00000000-0000-0000-00dd-202402290000");
+
+    // Human mode prints the day node id.
+    expect(await h.runCli("date", "ensure", "2024-02-29")).toBe(EXIT.ok);
+    expect(h.io.stdoutText.trim()).toBe(ids.day);
+
+    // --json prints the three chain ids.
+    expect(await h.runCli("--json", "date", "ensure", "2024-02-29")).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { yearId: string; monthId: string; dayId: string };
+    expect(machine).toEqual({ yearId: ids.year, monthId: ids.month, dayId: ids.day });
+
+    // The chain is real: the day sits under the month under the year, classed
+    // by the seeded system date classes.
+    expect(await h.runCli("--json", "object", "get", ids.day)).toBe(EXIT.ok);
+    const day = JSON.parse(h.io.stdoutText).object as { parentId: string; classIds: string[] };
+    expect(day.parentId).toBe(ids.month);
+    expect(day.classIds).toContain(SYSTEM_CLASS_UUIDS.day);
+
+    // Idempotent: re-running over the existing chain is still exit 0 (the
+    // already-exists 409 means "there").
+    expect(await h.runCli("date", "ensure", "2024-02-29")).toBe(EXIT.ok);
+    expect(h.io.stdoutText.trim()).toBe(ids.day);
+  });
+
+  it("rejects non-calendar dates with usage (exit 2)", async () => {
+    const h = harness;
+    expect(await h.runCli("date", "ensure", "2023-02-29")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("YYYY-MM-DD");
+    expect(await h.runCli("date", "ensure", "not-a-date")).toBe(EXIT.usage);
+    expect(await h.runCli("date", "ensure", "2024-13-01")).toBe(EXIT.usage);
+  });
+});
+
 describe("property schema verbs", () => {
   it("create → list → get → rename → bind → unbind → delete", async () => {
     const h = harness;
@@ -1597,6 +1671,49 @@ describe("shell (scripted mode)", () => {
     const code = await h.runCliWithStdin(script, "shell");
     expect(code).toBe(EXIT.usage);
     expect(h.io.stderrText).toContain("mutually exclusive");
+  });
+
+  it("scripted merge/mergePlan: the plan is dry, the merge lands, guards throw", async () => {
+    const h = harness;
+    const script = `
+      const source = await create({
+        isEmbedded: false,
+        contentAst: [{ type: "text", text: "shell-merge-src" }],
+        parentId: undefined,
+      });
+      const block = await create({
+        isEmbedded: true,
+        parentId: source.id,
+        contentAst: [{ type: "text", text: "shell-merge-block" }],
+      });
+      const target = await create({
+        isEmbedded: false,
+        contentAst: [{ type: "text", text: "shell-merge-tgt" }],
+      });
+      const plan = await mergePlan(source.id, target.id);
+      console.log("plan-dry " + plan.dryRun);
+      console.log("plan-moves " + plan.summary.childrenMoved);
+      const got = await get(source.id);
+      console.log("still-active " + got.isActive);
+      const res = await merge(source.id, target.id);
+      console.log("merged " + res.merged);
+      const trashed = await get(source.id);
+      console.log("trashed " + (trashed.isActive === false));
+      try {
+        await merge(target.id, target.id);
+        console.log("self-guard missing");
+      } catch (error) {
+        console.log("self-guard " + String(error.message).includes("different nodes"));
+      }
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("plan-dry true");
+    expect(h.io.stdoutText).toContain("plan-moves 1");
+    expect(h.io.stdoutText).toContain("still-active true");
+    expect(h.io.stdoutText).toContain("merged true");
+    expect(h.io.stdoutText).toContain("trashed true");
+    expect(h.io.stdoutText).toContain("self-guard true");
   });
 
   it("scripted helper sweep: list, classes, classInfo, backlinks, props, setProperty, upload, export", async () => {
@@ -2317,6 +2434,65 @@ describe("class remap", () => {
   });
 });
 
+describe("class set-extends", () => {
+  it("preview without --yes (exit 2, shows the resulting parent set); --yes replaces the full set", async () => {
+    const h = harness;
+    for (const name of ["sx-child", "sx-a", "sx-b"]) {
+      expect(await h.runCli("--json", "object", "create", "--isClass", "--name", name)).toBe(EXIT.ok);
+    }
+    const parentsOf = async (title: string): Promise<string[]> => {
+      expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
+      const row = (JSON.parse(h.io.stdoutText).classes as Array<{ name: string; parentClassIds: string[] }>).find(
+        (c) => c.name === title,
+      );
+      return row?.parentClassIds ?? [];
+    };
+
+    // No --yes: exit 2 with the resulting parent set in the preview.
+    expect(await h.runCli("class", "set-extends", "sx-child", "sx-a", "sx-b")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("sx-a");
+    expect(h.io.stderrText).toContain("replaces the FULL parent set");
+    expect(await parentsOf("sx-child")).toEqual([]);
+
+    // --yes: both parents land (title refs resolve).
+    expect(await h.runCli("--json", "class", "set-extends", "sx-child", "sx-a", "sx-b", "--yes")).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { class: { name: string }; parentClassIds: string[] };
+    expect(machine.class.name).toBe("sx-child");
+    expect(machine.parentClassIds.length).toBe(2);
+
+    // REPLACE semantics: re-setting with only sx-a detaches sx-b.
+    expect(await h.runCli("class", "set-extends", "sx-child", "sx-a", "--yes")).toBe(EXIT.ok);
+    const listRes = await h.app.inject({
+      method: "GET",
+      url: "/api/classes",
+      headers: { "x-api-key": API_KEY },
+    });
+    const row = (listRes.json().classes as Array<{ name: string; parentClassIds: string[] }>).find(
+      (c) => c.name === "sx-child",
+    );
+    const aId = (listRes.json().classes as Array<{ name: string; id: string }>).find((c) => c.name === "sx-a")!.id;
+    expect(row?.parentClassIds).toEqual([aId]);
+  });
+
+  it("an empty parent list detaches all; a cycle guard fails loud server-side", async () => {
+    const h = harness;
+    for (const name of ["sx-detach", "sx-detach-parent"]) {
+      expect(await h.runCli("--json", "object", "create", "--isClass", "--name", name)).toBe(EXIT.ok);
+    }
+    expect(await h.runCli("class", "set-extends", "sx-detach", "sx-detach-parent", "--yes")).toBe(EXIT.ok);
+    expect(await h.runCli("class", "set-extends", "sx-detach", "--yes")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "class", "list")).toBe(EXIT.ok);
+    const row = (JSON.parse(h.io.stdoutText).classes as Array<{ name: string; parentClassIds: string[] }>).find(
+      (c) => c.name === "sx-detach",
+    );
+    expect(row?.parentClassIds).toEqual([]);
+
+    // Self-extends fails client-side (usage) before any write.
+    expect(await h.runCli("class", "set-extends", "sx-detach", "sx-detach", "--yes")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("cannot extend itself");
+  });
+});
+
 describe("object list --all", () => {
   it("follows the cursor to exhaustion", async () => {
     const h = harness;
@@ -2336,6 +2512,54 @@ describe("object list --all", () => {
     const all = JSON.parse(h.io.stdoutText) as { objects: unknown[]; nextCursor: string | null };
     expect(all.objects.length).toBe(3);
     expect(all.nextCursor).toBeNull();
+  });
+});
+
+describe("object list row visibility (--embedded / --inactive)", () => {
+  it("--embedded selects embedded blocks; --all alone still excludes nothing active; --inactive lists the trash", async () => {
+    const h = harness;
+    const page = await h.createPage("visib-page", [{ type: "text", text: "visib-block" }]);
+    // The embedded block created as the page's body child.
+    expect(await h.runCli("--json", "object", "children", page)).toBe(EXIT.ok);
+    const block = (JSON.parse(h.io.stdoutText).children as Array<{ id: string; isEmbedded: boolean }>).find(
+      (child) => child.isEmbedded === true,
+    )!;
+    expect(block).toBeDefined();
+
+    // --embedded: only the block, never the page.
+    expect(await h.runCli("--json", "object", "list", "--q", "visib", "--embedded")).toBe(EXIT.ok);
+    let listed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(listed.map((o) => o.id)).toContain(block.id);
+    expect(listed.map((o) => o.id)).not.toContain(page);
+
+    // --all --embedded: same filter, cursor exhausted.
+    expect(await h.runCli("--json", "object", "list", "--q", "visib", "--embedded", "--all")).toBe(EXIT.ok);
+    listed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(listed.map((o) => o.id)).toContain(block.id);
+
+    // The trap surfaced: a bare (active) listing CONTAINS embedded blocks —
+    // --no-isEmbedded is what excludes them.
+    expect(await h.runCli("--json", "object", "list", "--q", "visib", "--no-isEmbedded")).toBe(EXIT.ok);
+    listed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(listed.map((o) => o.id)).not.toContain(block.id);
+
+    // --inactive: the trashed row shows up (no --q: the FTS index may not
+    // carry trashed rows), and every row is inactive.
+    expect(await h.runCli("--json", "object", "delete", page, "--yes")).toBe(EXIT.ok);
+    expect(await h.runCli("--json", "object", "list", "--inactive")).toBe(EXIT.ok);
+    const inactive = JSON.parse(h.io.stdoutText).objects as Array<{ id: string; isActive: boolean }>;
+    expect(inactive.map((o) => o.id)).toContain(page);
+    expect(inactive.every((o) => o.isActive === false)).toBe(true);
+
+    // --all stays additive over the same trap: still no trashed rows.
+    expect(await h.runCli("--json", "object", "list", "--q", "visib", "--all")).toBe(EXIT.ok);
+    listed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(listed.map((o) => o.id)).not.toContain(page);
+
+    // ...unless --inactive is combined in.
+    expect(await h.runCli("--json", "object", "list", "--all", "--inactive")).toBe(EXIT.ok);
+    listed = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
+    expect(listed.map((o) => o.id)).toContain(page);
   });
 });
 
@@ -2622,6 +2846,86 @@ describe("object property set/delete", () => {
   });
 });
 
+describe("object property set --batch --stdin", () => {
+  it("applies a JSON array with bounded concurrency; failures collected, exit 1", async () => {
+    const h = harness;
+    // Fresh schema (unique name — the shared server accumulates suites).
+    expect(await h.runCli("property", "create", "batchProbeScore", "--type", "number")).toBe(EXIT.ok);
+    const schemaId = h.io.stdoutText.trim();
+    const a = await h.createPage("batch-probe-a", []);
+    const b = await h.createPage("batch-probe-b", []);
+
+    const entries = JSON.stringify([
+      { objectId: a, schema: "batchProbeScore", value: 7 },
+      { objectId: b, schema: "batchProbeScore", value: 8, idx: 0 },
+      { objectId: "00000000-0000-0000-0000-00000000cafe", schema: "batchProbeScore", value: 9 },
+      { objectId: a, schema: "no.such.schema", value: 1 },
+    ]);
+    const code = await h.runCliWithStdin(entries, "--json", "object", "property", "set", "--batch", "--stdin", "--jobs", "2");
+    expect(code).toBe(EXIT.domain);
+    const machine = JSON.parse(h.io.stdoutText) as {
+      set: number;
+      objectIds: string[];
+      failures: Array<{ index: number; error: string }>;
+    };
+    expect(machine.set).toBe(2);
+    expect(machine.objectIds).toEqual([a, b]);
+    expect(machine.failures.map((f) => f.index)).toEqual([2, 3]);
+    expect(machine.failures[0]!.error).toContain("does not exist");
+    expect(machine.failures[1]!.error).toContain("no property schema named");
+
+    // The two good entries landed.
+    expect(await h.runCli("--json", "object", "get", a)).toBe(EXIT.ok);
+    let props = (JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>).map(
+      (p) => ({ schemaId: p.schemaId, value: p.value }),
+    );
+    expect(props).toContainEqual({ schemaId, value: 7 });
+    expect(await h.runCli("--json", "object", "get", b)).toBe(EXIT.ok);
+    props = (JSON.parse(h.io.stdoutText).object.properties as Array<{ schemaId: string; value: unknown }>).map(
+      (p) => ({ schemaId: p.schemaId, value: p.value }),
+    );
+    expect(props).toContainEqual({ schemaId, value: 8 });
+  });
+
+  it("--stop-on-error aborts the rest; clean input exits 0 with no failures key populated", async () => {
+    const h = harness;
+    const a = await h.createPage("batch-probe-c", []);
+    const stopped = JSON.stringify([
+      { objectId: a, schema: "batchProbeScore", value: 1 },
+      { objectId: "00000000-0000-0000-0000-00000000cafe", schema: "batchProbeScore", value: 2 },
+      { objectId: a, schema: "batchProbeScore", value: 3, idx: 1 },
+    ]);
+    const code = await h.runCliWithStdin(
+      stopped,
+      "--json", "object", "property", "set", "--batch", "--stdin", "--stop-on-error", "--jobs", "1",
+    );
+    expect(code).toBe(EXIT.domain);
+    const machine = JSON.parse(h.io.stdoutText) as { set: number; failures: Array<{ index: number; error: string }> };
+    expect(machine.set).toBe(1);
+    expect(machine.failures.map((f) => f.index)).toEqual([1, 2]);
+    expect(machine.failures[1]!.error).toContain("skipped");
+
+    const clean = JSON.stringify([{ objectId: a, schema: "batchProbeScore", value: 42 }]);
+    expect(await h.runCliWithStdin(clean, "--json", "object", "property", "set", "--batch", "--stdin")).toBe(EXIT.ok);
+    const okMachine = JSON.parse(h.io.stdoutText) as { set: number; failures: unknown[] };
+    expect(okMachine.set).toBe(1);
+    expect(okMachine.failures).toEqual([]);
+  });
+
+  it("batch mode validates its inputs (positional args, --stdin, entry shape)", async () => {
+    const h = harness;
+    const a = await h.createPage("batch-probe-d", []);
+    expect(await h.runCli("object", "property", "set", a, "batchProbeScore", "1", "--batch", "--stdin")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("no positional");
+    expect(await h.runCliWithStdin("[]", "object", "property", "set", "--batch")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("--stdin");
+    expect(await h.runCliWithStdin(JSON.stringify([{ objectId: a }]), "object", "property", "set", "--batch", "--stdin")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("schema");
+    expect(await h.runCliWithStdin("not json", "object", "property", "set", "--batch", "--stdin")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("JSON array");
+  });
+});
+
 describe("datetime properties (unified wire batch)", () => {
   it("datetime schema creation, retired types rejected, point + range values round-trip", async () => {
     const h = harness;
@@ -2858,6 +3162,22 @@ describe("object get --ids and create --icon/--color", () => {
     expect(await h.runCli("--json", "object", "get", "--ids", b, a)).toBe(EXIT.ok);
     const objects = JSON.parse(h.io.stdoutText).objects as Array<{ id: string }>;
     expect(objects.map((o) => o.id)).toEqual([b, a]);
+  });
+
+  it("multi-get tolerates missing ids: found objects + missing array, exit 0", async () => {
+    const h = harness;
+    const a = await h.createPage("multi-get-missing-a", []);
+    const gone = "00000000-0000-0000-0000-00000000beef";
+    expect(await h.runCli("--json", "object", "get", "--ids", a, gone)).toBe(EXIT.ok);
+    const body = JSON.parse(h.io.stdoutText) as { objects: Array<{ id: string }>; missing: string[] };
+    expect(body.objects.map((o) => o.id)).toEqual([a]);
+    expect(body.missing).toEqual([gone]);
+
+    // All-missing is still exit 0 with an empty objects list.
+    expect(await h.runCli("--json", "object", "get", "--ids", gone)).toBe(EXIT.ok);
+    const empty = JSON.parse(h.io.stdoutText) as { objects: unknown[]; missing: string[] };
+    expect(empty.objects).toEqual([]);
+    expect(empty.missing).toEqual([gone]);
   });
 
   it("create --icon/--color lands on the object", async () => {

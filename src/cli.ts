@@ -170,15 +170,27 @@ async function objectGet(ctx: CommandContext, id: string): Promise<void> {
 }
 
 /** `notees object get --ids <uuid…>` — multi-read: one fetch per id, in
- * argument order (verification scripts audit bulk imports without a loop). */
+ * argument order (verification scripts audit bulk imports without a loop).
+ * A missing id no longer fails the whole call: it lands in `missing` and the
+ * command still exits 0 (additive --json shape; any NON-404 failure stays
+ * loud — the listing is only tolerant of absent rows). */
 async function objectGetMany(ctx: CommandContext, ids: string[]): Promise<void> {
   const objects: unknown[] = [];
+  const missing: string[] = [];
   for (const id of ids) {
-    const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
-    objects.push(body.object);
+    try {
+      const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+      objects.push(body.object);
+    } catch (error) {
+      const absent =
+        error instanceof CliError && error.exitCode === EXIT.domain &&
+        isRecord(error.details) && error.details.status === 404;
+      if (!absent) throw error;
+      missing.push(id);
+    }
   }
   const human = objects.map((object) => `${JSON.stringify(object, null, 2)}\n`).join("");
-  emit(ctx, human, { objects });
+  emit(ctx, human, { objects, missing });
 }
 
 /** Shared create-body assembly for `object create` / `object upsert`. */
@@ -477,27 +489,27 @@ interface MergeSummary {
   fieldsCopied: number;
 }
 
-/** One human line over the plan's nonzero counts. */
-function renderMergeSummary(summary: MergeSummary): string {
-  const parts: string[] = [];
-  if (summary.childrenMoved > 0) parts.push(`${summary.childrenMoved} children moved`);
+/** One human line per nonzero plan count ("nothing to remap" when empty). */
+function renderMergeSummaryLines(summary: MergeSummary): string[] {
+  const lines: string[] = [];
+  if (summary.childrenMoved > 0) lines.push(`${summary.childrenMoved} children moved`);
   if (summary.classesRemapped > 0 || summary.tagsRemapped > 0) {
-    parts.push(`${summary.classesRemapped} classes + ${summary.tagsRemapped} tags remapped`);
+    lines.push(`${summary.classesRemapped} classes + ${summary.tagsRemapped} tags remapped`);
   }
   if (summary.propertiesCopied > 0) {
-    parts.push(
+    lines.push(
       `${summary.propertiesCopied} properties copied` +
         (summary.propertiesSkipped > 0 ? ` (${summary.propertiesSkipped} skipped — target already had a value)` : ""),
     );
   } else if (summary.propertiesSkipped > 0) {
-    parts.push(`${summary.propertiesSkipped} properties kept (target already had values)`);
+    lines.push(`${summary.propertiesSkipped} properties kept (target already had values)`);
   }
-  if (summary.contentLinksRewritten > 0) parts.push(`${summary.contentLinksRewritten} pages' mentions retargeted`);
-  if (summary.propertyValuesRewritten > 0) parts.push(`${summary.propertyValuesRewritten} property references retargeted`);
-  if (summary.aliasesRepointed > 0) parts.push(`${summary.aliasesRepointed} aliases repointed`);
-  if (summary.collectionsRemapped > 0) parts.push(`${summary.collectionsRemapped} collections remapped`);
-  if (summary.fieldsCopied > 0) parts.push(`${summary.fieldsCopied} fields copied`);
-  return parts.length > 0 ? parts.join(", ") : "nothing to remap";
+  if (summary.contentLinksRewritten > 0) lines.push(`${summary.contentLinksRewritten} pages' mentions retargeted`);
+  if (summary.propertyValuesRewritten > 0) lines.push(`${summary.propertyValuesRewritten} property references retargeted`);
+  if (summary.aliasesRepointed > 0) lines.push(`${summary.aliasesRepointed} aliases repointed`);
+  if (summary.collectionsRemapped > 0) lines.push(`${summary.collectionsRemapped} collections remapped`);
+  if (summary.fieldsCopied > 0) lines.push(`${summary.fieldsCopied} fields copied`);
+  return lines.length > 0 ? lines : ["nothing to remap"];
 }
 
 async function objectMerge(
@@ -506,7 +518,9 @@ async function objectMerge(
   targetRef: string,
   options: { dryRun?: boolean; yes?: boolean },
 ): Promise<void> {
-  if (sourceRef === targetRef) failUsage("object merge: source and target are the same node");
+  // No client-side guard for source === target: the server's merge planner
+  // owns the guards (self-merge, descendant target, class/trashed roles) and
+  // answers them as 422 → exit 1 (domain) with its message.
   const named = async (ref: string): Promise<{ id: string; name: string }> => {
     const body = await ctx.client.getJson<{ object: { id: string; name?: string | null } }>(
       `/api/objects/${encodeURIComponent(ref)}`,
@@ -522,7 +536,9 @@ async function objectMerge(
       `/api/objects/${encodeURIComponent(source.id)}/merge?dryRun=true`,
       { targetId: target.id },
     );
-    emit(ctx, `dry run: ${preview}\n  ${renderMergeSummary(res.summary)}\n`, {
+    const human =
+      `dry run: ${preview}\n` + renderMergeSummaryLines(res.summary).map((line) => `  ${line}`).join("\n") + "\n";
+    emit(ctx, human, {
       ...plan,
       dryRun: true,
       summary: res.summary,
@@ -537,9 +553,13 @@ async function objectMerge(
     `/api/objects/${encodeURIComponent(source.id)}/merge`,
     { targetId: target.id },
   );
-  emit(ctx, `merged "${source.name}" into "${target.name}" — ${renderMergeSummary(res.summary)}\n`, {
+  const human =
+    renderMergeSummaryLines(res.summary).map((line) => `  ${line}`).join("\n") +
+    `\nMerged "${source.name}" into "${target.name}"\n`;
+  emit(ctx, human, {
     ...plan,
     merged: res.merged,
+    targetId: res.targetId,
     summary: res.summary,
   });
 }
@@ -682,6 +702,10 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
 async function objectList(ctx: CommandContext, options: {
   isClass?: boolean;
   isEmbedded?: boolean;
+  /** The explicit twin of --isEmbedded — surfaces the row-visibility trap. */
+  embedded?: boolean;
+  /** The explicit twin of --trashed — the inactive (trashed) rows. */
+  inactive?: boolean;
   class?: string[];
   parent?: string;
   trashed?: boolean;
@@ -692,6 +716,12 @@ async function objectList(ctx: CommandContext, options: {
   all?: boolean;
 }): Promise<void> {
   const classes = options.class ?? [];
+  // Row-visibility map (the --all trap): the bare listing is ACTIVE rows of
+  // every render kind — classes, standalone pages, AND embedded blocks —
+  // unless narrowed; trashed rows are never in it. --embedded/--inactive are
+  // the explicit spellings of --isEmbedded/--trashed, combinable with --all.
+  const isEmbedded = options.isEmbedded ?? (options.embedded === true ? true : undefined);
+  const trashed = options.trashed === true || options.inactive === true ? true : undefined;
   // --all follows the pagination cursor to exhaustion (server page size,
   // defaulting to its 500 max so big workspaces take few round trips).
   const limit =
@@ -702,10 +732,10 @@ async function objectList(ctx: CommandContext, options: {
         : undefined;
   const pageParams = {
     isClass: options.isClass,
-    isEmbedded: options.isEmbedded,
+    isEmbedded,
     ...(classes.length === 1 ? { class: classes[0] } : {}),
     ...(options.parent !== undefined ? { parent: options.parent } : {}),
-    ...(options.trashed === true ? { trashed: "true" } : {}),
+    ...(trashed !== undefined ? { trashed: "true" } : {}),
     q: options.q,
     property: options.property,
     limit,
@@ -1022,6 +1052,63 @@ async function classRemap(
     ctx,
     `remapped ${moved}/${plan.members} members (${failures.length} failures), ${extendsRemapped}/${plan.extenders} extends\n`,
     { ...plan, moved, failures, extendsRemapped },
+  );
+}
+
+/**
+ * `notees class set-extends <class> <parent…>` — the first-class wrapper for
+ * the class.setExtends op (otherwise reachable only through the shell's
+ * makeOp). REPLACE semantics: the payload IS the class's full parent set —
+ * parents not listed are detached (an empty list detaches all). Preview-first
+ * like the bulk verbs: without --yes the resulting parent set prints and the
+ * command exits 2; applier guards (cycles, the system-class extends lock)
+ * fail loud server-side → exit 1.
+ */
+async function classSetExtends(
+  ctx: CommandContext,
+  classRef: string,
+  parentRefs: string[],
+  options: { yes?: boolean },
+): Promise<void> {
+  const klass = await resolveClassRef(ctx, classRef);
+  const parents: Array<{ id: string; name: string }> = [];
+  for (const ref of parentRefs) {
+    const parent = await resolveClassRef(ctx, ref);
+    if (parent.id === klass.id) failUsage("class set-extends: a class cannot extend itself");
+    if (!parents.some((existing) => existing.id === parent.id)) parents.push(parent);
+  }
+  const parentClassIds = parents.map((parent) => parent.id);
+  const plan = {
+    class: { id: klass.id, name: klass.name },
+    parents: parents.map((parent) => ({ id: parent.id, name: parent.name })),
+  };
+  const preview =
+    `set the extends parents of "${klass.name}" to ${parents.length > 0 ? parents.map((p) => `"${p.name}"`).join(", ") : "(none)"}` +
+    " — replaces the FULL parent set (unlisted parents detach)";
+  if (options.yes !== true) {
+    ctx.io.stderr.write(`Refusing to ${preview}.\nRe-run with --yes to proceed.\n`);
+    throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
+  }
+  // No REST surface for setExtends (configuration write) — the envelope rides
+  // the relay batch endpoint, the same write path as every other client.
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelope = newEnvelope({
+    workspaceId,
+    actorId,
+    deviceId: "notees-cli",
+    client: "cli",
+    hlc: clock.now(),
+    affectedNodeIds: [klass.id],
+    opType: "class.setExtends",
+    payload: { classId: klass.id, parentClassIds },
+  });
+  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  emit(
+    ctx,
+    `extends of "${klass.name}" set to ${parents.length > 0 ? parentClassIds.join(", ") : "(none)"}\n`,
+    { ...plan, parentClassIds },
   );
 }
 
@@ -1561,6 +1648,101 @@ async function objectPropertySet(
   await setProperty(ctx, id, schema.id, parsed, idx);
   const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
+}
+
+/**
+ * `notees object property set --batch --stdin` — bulk typed-property writes
+ * from a JSON array of `{objectId, schema, value, idx?}` (schema: uuid or
+ * name; value is already typed JSON on stdin). Schema names resolve against
+ * one upfront listing; items run through a bounded worker pool (mirror of
+ * `object create --batch`: --jobs 1–32, per-item failures collected into a
+ * `failures` array, exit 1 unless none, --stop-on-error aborts the rest).
+ */
+async function objectPropertySetBatch(ctx: CommandContext, options: {
+  jobs?: string;
+  stopOnError?: boolean;
+}): Promise<void> {
+  const raw = await readStdin(ctx.io);
+  let entries: unknown[];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    entries = parsed;
+  } catch {
+    throw new CliError(EXIT.usage, "--batch expects a JSON array of {objectId, schema, value, idx?} on stdin");
+  }
+  if (entries.length === 0) failUsage("--batch expects a non-empty JSON array");
+  entries.forEach((entry, index) => {
+    if (!isRecord(entry)) failUsage(`--batch entry ${index} is not a JSON object`);
+    if (typeof entry.objectId !== "string" || entry.objectId.length === 0) {
+      failUsage(`--batch entry ${index} needs a string objectId`);
+    }
+    if (typeof entry.schema !== "string" || entry.schema.length === 0) {
+      failUsage(`--batch entry ${index} needs a string schema (uuid or name)`);
+    }
+  });
+
+  const jobs = Number.parseInt(options.jobs ?? "8", 10);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32) failUsage("--jobs must be an integer between 1 and 32");
+
+  // One schema listing resolves every name ref (uuid refs pass verbatim).
+  const { propertySchemas } = await ctx.client.getJson<{ propertySchemas: { id: string; name: string }[] }>(
+    "/api/property-schemas",
+  );
+  const byName = new Map(propertySchemas.map((schema) => [schema.name.toLowerCase(), schema.id]));
+  const resolveSchemaId = (ref: string): string =>
+    PROPERTY_UUID_PATTERN.test(ref) ? ref : (byName.get(ref.trim().toLowerCase()) ?? ref);
+
+  const set: { index: number; objectId: string }[] = [];
+  const failures: { index: number; error: string }[] = [];
+  let stopped = false;
+  const queue = entries.map((entry, index) => ({ entry: entry as Record<string, unknown>, index }));
+
+  await Promise.all(
+    Array.from({ length: Math.min(jobs, queue.length) }, async () => {
+      for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+        const { entry, index } = item;
+        if (stopped) {
+          failures.push({ index, error: "skipped (--stop-on-error)" });
+          continue;
+        }
+        try {
+          const schemaId = resolveSchemaId(entry.schema as string);
+          if (!PROPERTY_UUID_PATTERN.test(schemaId)) {
+            throw new CliError(EXIT.usage, `no property schema named "${entry.schema}"`);
+          }
+          const idx = entry.idx === undefined ? 0 : Number(entry.idx);
+          if (!Number.isInteger(idx) || (idx as number) < 0) {
+            throw new CliError(EXIT.usage, "idx must be a non-negative integer");
+          }
+          await setProperty(ctx, entry.objectId as string, schemaId, entry.value, idx);
+          set.push({ index, objectId: entry.objectId as string });
+        } catch (error) {
+          failures.push({ index, error: error instanceof Error ? error.message : String(error) });
+          if (options.stopOnError === true) stopped = true;
+        }
+      }
+    }),
+  );
+
+  const objectIds = [...set].sort((a, b) => a.index - b.index).map((entry) => entry.objectId);
+  const machine = {
+    set: objectIds.length,
+    objectIds,
+    failures: [...failures].sort((a, b) => a.index - b.index),
+  };
+  emit(ctx, objectIds.map((id) => `${id}\n`).join(""), machine);
+  if (failures.length > 0) {
+    const detail = machine.failures
+      .slice(0, 5)
+      .map((failure) => `#${failure.index}: ${failure.error}`)
+      .join("; ");
+    throw new CliError(
+      EXIT.domain,
+      `--batch: ${failures.length}/${entries.length} failed (${detail}${failures.length > 5 ? "; …" : ""})`,
+      machine,
+    );
+  }
 }
 
 /** `notees object property delete` — unsets one slot (idx) of a schema's value. */
@@ -2461,6 +2643,28 @@ async function today(ctx: CommandContext, options: { append?: string }): Promise
   );
 }
 
+/**
+ * `notees date ensure <YYYY-MM-DD>` — ensure the date-chain nodes (year →
+ * month → day) exist for an arbitrary date, not just today. The ids are the
+ * domain's content-addressed chain ids (@notees/domain `chainNodeIds` — never
+ * re-hardcoded here) and the creates ride the same client path as `today`
+ * (GET-then-create; the deterministic id makes a re-run's 409 mean "already
+ * there", so the command is idempotent). Prints the day node id.
+ */
+async function dateEnsure(ctx: CommandContext, isoDate: string): Promise<void> {
+  let parts: ReturnType<typeof parseIsoDate>;
+  try {
+    parts = parseIsoDate(isoDate);
+  } catch {
+    failUsage(`date ensure expects a valid calendar date YYYY-MM-DD (got ${JSON.stringify(isoDate)})`);
+  }
+  const ids = chainNodeIds(isoDate);
+  await ensureChainNode(ctx, ids.year, dateNodeLabel(parts, "year"), SYSTEM_CLASS_UUIDS.year, null);
+  await ensureChainNode(ctx, ids.month, dateNodeLabel(parts, "month"), SYSTEM_CLASS_UUIDS.month, ids.year);
+  await ensureChainNode(ctx, ids.day, dateNodeLabel(parts, "day"), SYSTEM_CLASS_UUIDS.day, ids.month);
+  emit(ctx, `${ids.day}\n`, { yearId: ids.year, monthId: ids.month, dayId: ids.day });
+}
+
 /** `notees journal`: daily notes, newest first. */
 async function journal(ctx: CommandContext, options: { limit: string }): Promise<void> {
   const limit = Number.parseInt(options.limit, 10);
@@ -2860,8 +3064,8 @@ function buildProgram(): Command {
   const object = program.command("object").description("object operations");
   object
     .command("get [id]")
-    .description("fetch an object (--ids <uuid...> fetches many, in order)")
-    .addOption(new Option("--ids <uuid...>", "fetch several objects (mutually exclusive with the positional id)"))
+    .description("fetch an object (--ids <uuid...> fetches many, in order — unknown ids land in `missing`, exit stays 0)")
+    .addOption(new Option("--ids <uuid...>", "fetch several objects (mutually exclusive with the positional id; a 404 id is tolerated: returned under `missing`)"))
     .action(async (id: string | undefined, options: { ids?: string[] }, command: Command) => {
       if (options.ids !== undefined && options.ids.length > 0) {
         if (id !== undefined) failUsage("object get takes either an id or --ids, not both");
@@ -2924,7 +3128,8 @@ function buildProgram(): Command {
     .description(
       "merge one object into another: the source's children move, its class/tag bindings and authored properties remap " +
         "(the target keeps values it already has), references to the source (mentions, property references, aliases, " +
-        "collections) retarget, and the source moves to the trash. Preview-first: --dry-run shows the plan, --yes proceeds",
+        "collections) retarget, and the source moves to the trash. Preview-first: --dry-run shows the plan, --yes proceeds. " +
+        "Planner guards (self-merge, a target inside the source's subtree, a class or trashed endpoint) fail as 422 → exit 1",
     )
     .option("--dry-run", "print the merge plan without writing", false)
     .option("--yes", "proceed without prompting (required — destructive)", false)
@@ -2933,13 +3138,30 @@ function buildProgram(): Command {
     });
   const property = object.command("property").description("typed property operations");
   property
-    .command("set <id> <schema> <value>")
+    .command("set [id] [schema] [value]")
     .description(
       "set a property value (schema: uuid or name; value parses as JSON when possible, else string; " +
-        "text values may be a string or a {\"nodeId\":\"…\"} carrier-block ref)",
+        "text values may be a string or a {\"nodeId\":\"…\"} carrier-block ref). " +
+        "--batch --stdin reads a JSON array of {objectId, schema, value, idx?} and applies it with --jobs concurrency " +
+        "(per-item failures collected into `failures`; exit 1 when any fail)",
     )
     .option("--idx <n>", "slot index for multi-valued schemas", "0")
-    .action(async (id: string, schema: string, value: string, options: { idx?: string }, command: Command) => {
+    .option("--batch", "read a JSON array of {objectId, schema, value, idx?} from stdin and set them all (requires --stdin)", false)
+    .option("--stdin", "with --batch: read the entries from stdin", false)
+    .option("--jobs <n>", "batch concurrency 1–32 (default 8)", "8")
+    .option("--stop-on-error", "batch: abort the remaining entries on the first failure", false)
+    .action(async (id: string | undefined, schema: string | undefined, value: string | undefined, options: { idx?: string; batch?: boolean; stdin?: boolean; jobs?: string; stopOnError?: boolean }, command: Command) => {
+      if (options.batch === true) {
+        if (id !== undefined || schema !== undefined || value !== undefined) {
+          failUsage("--batch takes no positional arguments (entries come from --stdin)");
+        }
+        if (options.stdin !== true) failUsage("--batch requires --stdin (the JSON array is read from stdin)");
+        await objectPropertySetBatch(ctxOf(command), options);
+        return;
+      }
+      if (id === undefined || schema === undefined || value === undefined) {
+        failUsage("object property set requires <id> <schema> <value> (or --batch --stdin)");
+      }
       await objectPropertySet(ctxOf(command), id, schema, value, options);
     });
   property
@@ -3097,11 +3319,22 @@ function buildProgram(): Command {
     .option("--class <id>", "class id (repeatable)", (value: string, previous: string[]) => previous.concat([value]), [] as string[])
     .option("--parent <id>", "filter: direct children of this object id")
     .addOption(new Option("--trashed", "filter: trashed (inactive) rows — the trash listing").default(undefined))
+    .addOption(new Option("--embedded", "filter: embedded body rows only (blocks) — explicit twin of --isEmbedded; combinable with --all").default(undefined))
+    .addOption(
+      new Option(
+        "--inactive",
+        "filter: inactive (trashed) rows — explicit twin of --trashed; combinable with --all. Trap: a bare --all lists ACTIVE rows only, embedded blocks included, trashed rows never",
+      ).default(undefined),
+    )
     .option("--q <text>", "full-text filter")
     .option("--property <schemaId:value>", "exact-match property filter (value = everything after the first colon)")
     .option("--limit <n>", "page size")
     .option("--cursor <id>", "pagination cursor")
-    .option("--all", "fetch every page (follows the cursor to exhaustion; --limit becomes the page size)", false)
+    .option(
+      "--all",
+      "fetch every page (follows the cursor to exhaustion; --limit becomes the page size). Lists every ACTIVE row — classes, standalone pages, and embedded blocks, unless narrowed by a filter; trashed rows are excluded (add --inactive/--trashed for the trash)",
+      false,
+    )
     .action(async (options: object, command: Command) => {
       await objectList(ctxOf(command), options);
     });
@@ -3133,6 +3366,17 @@ function buildProgram(): Command {
       await today(ctxOf(command), options);
     });
 
+  const date = program.command("date").description("date-chain operations (the deterministic daily-note hierarchy)");
+  date
+    .command("ensure <YYYY-MM-DD>")
+    .description(
+      "ensure the year/month/day date-chain nodes exist for the given date (idempotent; prints the day node id, " +
+        "--json prints {yearId, monthId, dayId})",
+    )
+    .action(async (isoDate: string, _options: object, command: Command) => {
+      await dateEnsure(ctxOf(command), isoDate);
+    });
+
   program
     .command("journal")
     .description("list daily notes, newest first")
@@ -3160,6 +3404,16 @@ function buildProgram(): Command {
     .description("remove an object's class membership (class: uuid or title; idempotent)")
     .action(async (objectId: string, classRef: string, _options: object, command: Command) => {
       await classMembership(ctxOf(command), objectId, classRef, "unassign");
+    });
+  klass
+    .command("set-extends <class> [parents...]")
+    .description(
+      "replace a class's FULL extends parent set with the given parents (class/parents: uuid or title; repeat parents for several, " +
+        "give none to detach all — unlisted parents detach; requires --yes, previews the resulting parent set without it)",
+    )
+    .option("--yes", "confirm the replacement (the full parent set is replaced)", false)
+    .action(async (classRef: string, parentRefs: string[], options: { yes?: boolean }, command: Command) => {
+      await classSetExtends(ctxOf(command), classRef, parentRefs, options);
     });
   klass
     .command("remap <from> <to>")
