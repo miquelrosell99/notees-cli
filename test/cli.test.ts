@@ -1646,6 +1646,37 @@ describe("shell (scripted mode)", () => {
     expect(io.stderrText).toContain("authentication failed");
     io.stdin = undefined;
   });
+
+  it("pool() runs fn with N workers: per-item results in input order, failures captured not thrown", async () => {
+    const h = harness;
+    const script = `
+      const results = await pool(
+        Array.from({ length: 10 }, (_, i) => i),
+        3,
+        async (item) => {
+          if (item === 4) throw new Error("boom-" + item);
+          return item * 2;
+        },
+      );
+      console.log("ok " + results.filter((r) => r.ok).length + " failed " + results.filter((r) => !r.ok).length);
+      console.log("order " + results.map((r) => r.index).join(","));
+      console.log("failure " + results.find((r) => !r.ok).error);
+      console.log("value " + results[3].value);
+    `;
+    const code = await h.runCliWithStdin(script, "shell");
+    expect(code).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("ok 9 failed 1");
+    expect(h.io.stdoutText).toContain("order 0,1,2,3,4,5,6,7,8,9");
+    expect(h.io.stdoutText).toContain("failure boom-4");
+    expect(h.io.stdoutText).toContain("value 6");
+  });
+
+  it("pool() with a bad concurrency exits 2 (usage)", async () => {
+    const h = harness;
+    const code = await h.runCliWithStdin(`await pool([1], 0, async (x) => x);`, "shell");
+    expect(code).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("concurrency");
+  });
 });
 
 describe("workspace selection (--workspace)", () => {

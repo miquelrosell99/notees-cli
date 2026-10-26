@@ -126,6 +126,17 @@ export interface ShellHelpers {
   ops(): Array<{ opType: string; description: string }>;
   /** One catalog entry (description, example payload, affected-node shape); throws on unknown op types. */
   opHelp(opType: string): { opType: string; description: string; example: Record<string, unknown>; affected: string };
+  /**
+   * Run `fn` over `items` with N workers (concurrency 1–32, validated — bad
+   * args throw a usage error). NEVER throws on item failure: resolves to
+   * per-item results in INPUT ORDER. `fn` may console.log its own JSONL
+   * progress per item — log lines interleave across workers, which is fine.
+   */
+  pool<I, T>(
+    items: I[],
+    concurrency: number,
+    fn: (item: I, index: number) => Promise<T>,
+  ): Promise<Array<{ index: number; item: I; ok: true; value: T } | { index: number; item: I; ok: false; error: string }>>;
 }
 
 const HELP_TEXT = `notees shell helpers (object API, top-level await works; scripts run in a
@@ -159,6 +170,7 @@ giant heredoc):
   submitOps(envelopes)                       submit makeOp-built envelopes via the relay batch endpoint
   ops()                                      the op catalog: opType + one-liner per registered op
   opHelp(opType)                             one op's description, example payload, affected-node shape
+  pool(items, concurrency, fn)               run fn over items with N workers (1-32) -> per-item results in input order; failures are {ok:false,error}, never thrown
 Type .help to see this again, .exit (or Ctrl-D) to quit.`;
 
 function errorMessage(error: unknown): string {
@@ -314,6 +326,36 @@ function buildHelpers(client: ApiClient): ShellHelpers {
     submitOp: async (opType, payload, affectedNodeIds) =>
       submitOps([await makeOp(opType, payload, affectedNodeIds)]),
     submitOps,
+    pool: async (items, concurrency, fn) => {
+      if (!Array.isArray(items)) {
+        throw new CliError(EXIT.usage, "pool: items must be an array");
+      }
+      if (typeof fn !== "function") {
+        throw new CliError(EXIT.usage, "pool: fn must be an async function");
+      }
+      if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32) {
+        throw new CliError(EXIT.usage, "pool: concurrency must be an integer between 1 and 32");
+      }
+      // Worker-pool over a shared cursor; results land by index, so the
+      // resolution order matches the input order regardless of completion
+      // order. Item failures are captured, never thrown.
+      const results = new Array(items.length);
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (cursor < items.length) {
+          const index = cursor;
+          cursor += 1;
+          const item = items[index]!;
+          try {
+            results[index] = { index, item, ok: true as const, value: await fn(item, index) };
+          } catch (error) {
+            results[index] = { index, item, ok: false as const, error: errorMessage(error) };
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+      return results;
+    },
     ops: () => OP_CATALOG.map((entry) => ({ opType: entry.opType, description: entry.description })),
     opHelp: (opType) => {
       const entry = describeOp(opType);
