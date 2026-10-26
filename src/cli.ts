@@ -133,7 +133,8 @@ function requireServer(
 
 /**
  * Credential resolution order: --key > NOTEES_API_KEY > the credential stored
- * by `notees auth login` for this profile+server. No client-side shape check:
+ * by `notees auth login` / `notees auth store` for this profile+server. No
+ * client-side shape check:
  * the server resolves operator keys, user API keys, and session tokens, and
  * answers 401 when invalid — a local regex can only reject valid credentials.
  */
@@ -148,7 +149,7 @@ function resolveKey(
   const stored = serverState(statePath, stateKey).credential;
   if (stored !== undefined && stored.token.length > 0) return { apiKey: stored.token, stored };
   if (allowMissing) return { apiKey: "", stored: undefined };
-  failUsage("credential required: pass --key, set NOTEES_API_KEY, or run `notees auth login` for this server");
+  failUsage("credential required: pass --key, set NOTEES_API_KEY, or run `notees auth login` (or `notees auth store --key`) for this server");
 }
 
 // --- command handlers --------------------------------------------------------
@@ -2606,6 +2607,47 @@ async function authLogin(
   );
 }
 
+/**
+ * `notees auth store` — take an existing user API key (the global --key flag,
+ * or --key-stdin), probe-verify it against the server (a 401 maps to exit 3,
+ * network to 5), then write it per profile+server into the CLI state file
+ * (mode 0600) — the same slot `auth login` writes. Unlike a login-minted key
+ * there is no keyId, so `auth logout` clears it locally but cannot revoke it
+ * server-side. The key is never printed; the machine output carries metadata
+ * only.
+ *
+ * NB: the token comes from the root --key option on purpose — commander
+ * matches options against the whole ancestor chain, so a `--key` after
+ * `auth store` populates the global flag, and defining a second `--key` on
+ * the subcommand would silently shadow it.
+ */
+async function authStore(ctx: CommandContext, options: { keyStdin?: boolean }): Promise<void> {
+  const flagKey = ctx.opts.key;
+  if (flagKey !== undefined && flagKey.length > 0 && options.keyStdin === true) {
+    failUsage("auth store takes either --key or --key-stdin, not both");
+  }
+  let token: string | undefined;
+  if (options.keyStdin === true) token = (await readStdin(ctx.io)).trim();
+  else if (flagKey !== undefined && flagKey.length > 0) token = flagKey;
+  if (token === undefined || token.length === 0) {
+    failUsage("auth store requires a key: --key <credential> or --key-stdin");
+  }
+  await new ApiClient({ server: ctx.client.server, apiKey: token }).getJson("/api/classes");
+  const credential: StoredCredential = {
+    kind: "apiKey",
+    token,
+    createdAt: new Date().toISOString(),
+  };
+  updateServerState(ctx.statePath, ctx.stateKey, (current) => ({ ...current, credential }));
+  const profile = ctx.opts.profile ?? "default";
+  emit(
+    ctx,
+    `stored API key for ${ctx.client.server} (profile ${profile}) — verified against the server; ` +
+      "`notees auth logout` clears it locally (server-side revocation only for CLI-minted keys)\n",
+    { stored: true, server: ctx.client.server, profile, kind: credential.kind, createdAt: credential.createdAt },
+  );
+}
+
 /** `notees auth logout` — revoke the stored key server-side, then clear it. */
 async function authLogout(ctx: CommandContext): Promise<void> {
   const stored = serverState(ctx.statePath, ctx.stateKey).credential;
@@ -3098,6 +3140,16 @@ function buildProgram(): Command {
     .option("--password-stdin", "read the password from stdin", false)
     .action(async (options: { email?: string; password?: string; passwordStdin?: boolean }, command: Command) => {
       await authLogin(ctxOf(command, { allowMissingKey: true }), options);
+    });
+  auth
+    .command("store")
+    .description(
+      "verify and store an existing API key as the standing credential (pass it with the global --key flag, or use " +
+        "--key-stdin); `auth logout` clears it locally (server-side revocation only for CLI-minted keys)",
+    )
+    .option("--key-stdin", "read the key from stdin (mutually exclusive with the global --key flag)", false)
+    .action(async (options: { keyStdin?: boolean }, command: Command) => {
+      await authStore(ctxOf(command, { allowMissingKey: true }), options);
     });
   auth
     .command("logout")
