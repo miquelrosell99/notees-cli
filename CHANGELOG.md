@@ -6,6 +6,17 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-26
+
+- **feat(property): `notees property get` resolves eligible classes client-side.** The schema dump now carries an `eligibleClasses` section: `null` for global schemas (every node), otherwise every class whose transitive extends-closure intersects `scopeClassIds`, each with a `via` chain — the shortest parent-chain from the class up to a scoped class as readable names, or `["(scoped directly)"]` when the class itself is in scope. `--json` keeps `{propertySchema}` and adds the same field (additive-only). The human output stays the pretty-printed schema JSON, now with the section inline.
+  - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new e2e (seeded `citekey` scoped to Source: Document listed with a via chain through Source, Person absent).
+
+- **feat(class): `notees class list --tree` renders the extends hierarchy.** Default flat table unchanged. With `--tree`: roots are parentless classes (sorted by name), children indented two spaces per level and sorted by name, `name (members)` lines; a class extending multiple parents renders under each parent with an `[also under: <names>]` tag; cycles on the current path render `(cycle)` and stop. `--json` keeps the flat `classes` body and adds a nested `tree` field (`{id, name, memberCount, children}`).
+  - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new e2e (seeded Document renders indented under Source; a user class with two parents renders under each with the `also under` tag; `--json` carries both `classes` and `tree`).
+
+- **fix(shell): `update(id, fields)` accepts `name` (title-is-content).** The raw PATCH passthrough sent `{name}` verbatim and the server rejected it ("Unrecognized key(s)"); the helper now mirrors `object update --name`: `name` becomes `contentAst: [{type:"text",text: name}]`, and combining `name` with `contentAst` in one call fails loud as a usage error (exit 2 — `runScript` now preserves a helper-thrown `CliError`'s exit code instead of flattening every script failure to exit 1). HELP_TEXT and the interface doc state the shorthand.
+  - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new e2e (scripted rename via `update(id, {name})`; `name` + `contentAst` together exits 2).
+
 ## 2026-10-23
 
 - **feat(object): `notees object move <id> --parent <id> [--after <id> | --before <id>]` — the missing placement command.** Moves a node under a new parent with optional sibling anchoring. Placement is log-only state with no REST surface: the write rides the `object.move` op through the relay batch endpoint (the one write path), same envelope discipline as the class-remap path (HLC clock, actor derived from the credential). MoveGuard invariants apply server-side (no standalone child under a non-page parent; no demoting a page with standalone children). Usage errors (missing `--parent`, `--after` with `--before`) exit 2. Prints the moved id; `--json` adds `{moved, parent, object}`.
