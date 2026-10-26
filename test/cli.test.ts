@@ -1383,20 +1383,40 @@ describe("search (query language)", () => {
 });
 
 describe("daily notes", () => {
-  it("today ensures the local date chain + day page; --append blocks; journal lists newest first", async () => {
+  it("today ensures the local date chain + day page; --append blocks and reports the created block id; journal lists newest first", async () => {
     const h = harness;
     expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
     const day = JSON.parse(h.io.stdoutText) as { id: string; classIds: string[]; parentId: string | null };
     expect(day.classIds).toContain(SYSTEM_CLASS_UUIDS.day);
-    const created = JSON.parse(h.io.stdoutText) as { createdAt: string | null };
 
-    // Append a block; the day object carries it as a child.
+    // Append a block (human mode): the summary line names the created block.
     expect(await h.runCli("today", "--append", "captured from the CLI")).toBe(EXIT.ok);
+    const humanMatch = h.io.stdoutText.match(/appended block ([0-9a-f-]{36}) to /);
+    expect(humanMatch).not.toBeNull();
+    const humanBlockId = humanMatch![1]!;
+
+    // Append a block (--json mode): the day-page fields are unchanged and
+    // the new `appendedBlock` field carries the created block's id.
+    expect(await h.runCli("--json", "today", "--append", "second capture")).toBe(EXIT.ok);
+    const appended = JSON.parse(h.io.stdoutText) as {
+      id: string;
+      classIds: string[];
+      appendedBlock: { id: string };
+    };
+    expect(appended.id).toBe(day.id);
+    expect(appended.classIds).toContain(SYSTEM_CLASS_UUIDS.day);
+    expect(appended.appendedBlock.id).toMatch(/^[0-9a-f-]{36}$/);
+    const jsonBlockId = appended.appendedBlock.id;
+    expect(jsonBlockId).not.toBe(humanBlockId);
+
+    // The day object carries both appended blocks as children.
     expect(await h.runCli("--json", "object", "children", day.id)).toBe(EXIT.ok);
     const children = JSON.parse(h.io.stdoutText) as { children: Array<{ id: string }> };
-    expect(children.children.length).toBe(1);
+    expect(children.children.map((c) => c.id)).toEqual(
+      expect.arrayContaining([humanBlockId, jsonBlockId]),
+    );
 
-    // Idempotent: a second today returns the same day id.
+    // Idempotent: a second append-less today returns the same day id.
     expect(await h.runCli("--json", "today")).toBe(EXIT.ok);
     expect((JSON.parse(h.io.stdoutText) as { id: string }).id).toBe(day.id);
 
@@ -1404,7 +1424,6 @@ describe("daily notes", () => {
     expect(await h.runCli("--json", "journal")).toBe(EXIT.ok);
     const journal = JSON.parse(h.io.stdoutText) as { days: Array<{ id: string }> };
     expect(journal.days.map((d) => d.id)).toContain(day.id);
-    void created;
   });
 });
 

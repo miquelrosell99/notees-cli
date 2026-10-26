@@ -75,6 +75,18 @@ history.
     no vitest case added — the suite covers the TS CLI only and has no
     shell-level harness.
   - **Files**: `scripts/install.sh`, `README.md` (Installing section).
+- **feat(today): `notees today --append` reports the created block id.** The
+  append used to print the day page object alone — same `updatedAt`, no
+  children in the output — so a script had no confirmation of the write and no
+  id to reference (verifying took a second `notees object children` call).
+  The created block's id is now threaded through: human mode prints
+  `appended block <id> to <day name>`, and `--json` gains an `appendedBlock:
+  { id }` field alongside the unchanged day-page fields (additive-only per
+  the `--json` contract; no append leaves the output byte-identical to
+  before). Help text for `--append` updated in the same pass.
+  - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the
+    extended `daily notes` e2e asserting the `appendedBlock.id` matches the
+    block listed under the day page and the human summary line names the id.
 
 ## 2026-10-23
 
