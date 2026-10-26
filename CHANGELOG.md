@@ -8,6 +8,9 @@ history.
 
 ## 2026-10-26
 
+- **chore(release): v4.5.2 — the merged PR queue: `auth store`, per-profile `config` defaults, `today --append` block id, Windows shim.** Rides the 4.5.x train (server 4.5.0): `notees auth store --key|--key-stdin` persists an existing API key (probe-verified; logout clears locally only for non-CLI-minted keys — PR #8 / issue #1); `notees config set|get|list` stores a per-profile default server/workspace with resolution flag > env > stored (PR #7 / issue #2); `notees today --append` reports the created block id (PR #6 / issue #4); `install.sh` emits a `notees.cmd` shim on Windows (PR #5 / issue #3).
+  - **Verification**: `pnpm typecheck && pnpm test && pnpm build` — all green (113/113); bundle sha256 `a874279e…` recorded in the PKGBUILD.
+
 - **chore(release): v4.5.1 — vendor re-pin (source roster, dual-track authorship) and the day's commands.** Rides the 4.5.x train (server 4.5.0): `import` adopts `@citekey`-titled nodes and gains `csl-json`/`zotero-rdf` formats with `--dry-run`/`--no-create`; `class list --tree`; `property get` resolves eligible classes; `shell` gains `update(id,{name})` semantics, exit-code preservation, and the `pool()` worker pool; vendored main at `a216b07db` (the `name:` query arm arrives for the next train).
   - **Verification**: `pnpm typecheck && pnpm test && pnpm build` — all green (104/104); bundle sha256 `5a2d1d9a…` recorded in the PKGBUILD.
 
