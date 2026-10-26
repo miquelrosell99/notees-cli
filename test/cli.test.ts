@@ -1895,6 +1895,134 @@ describe("auth (stored credentials)", () => {
   });
 });
 
+describe("config (per-profile defaults)", () => {
+  // Every test here uses its own state file: a stored default server/workspace
+  // must not leak into the shared harness state (other tests assert the
+  // no-server usage error against a blank environment).
+  async function withFreshStateFile(fn: (stateFile: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "notees-cli-config-test-"));
+    const stateFile = join(dir, "state.json");
+    const saved = process.env.NOTEES_STATE_FILE;
+    process.env.NOTEES_STATE_FILE = stateFile;
+    try {
+      await fn(stateFile);
+    } finally {
+      if (saved === undefined) delete process.env.NOTEES_STATE_FILE;
+      else process.env.NOTEES_STATE_FILE = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("config set/get/list round-trip through the state file (no server needed)", async () => {
+    await withFreshStateFile(async (stateFile) => {
+      const setIo = new Capture();
+      expect(await run(["config", "set", "server", "https://notees.example.test"], setIo)).toBe(EXIT.ok);
+      expect(setIo.stdoutText).toContain("server default set to https://notees.example.test (profile default)");
+      expect(await run(["config", "set", "workspace", "main"], new Capture())).toBe(EXIT.ok);
+
+      const getIo = new Capture();
+      expect(await run(["--json", "config", "get", "server"], getIo)).toBe(EXIT.ok);
+      expect(JSON.parse(getIo.stdoutText)).toMatchObject({
+        key: "server",
+        value: "https://notees.example.test",
+        profile: "default",
+      });
+
+      const listIo = new Capture();
+      expect(await run(["--json", "config", "list"], listIo)).toBe(EXIT.ok);
+      expect(JSON.parse(listIo.stdoutText)).toMatchObject({
+        profile: "default",
+        server: "https://notees.example.test",
+        workspace: "main",
+      });
+
+      // On disk: a top-level `profiles` record keyed by profile name (the
+      // server default cannot live under `servers`, which is keyed profile:server).
+      const state = JSON.parse(readFileSync(stateFile, "utf8")) as {
+        profiles: Record<string, { server?: string; workspace?: string }>;
+      };
+      expect(state.profiles.default?.server).toBe("https://notees.example.test");
+      expect(state.profiles.default?.workspace).toBe("main");
+    });
+  });
+
+  it("config get/list on a fresh state file report unset values (exit 0); unknown keys exit 2", async () => {
+    await withFreshStateFile(async () => {
+      const getIo = new Capture();
+      expect(await run(["--json", "config", "get", "server"], getIo)).toBe(EXIT.ok);
+      expect(JSON.parse(getIo.stdoutText)).toMatchObject({ key: "server", value: null });
+      expect(getIo.stdoutText).not.toContain("https://");
+
+      const listIo = new Capture();
+      expect(await run(["--json", "config", "list"], listIo)).toBe(EXIT.ok);
+      expect(JSON.parse(listIo.stdoutText)).toMatchObject({ server: null, workspace: null });
+
+      const badIo = new Capture();
+      expect(await run(["config", "get", "bogus"], badIo)).toBe(EXIT.usage);
+      expect(badIo.stderrText).toContain("unknown config key bogus");
+      const badSetIo = new Capture();
+      expect(await run(["config", "set", "bogus", "x"], badSetIo)).toBe(EXIT.usage);
+    });
+  });
+
+  it("stored default server is picked up with no --server and no env", async () => {
+    await withFreshStateFile(async () => {
+      const h = harness;
+      expect(await run(["config", "set", "server", h.baseUrl], new Capture())).toBe(EXIT.ok);
+      // Bare `notees object list` — no flag, no env (beforeAll blanked them): the
+      // stored default carries it.
+      const io = new Capture();
+      expect(await run(["--key", API_KEY, "--json", "object", "list"], io)).toBe(EXIT.ok);
+    });
+  });
+
+  it("flag and env still beat the stored default server", async () => {
+    await withFreshStateFile(async () => {
+      const h = harness;
+      const unreachable = "http://127.0.0.1:1";
+      expect(await run(["config", "set", "server", unreachable], new Capture())).toBe(EXIT.ok);
+
+      // flag > stored
+      expect(await run(["--server", h.baseUrl, "--key", API_KEY, "doctor"], new Capture())).toBe(EXIT.ok);
+      // env > stored
+      process.env.NOTEES_SERVER = h.baseUrl;
+      try {
+        expect(await run(["--key", API_KEY, "doctor"], new Capture())).toBe(EXIT.ok);
+        // flag > env
+        process.env.NOTEES_SERVER = unreachable;
+        expect(await run(["--server", h.baseUrl, "--key", API_KEY, "doctor"], new Capture())).toBe(EXIT.ok);
+      } finally {
+        delete process.env.NOTEES_SERVER;
+      }
+    });
+  });
+
+  it("stored default workspace applies when --workspace and NOTEES_WORKSPACE are absent", async () => {
+    await withFreshStateFile(async () => {
+      const h = harness;
+      const defaultWsId = defaultWorkspaceId();
+      expect(await run(["config", "set", "server", h.baseUrl], new Capture())).toBe(EXIT.ok);
+      expect(await run(["config", "set", "workspace", "whatever"], new Capture())).toBe(EXIT.ok);
+      // An operator key can only take a workspace id, not a name — so this fails
+      // with "needs an account credential" only if the stored default was applied.
+      const io = new Capture();
+      expect(await run(["--key", API_KEY, "object", "list"], io)).toBe(EXIT.usage);
+      expect(io.stderrText).toContain("needs an account credential");
+      // flag > stored: an explicit id works.
+      expect(await run(["--workspace", defaultWsId, "--key", API_KEY, "object", "list"], new Capture())).toBe(
+        EXIT.ok,
+      );
+      // env > stored
+      process.env.NOTEES_WORKSPACE = defaultWsId;
+      try {
+        expect(await run(["--key", API_KEY, "object", "list"], new Capture())).toBe(EXIT.ok);
+      } finally {
+        delete process.env.NOTEES_WORKSPACE;
+      }
+    });
+  });
+});
+
 describe("tabular human output", () => {
   it("class list and object list render compact tables in human mode", async () => {
     const h = harness;
