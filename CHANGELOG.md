@@ -8,6 +8,9 @@ history.
 
 ## 2026-10-26
 
+- **chore(release): v4.5.1 — vendor re-pin (source roster, dual-track authorship) and the day's commands.** Rides the 4.5.x train (server 4.5.0): `import` adopts `@citekey`-titled nodes and gains `csl-json`/`zotero-rdf` formats with `--dry-run`/`--no-create`; `class list --tree`; `property get` resolves eligible classes; `shell` gains `update(id,{name})` semantics, exit-code preservation, and the `pool()` worker pool; vendored main at `a216b07db` (the `name:` query arm arrives for the next train).
+  - **Verification**: `pnpm typecheck && pnpm test && pnpm build` — all green (104/104); bundle sha256 `5a2d1d9a…` recorded in the PKGBUILD.
+
 - **chore(vendor): vendor pin re-pointed at main `1423ce2c2 → a216b07db` — the
   source-library roster, the dual-track authorship contract, and the mention
   customLabel ruling.** A large jump (487 files in main across several
