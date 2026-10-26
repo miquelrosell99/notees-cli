@@ -36,6 +36,19 @@ If you cloned without `--recurse-submodules`:
 git submodule update --init
 ```
 
+## Configuration
+
+Resolution order for both the server URL and the workspace is: flag (`--server` / `--workspace`) > environment (`NOTEES_SERVER` / `NOTEES_WORKSPACE`) > the stored per-profile default. Persist the defaults once and bare `notees <cmd>` works without any env plumbing:
+
+```bash
+notees config set server https://<host>     # stored default server (per --profile)
+notees config set workspace <name|id>       # stored default workspace
+notees config get server                    # print one stored default
+notees config list                          # print both
+```
+
+The defaults live in the CLI state file (`~/.notees/state.json`, mode 0600) under a top-level per-profile record — separate from the `servers` map, which is keyed `profile:server`. `notees config` itself needs no server, credential, or env: it only touches the local state file.
+
 ## Installing
 
 Every `v*` tag carries a prebuilt bundle (`cli.mjs`, ESM with a `node` shebang, sha256 sidecar) on its GitHub Release, built by `.github/workflows/release.yml`. The install script fetches it, verifies the checksum, and links `notees` into `~/.local/bin` (override with `NOTEES_INSTALL_DIR`):
