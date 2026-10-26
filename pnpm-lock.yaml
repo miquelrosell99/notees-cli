@@ -23,6 +23,9 @@ importers:
       commander:
         specifier: ^12.1.0
         version: 12.1.0
+      sax:
+        specifier: ^1.6.1
+        version: 1.6.1
     devDependencies:
       '@notees/server':
         specifier: workspace:*
@@ -30,6 +33,9 @@ importers:
       '@types/node':
         specifier: ^20.14.0
         version: 20.19.43
+      '@types/sax':
+        specifier: ^1.2.7
+        version: 1.2.7
       tsup:
         specifier: ^8.3.0
         version: 8.5.1(postcss@8.5.28)(tsx@4.23.15)(typescript@5.9.3)
@@ -906,6 +912,9 @@ packages:
 
   '@types/node@26.6.4':
     resolution: {integrity: sha512-ldVPDCzj7fsaGZrLB0NuHuTvJcsNasysBAqMolr/cgxrLd1xbqxIr3XJiPnHHJUCxj5sNF1vnRj9aWnrVh5Jcg==}
+
+  '@types/sax@1.2.7':
+    resolution: {integrity: sha512-rO73L89PJxeYM3s3pPPjiPgVVcymqU490g0YO5n5By0k2Erzj6tay/4lr1CHAAU4JyOWd1rpQ8bCf6cZfHU96A==}
 
   '@types/sql.js@1.4.11':
     resolution: {integrity: sha512-QXIx38p2ZThJaK9vP5ZdqdlRe1FG9I8SmCZOS7FHfB/2qPAjZwkL7/vlfPg6N/oWHuuOaGg/P/IRwfP2W0kWVQ==}
@@ -2056,6 +2065,10 @@ snapshots:
   '@types/node@26.6.4':
     dependencies:
       undici-types: 8.9.0
+
+  '@types/sax@1.2.7':
+    dependencies:
+      '@types/node': 20.19.43
 
   '@types/sql.js@1.4.11':
     dependencies:
