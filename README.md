@@ -56,6 +56,8 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 - `notees auth store --key <credential>` (or `--key-stdin`) — probe-verify an existing API key against the server, then store it as the standing credential. Stored keys are not CLI-minted, so `auth logout` clears them locally only — server-side revocation applies to login-minted keys.
 - `notees auth status` / `notees auth logout` — probe / clear the stored credential.
 
+`notees doctor` exercises the same resolution chain: it resolves server, workspace, and credential flag > env > stored (a stored credential counts, and the `authentication:` probe sends it), reports every check as ok/FAIL — failing checks report FAILs, not a bare usage error — and exits non-zero when any check fails.
+
 ## Installing
 
 Every `v*` tag carries a prebuilt bundle (`cli.mjs`, ESM with a `node` shebang, sha256 sidecar) on its GitHub Release, built by `.github/workflows/release.yml`. The install script fetches it, verifies the checksum, and links `notees` into `~/.local/bin` (override with `NOTEES_INSTALL_DIR`):

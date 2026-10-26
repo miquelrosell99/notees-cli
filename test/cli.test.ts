@@ -30,6 +30,7 @@ import { run, type CliIo } from "../src/cli.js";
 import { ApiClient } from "../src/client.js";
 import { EXIT } from "../src/exit-codes.js";
 import { buildMarkdownBundle } from "../src/markdown-export.js";
+import { updateServerState } from "../src/state.js";
 
 const API_KEY = `nk_${"c".repeat(32)}`;
 type App = Awaited<ReturnType<typeof buildServer>>["app"];
@@ -161,6 +162,23 @@ afterAll(async () => {
     else process.env[name] = savedEnv[name];
   }
 });
+
+// A test-private state file: stored defaults/credentials must not leak into
+// the shared harness state (other tests assert the no-server usage error
+// against a blank environment).
+async function withFreshStateFile(fn: (stateFile: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "notees-cli-config-test-"));
+  const stateFile = join(dir, "state.json");
+  const saved = process.env.NOTEES_STATE_FILE;
+  process.env.NOTEES_STATE_FILE = stateFile;
+  try {
+    await fn(stateFile);
+  } finally {
+    if (saved === undefined) delete process.env.NOTEES_STATE_FILE;
+    else process.env.NOTEES_STATE_FILE = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 describe("object lifecycle (json mode)", () => {
   it("create → get → list → search → update → delete", async () => {
@@ -1894,23 +1912,6 @@ describe("auth (stored credentials)", () => {
 });
 
 describe("config (per-profile defaults)", () => {
-  // Every test here uses its own state file: a stored default server/workspace
-  // must not leak into the shared harness state (other tests assert the
-  // no-server usage error against a blank environment).
-  async function withFreshStateFile(fn: (stateFile: string) => Promise<void>): Promise<void> {
-    const dir = mkdtempSync(join(tmpdir(), "notees-cli-config-test-"));
-    const stateFile = join(dir, "state.json");
-    const saved = process.env.NOTEES_STATE_FILE;
-    process.env.NOTEES_STATE_FILE = stateFile;
-    try {
-      await fn(stateFile);
-    } finally {
-      if (saved === undefined) delete process.env.NOTEES_STATE_FILE;
-      else process.env.NOTEES_STATE_FILE = saved;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }
-
   it("config set/get/list round-trip through the state file (no server needed)", async () => {
     await withFreshStateFile(async (stateFile) => {
       const setIo = new Capture();
@@ -2017,6 +2018,68 @@ describe("config (per-profile defaults)", () => {
       } finally {
         delete process.env.NOTEES_WORKSPACE;
       }
+    });
+  });
+});
+
+describe("doctor honors stored config and the stored credential", () => {
+  it("reads all-ok on a fully stored setup with a scrubbed env (no flags, no NOTEES_* vars)", async () => {
+    await withFreshStateFile(async () => {
+      const h = harness;
+      expect(await run(["config", "set", "server", h.baseUrl], new Capture())).toBe(EXIT.ok);
+      expect(await run(["config", "set", "workspace", defaultWorkspaceId()], new Capture())).toBe(EXIT.ok);
+      // `auth store` resolves the server from the stored default (no --server).
+      expect(await run(["--key", API_KEY, "auth", "store"], new Capture())).toBe(EXIT.ok);
+
+      const io = new Capture();
+      expect(await run(["doctor"], io)).toBe(EXIT.ok);
+      expect(io.stdoutText).toContain("ok  server configured");
+      expect(io.stdoutText).toContain("ok  credential configured: present (stored)");
+      expect(io.stdoutText).toContain("ok  server reachable");
+      expect(io.stdoutText).toContain("ok  authentication");
+
+      // --json keeps the additive-only { ok, checks } shape.
+      const jsonIo = new Capture();
+      expect(await run(["--json", "doctor"], jsonIo)).toBe(EXIT.ok);
+      const report = JSON.parse(jsonIo.stdoutText) as { ok: boolean; checks: { check: string; ok: boolean }[] };
+      expect(report.ok).toBe(true);
+      expect(report.checks.length).toBeGreaterThanOrEqual(5);
+      expect(report.checks.every((c) => c.ok)).toBe(true);
+    });
+  });
+
+  it("still FAILs when nothing is stored and the env is blank — with hints at the stored sources", async () => {
+    await withFreshStateFile(async () => {
+      const io = new Capture();
+      expect(await run(["doctor"], io)).toBe(EXIT.usage);
+      expect(io.stdoutText).toContain("FAIL  server configured");
+      expect(io.stdoutText).toContain("FAIL  credential configured");
+      expect(io.stdoutText).toContain("notees config set server");
+      expect(io.stdoutText).toContain("notees auth store");
+      // No probes ran — there is no server to reach.
+      expect(io.stdoutText).not.toContain("server reachable");
+    });
+  });
+
+  it("the authentication check exercises the stored credential (server by flag, credential by store)", async () => {
+    await withFreshStateFile(async (stateFile) => {
+      const h = harness;
+      expect(await run(["--server", h.baseUrl, "--key", API_KEY, "auth", "store"], new Capture())).toBe(EXIT.ok);
+
+      // --server only: the credential resolves from the store, and the probe uses it.
+      const io = new Capture();
+      expect(await run(["--server", h.baseUrl, "doctor"], io)).toBe(EXIT.ok);
+      expect(io.stdoutText).toContain("ok  credential configured: present (stored)");
+      expect(io.stdoutText).toContain("ok  authentication: credential accepted");
+
+      // A stored credential that the server rejects fails authentication (exit 3)…
+      updateServerState(stateFile, `default:${h.baseUrl}`, (current) => ({
+        ...current,
+        credential: { kind: "apiKey", token: `nk_${"y".repeat(32)}`, createdAt: new Date().toISOString() },
+      }));
+      const badIo = new Capture();
+      expect(await run(["--server", h.baseUrl, "doctor"], badIo)).toBe(EXIT.auth);
+      expect(badIo.stdoutText).toContain("FAIL  authentication");
     });
   });
 });

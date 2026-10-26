@@ -114,15 +114,25 @@ function failUsage(message: string): never {
 /**
  * Server/workspace resolution order: flag (`--server` / `--workspace`) >
  * env (`NOTEES_SERVER` / `NOTEES_WORKSPACE`) > the stored per-profile
- * defaults from `notees config set` (server: and workspace:).
+ * defaults from `notees config set` (server: and workspace:). Non-throwing —
+ * `requireServer` fails usage on the missing case, `doctor` reports it as a
+ * failing check instead.
  */
+function resolveServer(
+  opts: GlobalOptions,
+  statePath: string,
+): { server: string | undefined; workspace: string | undefined } {
+  const defaults = profileDefaults(statePath, opts.profile ?? "default");
+  const server = opts.server ?? process.env.NOTEES_SERVER ?? defaults.server;
+  const workspace = opts.workspace ?? process.env.NOTEES_WORKSPACE ?? defaults.workspace;
+  return { server, workspace };
+}
+
 function requireServer(
   opts: GlobalOptions,
   statePath: string,
 ): { server: string; workspace: string | undefined } {
-  const defaults = profileDefaults(statePath, opts.profile ?? "default");
-  const server = opts.server ?? process.env.NOTEES_SERVER ?? defaults.server;
-  const workspace = opts.workspace ?? process.env.NOTEES_WORKSPACE ?? defaults.workspace;
+  const { server, workspace } = resolveServer(opts, statePath);
   if (server === undefined || server.length === 0) {
     failUsage(
       "server URL required: pass --server <url>, set NOTEES_SERVER, or run `notees config set server <url>`",
@@ -1261,7 +1271,25 @@ function isVersionAhead(server: string, cli: string): boolean {
   return sMajor > cMajor || (sMajor === cMajor && sMinor > cMinor);
 }
 
-async function doctor(ctx: CommandContext): Promise<void> {
+/**
+ * `notees doctor` — auth + reachability + version probe. Unlike other
+ * commands it must run (and report FAILs) with nothing configured, so it
+ * cannot take the throwing `ctxOf` path. It resolves through the same
+ * helpers instead: `resolveServer` (the exact precedence `ctxOf` uses, stored
+ * defaults included) and `resolveKey` with the same `${profile}:${server}`
+ * state key the command-context builder derives — so a fully stored setup
+ * reads all-ok and the probe exercises the stored credential.
+ */
+async function doctor(command: Command): Promise<void> {
+  const root = rootOf(command);
+  const opts = root.opts<GlobalOptions>();
+  const io = (root.getOptionValue("__io") as CliIo | undefined) ?? defaultIo;
+  const json = opts.json === true;
+  const emitDoctor = (human: string, machine: unknown) => {
+    if (json) io.stdout.write(`${JSON.stringify(machine, null, 2)}\n`);
+    else io.stdout.write(human);
+  };
+
   const report: { check: string; ok: boolean; detail: string }[] = [];
   let worst: number = EXIT.ok;
 
@@ -1270,14 +1298,48 @@ async function doctor(ctx: CommandContext): Promise<void> {
     if (!ok && code > worst) worst = code;
   };
 
-  const server = ctx.opts.server ?? process.env.NOTEES_SERVER;
-  const apiKey = ctx.opts.key ?? process.env.NOTEES_API_KEY;
-  push("server configured", server !== undefined && server.length > 0, server ?? "missing (--server or NOTEES_SERVER)", EXIT.usage);
-  push("credential configured", apiKey !== undefined && apiKey.length > 0, apiKey !== undefined ? "present" : "missing (--key or NOTEES_API_KEY)", EXIT.usage);
+  const statePath = defaultStatePath();
+  const profile = opts.profile ?? "default";
+  const { server, workspace } = resolveServer(opts, statePath);
+  const serverOk = server !== undefined && server.length > 0;
+  // Same state-key shape as ctxOf — the stored server default is part of the
+  // key, so the credential lookup lands on the right per-server slot.
+  const stateKey = `${profile}:${server ?? ""}`;
+  const { apiKey, stored } = serverOk ? resolveKey(opts, statePath, stateKey, true) : { apiKey: "", stored: undefined };
+  const client =
+    serverOk && server !== undefined
+      ? new ApiClient({
+          server,
+          apiKey,
+          // exactOptionalPropertyTypes: omit rather than assign undefined.
+          ...(workspace !== undefined ? { workspace } : {}),
+          statePath,
+          stateKey,
+        })
+      : undefined;
 
-  if (server !== undefined && server.length > 0) {
+  push(
+    "server configured",
+    serverOk,
+    serverOk && server !== undefined
+      ? server
+      : "missing (--server, NOTEES_SERVER, or `notees config set server <url>`)",
+    EXIT.usage,
+  );
+  push(
+    "credential configured",
+    apiKey.length > 0,
+    apiKey.length > 0
+      ? stored !== undefined
+        ? "present (stored)"
+        : "present"
+      : "missing (--key, NOTEES_API_KEY, or `notees auth login` / `notees auth store --key`)",
+    EXIT.usage,
+  );
+
+  if (client !== undefined) {
     try {
-      const version = await ctx.client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/version");
+      const version = await client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/version");
       push("server reachable", true, `${version.name} ${version.version} (protocol v${version.protocolVersion})`, EXIT.ok);
       push(
         "cli/server version drift",
@@ -1294,12 +1356,13 @@ async function doctor(ctx: CommandContext): Promise<void> {
         push("server reachable", false, String(error), EXIT.network);
       }
     }
-    if (apiKey !== undefined && apiKey.length > 0) {
-      // The probe sends the credential verbatim — the server resolves
-      // operator key, user API key, and session tokens alike.
+    if (apiKey.length > 0) {
+      // The probe sends the resolved credential (flag, env, or stored)
+      // verbatim — the server resolves operator key, user API key, and
+      // session tokens alike.
       try {
-        const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-        await ctx.client.getJson<unknown>(`/api/relay/v2/stats?workspaceId=${workspaceId}`);
+        const workspaceId = (await client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+        await client.getJson<unknown>(`/api/relay/v2/stats?workspaceId=${workspaceId}`);
         push("authentication", true, "credential accepted", EXIT.ok);
       } catch (error) {
         if (error instanceof CliError) {
@@ -1312,7 +1375,7 @@ async function doctor(ctx: CommandContext): Promise<void> {
   }
 
   const lines = report.map((entry) => `${entry.ok ? "ok" : "FAIL"}  ${entry.check}: ${entry.detail}`);
-  emit(ctx, `${lines.join("\n")}\n`, { ok: worst === EXIT.ok, checks: report });
+  emitDoctor(`${lines.join("\n")}\n`, { ok: worst === EXIT.ok, checks: report });
   if (worst !== EXIT.ok) {
     throw new CliError(worst as 0 | 1 | 2 | 3 | 4 | 5, `doctor found failing checks (exit ${worst})`, { report });
   }
@@ -3226,9 +3289,11 @@ function buildProgram(): Command {
 
   program
     .command("doctor")
-    .description("auth + reachability + version probe")
+    .description(
+      "auth + reachability + version probe (server/workspace/credential resolved flag > env > stored config; reports FAILs instead of usage errors)",
+    )
     .action(async (_options: object, command: Command) => {
-      await doctor(ctxOf(command));
+      await doctor(command);
     });
 
   program
