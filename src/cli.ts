@@ -63,6 +63,7 @@ import {
   makeObjectResolver,
 } from "./markdown-export.js";
 import { buildJsonArchiveDocument } from "./json-export.js";
+import { runLogseqDbImport } from "./import-logseq-db.js";
 import { runShell } from "./shell.js";
 import { defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, queryString, readStdin } from "./util.js";
@@ -2255,6 +2256,41 @@ async function importZoteroRdf(ctx: CommandContext, filePath: string, options: S
 }
 
 /**
+ * `notees import logseq-db <file.sqlite>` — the Logseq DB drift reconcile
+ * (decode → plan → report; dry-run by default, `--write`/`--yes` applies).
+ * The planner/executor lives in import-logseq-db.ts; this is the thin ctx
+ * adapter, mirroring how the other import handlers delegate.
+ */
+async function importLogseqDb(
+  ctx: CommandContext,
+  filePath: string,
+  options: {
+    strategy?: string;
+    restoreDiffs?: boolean;
+    write?: boolean;
+    yes?: boolean;
+    dryRun?: boolean;
+  },
+): Promise<void> {
+  if (options.dryRun === true && (options.write === true || options.yes === true)) {
+    failUsage("--dry-run and --write/--yes are mutually exclusive (dry-run is the default)");
+  }
+  const strategy = options.strategy ?? "notees-wins";
+  if (strategy !== "notees-wins" && strategy !== "newer-wins") {
+    failUsage(`--strategy must be notees-wins or newer-wins (got ${JSON.stringify(strategy)})`);
+  }
+  await runLogseqDbImport({
+    client: ctx.client,
+    io: ctx.io,
+    json: ctx.opts.json === true,
+    file: filePath,
+    write: options.write === true || options.yes === true,
+    strategy,
+    restoreDiffs: options.restoreDiffs === true,
+  });
+}
+
+/**
  * The shared source-import pipeline: schema ensure → authors find-or-create →
  * source upsert/adopt → field writes. All three formats feed it as CslItem[].
  *
@@ -3673,6 +3709,31 @@ function buildProgram(): Command {
     .description("import a Zotero RDF export (bib:* entries; unkeyed top-level items are skipped)")
     .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
       await importZoteroRdf(ctxOf(command), filePath, options);
+    });
+  importCmd
+    .command("logseq-db <file>")
+    .description(
+      "import a Logseq DB (.sqlite) export — decode the kvs transit store, plan the drift reconcile " +
+        "(missing-node creates with preserved uuids, property fills, title conflicts), and report; " +
+        "dry-run is the default: nothing is written without --write/--yes",
+    )
+    .addOption(
+      new Option("--strategy <mode>", "title conflicts: notees-wins keeps Notees titles, never writing them (default); newer-wins writes the Logseq title only when its :block/updated-at is strictly newer than the Notees updatedAt")
+        .choices(["notees-wins", "newer-wins"])
+        .default("notees-wins"),
+    )
+    .option("--restore-diffs", "also restore differing property values from Logseq (default: fill missing values only — restores clobber Notees values)", false)
+    .option("--write", "apply the plan (default is a dry run that prints the full report and writes nothing)", false)
+    .option("--yes", "alias for --write (the destructive-confirm convention)", false)
+    .option("--dry-run", "plan only, write nothing — the default; mutually exclusive with --write/--yes", false)
+    .action(async (filePath: string, options: {
+      strategy?: string;
+      restoreDiffs?: boolean;
+      write?: boolean;
+      yes?: boolean;
+      dryRun?: boolean;
+    }, command: Command) => {
+      await importLogseqDb(ctxOf(command), filePath, options);
     });
 
   return program;
