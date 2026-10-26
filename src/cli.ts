@@ -2357,7 +2357,8 @@ async function ensureYearNode(ctx: CommandContext, yearId: string, label: string
 }
 
 /** `notees today`: ensure the local date chain + the day page,
- *  print the day object; --append adds a text block to it. */
+ *  print the day object; --append adds a text block to it and reports
+ *  the created block's id (human line / `appendedBlock` in --json). */
 async function today(ctx: CommandContext, options: { append?: string }): Promise<void> {
   const iso = todayIsoLocal();
   const parts = parseIsoDate(iso);
@@ -2365,14 +2366,24 @@ async function today(ctx: CommandContext, options: { append?: string }): Promise
   await ensureChainNode(ctx, ids.year, dateNodeLabel(parts, "year"), SYSTEM_CLASS_UUIDS.year, null);
   await ensureChainNode(ctx, ids.month, dateNodeLabel(parts, "month"), SYSTEM_CLASS_UUIDS.month, ids.year);
   await ensureChainNode(ctx, ids.day, dateNodeLabel(parts, "day"), SYSTEM_CLASS_UUIDS.day, ids.month);
+  let appendedBlock: { id: string } | undefined;
   if (options.append !== undefined && options.append.trim() !== "") {
-    await ctx.client.postJson("/api/objects", {
+    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
       parentId: ids.day,
       contentAst: [{ type: "text", text: options.append }],
     });
+    appendedBlock = { id: created.id };
   }
   const day = await getFullObject(ctx, ids.day);
-  emit(ctx, `${JSON.stringify(day, null, 2)}\n`, day);
+  if (appendedBlock === undefined) {
+    emit(ctx, `${JSON.stringify(day, null, 2)}\n`, day);
+    return;
+  }
+  emit(
+    ctx,
+    `appended block ${appendedBlock.id} to ${day.name ?? ids.day}\n`,
+    { ...day, appendedBlock },
+  );
 }
 
 /** `notees journal`: daily notes, newest first. */
@@ -2919,7 +2930,7 @@ function buildProgram(): Command {
   program
     .command("today")
     .description("open today's daily note — ensures the local date chain and the day page, prints it")
-    .option("--append <text>", "append a text block to the daily note")
+    .option("--append <text>", "append a text block to the daily note and report the created block id")
     .action(async (options: { append?: string }, command: Command) => {
       await today(ctxOf(command), options);
     });
