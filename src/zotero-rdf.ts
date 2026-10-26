@@ -13,8 +13,10 @@
  *   - `bib:Authors` (capital A) and `bib:editors` → `rdf:Seq` → `rdf:li` →
  *     `foaf:Person` with `foaf:surname` / `foaf:givenName` children (or a
  *     `foaf:Organization` with `foaf:name`).
- *   - `dc:publisher` nests `foaf:Organization`/`foaf:name`; several publishers
- *     join with "; ".
+ *   - `dc:publisher` nests `foaf:Organization`/`foaf:name` — ONLY the name is
+ *     captured (a vcard:address locality never is); several organizations
+ *     join with "; "; an organization without a name is counted
+ *     (`publisherNameMissing`), never address-guessed.
  *
  * Field mapping beyond the CSL core (dcterms:abstract, prism:volume,
  * prism:number, bib:pages, z:language, dcterms:alternative, dc:description,
@@ -58,6 +60,8 @@ export interface ZoteroRdfParseResult {
   tagsSkipped: number;
   /** `z:Attachment` items + `link:link` attachment entries skipped wholesale. */
   attachmentsSkipped: number;
+  /** foaf:Organizations under dc:publisher WITHOUT a foaf:name — counted, never address-guessed. */
+  publisherNameMissing: number;
 }
 
 /** The leaf fields the entry-level character data can belong to. */
@@ -201,6 +205,7 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
   const keylessSkipped: Array<{ id: string; title: string }> = [];
   let tagsSkipped = 0;
   let attachmentsSkipped = 0;
+  let publisherNameMissing = 0;
 
   const tagStack: string[] = [];
   // The entry element currently open (null between entries).
@@ -220,6 +225,13 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
   // dcterms:isPartOf container tracking: the nested bib:* (Journal/Book/…)
   // element and its dc:title (the container-title fill).
   let partOfDepth = -1;
+  // dc:publisher tracking: the open element indexes, so ONLY the
+  // foaf:Organization's foaf:name is captured — a vcard:address locality is
+  // never the publisher (the live bug). An org closing without a name is
+  // counted (publisherNameMissing), never address-guessed.
+  let publisherDepth = -1;
+  let publisherOrgDepth = -1;
+  let publisherOrgHasName = false;
 
   const commitText = (): void => {
     if (textTarget === null) return;
@@ -333,11 +345,17 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
         else if (tag === "bib:Authors" || tag === "bib:authors") authorsDepth = tagStack.length;
         else if (tag === "bib:editors") editorsDepth = tagStack.length;
         else if (tag === "dcterms:isPartOf") partOfDepth = tagStack.length;
-        else if (tag === "dc:publisher") {
-          // A plain-text publisher (no nested foaf:Organization) still lands;
-          // a nested foaf:name re-targets the same field before its text commits.
-          textTarget = { tag, field: "publisherName" };
-        }
+        else if (tag === "dc:publisher") publisherDepth = tagStack.length;
+      }
+      // Publisher organization: capture ONLY the foaf:name at the org's
+      // direct-child depth; vcard:address and its locality never are.
+      if (publisherDepth !== -1 && tagStack.length === publisherDepth + 1 && tag === "foaf:Organization") {
+        publisherOrgDepth = tagStack.length;
+        publisherOrgHasName = false;
+      }
+      if (publisherOrgDepth !== -1 && tagStack.length === publisherOrgDepth + 1 && tag === "foaf:name") {
+        textTarget = { tag, field: "publisherName" };
+        publisherOrgHasName = true;
       }
       // dcterms:isPartOf container: the nested bib:* (Journal/Book/…), then
       // its dc:title one level down (the container-title fill). Container
@@ -383,6 +401,11 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
     if (tag === "bib:Authors" || tag === "bib:authors") authorsDepth = -1;
     if (tag === "bib:editors") editorsDepth = -1;
     if (partOfDepth !== -1 && tagStack.length - 1 === partOfDepth) partOfDepth = -1;
+    if (publisherOrgDepth !== -1 && tagStack.length - 1 === publisherOrgDepth) {
+      if (!publisherOrgHasName) publisherNameMissing += 1;
+      publisherOrgDepth = -1;
+    }
+    if (publisherDepth !== -1 && tagStack.length - 1 === publisherDepth) publisherDepth = -1;
     if (entry !== null && tag === entryTag && tagStack.length - 1 === entryDepth) {
       // Entry closes: only keyed entries become items (journals etc. count
       // as skipped AND are listed — idempotency needs the stable key).
@@ -419,5 +442,5 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
 
   parser.write(text).close();
   if (parseError !== null) throw parseError;
-  return { items, skipped, keylessSkipped, tagsSkipped, attachmentsSkipped };
+  return { items, skipped, keylessSkipped, tagsSkipped, attachmentsSkipped, publisherNameMissing };
 }

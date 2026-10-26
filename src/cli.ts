@@ -2334,6 +2334,7 @@ interface SourceImportOptions {
     keylessSkipped: Array<{ id: string; title: string }>;
     tagsSkipped: number;
     attachmentsSkipped: number;
+    publisherNameMissing: number;
   };
 }
 
@@ -2493,6 +2494,7 @@ async function importZoteroRdf(ctx: CommandContext, filePath: string, options: S
       keylessSkipped: result.keylessSkipped,
       tagsSkipped: result.tagsSkipped,
       attachmentsSkipped: result.attachmentsSkipped,
+      publisherNameMissing: result.publisherNameMissing,
     },
   });
 }
@@ -2602,6 +2604,7 @@ async function runSourceImport(
       ? {
           tagsSkipped: options.parserExtras.tagsSkipped,
           attachmentsSkipped: options.parserExtras.attachmentsSkipped,
+          publisherNameMissing: options.parserExtras.publisherNameMissing,
         }
       : {}),
   };

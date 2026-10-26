@@ -1319,6 +1319,49 @@ const ZOTERO_RDF_IDEM_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
   </bib:Article>
 </rdf:RDF>`;
 
+// The live-bug shape: the foaf:Organization carries a vcard:address whose
+// locality precedes the foaf:name in document order — the publisher must be
+// the NAME, never the address. Plus an organization with NO foaf:name at all
+// (address only): skipped, counted as publisherNameMissing.
+const ZOTERO_RDF_PUBLISHER_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/"
+ xmlns:vcard="http://www.w3.org/2006/vcard/ns#">
+  <bib:Book rdf:about="#publisher_named">
+    <z:citationKey>rdf-pub-1</z:citationKey>
+    <z:itemType>book</z:itemType>
+    <dc:title>The Publisher Named Book</dc:title>
+    <dc:publisher>
+      <foaf:Organization>
+        <vcard:adr>
+          <vcard:Address>
+            <vcard:locality>London San Diego, CA Cambridge, MA Oxford</vcard:locality>
+          </vcard:Address>
+        </vcard:adr>
+        <foaf:name>Academic Press</foaf:name>
+      </foaf:Organization>
+    </dc:publisher>
+  </bib:Book>
+  <bib:Book rdf:about="#publisher_nameless">
+    <z:citationKey>rdf-pub-2</z:citationKey>
+    <z:itemType>book</z:itemType>
+    <dc:title>The Publisher Nameless Book</dc:title>
+    <dc:publisher>
+      <foaf:Organization>
+        <vcard:adr>
+          <vcard:Address>
+            <vcard:locality>Springfield</vcard:locality>
+          </vcard:Address>
+        </vcard:adr>
+      </foaf:Organization>
+    </dc:publisher>
+  </bib:Book>
+</rdf:RDF>`;
+
 const ZOTERO_RDF_CLASH_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
 <rdf:RDF
  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -1562,6 +1605,45 @@ describe("import zotero-rdf", () => {
       entries: Array<{ citekey: string; fills: Array<{ name: string }> }>;
     };
     expect(after.entries.find((e) => e.citekey === "rdf-idem-1")!.fills).toEqual([]);
+  });
+
+  it("publisher is the foaf:Organization's foaf:name — never the vcard locality; nameless orgs counted", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "zotero-import-publisher.rdf");
+    writeFileSync(file, ZOTERO_RDF_PUBLISHER_FIXTURE);
+
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      entries: string[];
+      entryFills: Array<{ citekey: string; fills: Array<{ name: string; value: unknown }> }>;
+      publisherNameMissing: number;
+    };
+    expect(report.created).toBe(2);
+    // The nameless organization is counted, not silently published-as-address.
+    expect(report.publisherNameMissing).toBe(1);
+
+    const fillsOf = (citekey: string) =>
+      Object.fromEntries(
+        report.entryFills.find((e) => e.citekey === citekey)!.fills.map((f) => [f.name, f.value]),
+      );
+    expect(fillsOf("rdf-pub-1")).toMatchObject({ publisher: "Academic Press" });
+
+    // The values actually landed: name wins over the document-order locality.
+    for (const [i, entry] of report.entryFills.entries()) {
+      await h.runCli("--json", "object", "get", report.entries[i]!);
+      const props = (JSON.parse(h.io.stdoutText).object.properties ?? []) as Array<{
+        schemaId: string;
+        value: unknown;
+      }>;
+      const publisher = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.publisher)?.value;
+      if (entry.citekey === "rdf-pub-1") {
+        expect(publisher).toBe("Academic Press");
+      } else {
+        // rdf-pub-2: the address must never become the publisher.
+        expect(publisher).toBeUndefined();
+      }
+    }
   });
 });
 
