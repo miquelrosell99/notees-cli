@@ -6,7 +6,9 @@
 #
 # The script downloads the tag's `cli.mjs` bundle (+ sha256, verified before
 # install), places it as `notees.mjs` in the install dir, and symlinks
-# `notees` next to it. Requires bash, curl, and node (>= 22) on PATH.
+# `notees` next to it. It also always writes a `notees.cmd` shim next to it
+# so cmd/PowerShell can invoke the CLI on Windows (a unix-shebang extensionless
+# script is not executable there). Requires bash, curl, and node (>= 22) on PATH.
 #
 # Env overrides:
 #   NOTEES_INSTALL_DIR    where `notees` lands (default: ~/.local/bin)
@@ -65,6 +67,15 @@ fi
 chmod 0755 "$INSTALL_DIR/notees.mjs"
 ln -sfn "notees.mjs" "$INSTALL_DIR/notees"
 
+# cmd/PowerShell cannot execute the extensionless `notees` (a unix-shebang
+# script), so always emit a `notees.cmd` shim next to it — one small extra
+# file on unix, and no platform detection to get wrong. `node` is already a
+# hard requirement of this installer, so the shim adds no dependency.
+cat > "$INSTALL_DIR/notees.cmd" <<'EOF'
+@echo off
+node "%~dp0notees.mjs" %*
+EOF
+
 # Sanity: the installed symlink must answer --version with a version string
 # (a bare exit-code check is not enough — a silently no-op'ing binary also
 # exits 0).
@@ -74,5 +85,5 @@ case "$installed_version" in
   *) die "installed binary failed to run — check node >= 22" ;;
 esac
 
-log "installed notees $VERSION into $INSTALL_DIR (notees -> notees.mjs)"
+log "installed notees $VERSION into $INSTALL_DIR (notees -> notees.mjs, + notees.cmd for cmd/PowerShell)"
 log "make sure $INSTALL_DIR is on PATH"

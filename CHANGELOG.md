@@ -56,6 +56,25 @@ history.
 
 - **fix(shell): `update(id, fields)` accepts `name` (title-is-content).** The raw PATCH passthrough sent `{name}` verbatim and the server rejected it ("Unrecognized key(s)"); the helper now mirrors `object update --name`: `name` becomes `contentAst: [{type:"text",text: name}]`, and combining `name` with `contentAst` in one call fails loud as a usage error (exit 2 — `runScript` now preserves a helper-thrown `CliError`'s exit code instead of flattening every script failure to exit 1). HELP_TEXT and the interface doc state the shorthand.
   - **Verification**: `pnpm typecheck && pnpm test` — all green, incl. the new e2e (scripted rename via `update(id, {name})`; `name` + `contentAst` together exits 2).
+- **fix(install): `scripts/install.sh` now also writes a `notees.cmd` shim next
+  to the installed files (issue #3).** The extensionless `notees` is a
+  unix-shebang script — Git Bash/MSYS happens to execute it, but cmd and
+  PowerShell cannot, which left a fresh v4.5.0 install unusable from
+  PowerShell until a shim was hand-written. The installer now always emits
+  `notees.cmd` (`@echo off` + `node "%~dp0notees.mjs" %*`) alongside
+  `notees.mjs` / `notees`. Decision: always-write, no platform detection —
+  the shim is one small extra file on unix, and "always" is simpler and
+  directly testable with `NOTEES_RELEASE_BASE` pointed at local files.
+  Checksum verification, the `ln -sfn` unix path, and the post-install
+  `--version` sanity check are unchanged.
+  - **Verification**: manual — `NOTEES_INSTALL_DIR=<tempdir>` +
+    `NOTEES_RELEASE_BASE=file://<local-release-dir>` install landed
+    `notees.mjs`, `notees`, and `notees.cmd`; `<tempdir>\notees.cmd --version`
+    (run via `cmd /c`) printed the version string. Gate
+    (`pnpm install && pnpm typecheck && pnpm test` + `pnpm build`) green;
+    no vitest case added — the suite covers the TS CLI only and has no
+    shell-level harness.
+  - **Files**: `scripts/install.sh`, `README.md` (Installing section).
 
 ## 2026-10-23
 
