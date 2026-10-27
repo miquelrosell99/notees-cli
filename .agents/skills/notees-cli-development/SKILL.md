@@ -34,6 +34,10 @@ through the submodule, the main repo's `docs/developers/` runbooks.
    for recent related work and check `.plans/` for an in-flight proposal
    folder. After shipping, add a `CHANGELOG.md` entry (what shipped,
    verification) in the same pass. A change without its record is not done.
+   The changelog is **app changes only** — never operations on a personal
+   workspace or its specifics (names, ids, sizes, per-workspace counts,
+   personal node samples); data work is reported to the owner, not recorded.
+   State rules and facts **directly** — no attribution parentheticals in `CHANGELOG.md` or `AGENTS.md`.
 5. **Docs are part of the change.** Same-pass updates to README.md (commands,
    flags, behavior) and command help text.
 6. **No-legacy-version-names.** Live version identifiers (`/api/relay/v2`,
