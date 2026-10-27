@@ -712,14 +712,17 @@ const BIB_FIXTURE = `% Round-trip fixture
 }`;
 
 describe("bibliography round-trip (bibtex)", () => {
-  it("import creates sources with classes/properties and find-or-created person authors", async () => {
+  it("import creates sources with classes/properties and text-only authors (no person nodes, no linked authors)", async () => {
     const h = harness;
     const file = join(h.dataDir, "bib-import-1.bib");
     writeFileSync(file, BIB_FIXTURE);
 
     expect(await h.runCli("--json", "import", "bibtex", file)).toBe(EXIT.ok);
     const counts = JSON.parse(h.io.stdoutText);
-    expect(counts).toMatchObject({ created: 2, updated: 0, persons: 3, personsCreated: 3 });
+    // Bibliographic imports NEVER create person/org
+    // nodes and NEVER write Linked authors — creators ride the CSL text
+    // properties only. The counts keys stay (additive stability) at 0.
+    expect(counts).toMatchObject({ created: 2, updated: 0, persons: 0, personsCreated: 0 });
 
     // The book source: class + title + citekey + bibliographic properties.
     const bookId = counts.entries[0] as string;
@@ -744,14 +747,10 @@ describe("bibliography round-trip (bibtex)", () => {
     await h.runCli("--json", "object", "get", pubRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.classIds).toContain(SYSTEM_CLASS_UUIDS.year);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("1962");
-    // Authorship is dual-track (SCHEMA.md "Citations"): the
-    // `authors` text rows are the citation track; `linkedAuthors` carries the
-    // {nodeId} refs to the agent nodes, one per author.
+    // Authorship is the citation track only: the `authors` text row carries
+    // "Family, Given" — no linkedAuthors refs, no person nodes.
     expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("Kuhn, Thomas S.");
-    const authorRef = props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as {
-      nodeId: string;
-    };
-    expect(authorRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
 
     // The journal-article source maps @article → the journal_article class.
     const paperId = counts.entries[1] as string;
@@ -761,40 +760,33 @@ describe("bibliography round-trip (bibtex)", () => {
     const paperProps = paper.properties as { schemaId: string; value: unknown }[];
     expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.doi)?.value).toBe("10.2307/2333763");
     expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("David, F. N.");
-    expect(
-      paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors).map((p) => p.value),
-    ).toEqual([{ nodeId: expect.stringMatching(/^[0-9a-f-]{36}$/) }, { nodeId: expect.stringMatching(/^[0-9a-f-]{36}$/) }]);
+    expect(paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)).toHaveLength(2);
+    expect(paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
 
-    // The author person node: person class + the verbatim display name.
-    await h.runCli("--json", "object", "get", authorRef.nodeId);
-    const person = JSON.parse(h.io.stdoutText).object;
-    expect(person.name).toBe("Kuhn, Thomas S.");
-    expect(person.classIds).toContain(SYSTEM_CLASS_UUIDS.person);
-
-    // Exactly three persons exist (Kuhn, David, Barton).
+    // No author person nodes exist (Kuhn, David, Barton all stay strings).
     await h.runCli("--json", "class", "list");
     const classes = JSON.parse(h.io.stdoutText).classes as { id: string; memberCount: number }[];
-    expect(classes.find((c) => c.id === SYSTEM_CLASS_UUIDS.person)?.memberCount).toBe(3);
+    expect(classes.find((c) => c.id === SYSTEM_CLASS_UUIDS.person)?.memberCount ?? 0).toBe(0);
   });
 
-  it("re-import dedupes persons by exact name and upserts by citekey (no duplicates)", async () => {
+  it("re-import dedupes by citekey (no duplicates, still no persons)", async () => {
     const h = harness;
     const file = join(h.dataDir, "bib-import-2.bib");
     writeFileSync(file, BIB_FIXTURE);
 
     expect(await h.runCli("--json", "import", "bibtex", file)).toBe(EXIT.ok);
     const counts = JSON.parse(h.io.stdoutText);
-    expect(counts).toMatchObject({ created: 0, updated: 2, persons: 3, personsCreated: 0 });
+    expect(counts).toMatchObject({ created: 0, updated: 2, persons: 0, personsCreated: 0 });
 
     // Exactly one object per citekey after the re-import.
     await h.runCli("--json", "object", "list", "--property", `${SYSTEM_PROPERTY_UUIDS.citekey}:cli-kuhn1962`);
     expect(JSON.parse(h.io.stdoutText).objects).toHaveLength(1);
     await h.runCli("--json", "object", "list", "--property", `${SYSTEM_PROPERTY_UUIDS.citekey}:cli-david1962`);
     expect(JSON.parse(h.io.stdoutText).objects).toHaveLength(1);
-    // Still exactly three person nodes — the re-import matched them by name.
+    // Still zero person nodes.
     await h.runCli("--json", "class", "list");
     const classes = JSON.parse(h.io.stdoutText).classes as { id: string; memberCount: number }[];
-    expect(classes.find((c) => c.id === SYSTEM_CLASS_UUIDS.person)?.memberCount).toBe(3);
+    expect(classes.find((c) => c.id === SYSTEM_CLASS_UUIDS.person)?.memberCount ?? 0).toBe(0);
   });
 
   it("citekey upsert updates the existing source instead of duplicating it", async () => {
@@ -908,13 +900,29 @@ describe("bibliography round-trip (bibtex)", () => {
     const { entries } = JSON.parse(h.io.stdoutText) as { entries: string[] };
     const bookId = entries[0]!;
 
-    // Import writes BOTH tracks: the authors text literal and the
-    // linkedAuthors {nodeId} ref to the find-or-created person node.
+    // The import writes the citation track only —
+    // no linkedAuthors refs, no person nodes.
     await h.runCli("--json", "object", "get", bookId);
     const book = JSON.parse(h.io.stdoutText).object;
     const bookProps = book.properties as { schemaId: string; value: { nodeId?: string } }[];
-    const linkedRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)!.value;
-    expect(linkedRef.nodeId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(bookProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
+
+    // A manual Linked authors pick (user-selected person) is the read
+    // contract's people-graph track: author it by hand.
+    expect(
+      await h.runCli("--json", "object", "create", "--name", "Sagan, Carl", "--class", SYSTEM_CLASS_UUIDS.person),
+    ).toBe(EXIT.ok);
+    const personId = (JSON.parse(h.io.stdoutText) as { id: string }).id;
+    expect(
+      await h.runCli(
+        "object",
+        "property",
+        "set",
+        bookId,
+        SYSTEM_PROPERTY_UUIDS.linkedAuthors,
+        JSON.stringify({ nodeId: personId }),
+      ),
+    ).toBe(EXIT.ok);
 
     // The citation track (authors text) renders.
     expect(await h.runCli("export", "bibtex", "--ids", bookId)).toBe(EXIT.ok);
@@ -922,7 +930,7 @@ describe("bibliography round-trip (bibtex)", () => {
 
     // Renaming the person moves the people-graph track but NOT the citation
     // text — the authors rows are the source of truth.
-    expect(await h.runCli("object", "update", linkedRef.nodeId!, "--name", "Sagan, Carl")).toBe(EXIT.ok);
+    expect(await h.runCli("object", "update", personId, "--name", "Sagan, Carl")).toBe(EXIT.ok);
     expect(await h.runCli("export", "bibtex", "--ids", bookId)).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("author = {Kuhn, Thomas S.}");
 
@@ -1091,7 +1099,7 @@ describe("import adoption (title-is-content)", () => {
 });
 
 describe("import csl-json", () => {
-  it("imports a 3-item CSL-JSON file with classes, citekeys, and find-or-created authors", async () => {
+  it("imports a 3-item CSL-JSON file with classes, citekeys, and text-only authors", async () => {
     const h = harness;
     const file = join(h.dataDir, "csl-import-1.json");
     writeFileSync(
@@ -1126,7 +1134,9 @@ describe("import csl-json", () => {
     );
     expect(await h.runCli("--json", "import", "csl-json", file)).toBe(EXIT.ok);
     const counts = JSON.parse(h.io.stdoutText) as { created: number; persons: number; personsCreated: number; entries: string[] };
-    expect(counts).toMatchObject({ created: 3, persons: 3, personsCreated: 3 });
+    // No person nodes, no linked authors — creators
+    // ride the text Authors rows only.
+    expect(counts).toMatchObject({ created: 3, persons: 0, personsCreated: 0 });
 
     // Book → book class; citekey + ISBN landed.
     await h.runCli("--json", "object", "get", counts.entries[0]!);
@@ -1136,9 +1146,10 @@ describe("import csl-json", () => {
     const bookProps = book.properties as { schemaId: string; value: unknown }[];
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.citekey)?.value).toBe("csl-book-1");
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9781234567890");
+    expect(bookProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
 
-    // article-journal → the journal_article class (the roster naming); the
-    // dual-track authorship: two authors text rows + two linkedAuthors refs.
+    // article-journal → the journal_article class (the roster naming);
+    // authorship is the text rows only — zero linkedAuthors refs.
     await h.runCli("--json", "object", "get", counts.entries[1]!);
     const paper = JSON.parse(h.io.stdoutText).object;
     expect(paper.classIds).toContain(SYSTEM_CLASS_UUIDS.journal_article);
@@ -1146,20 +1157,24 @@ describe("import csl-json", () => {
     expect(paperProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.doi)?.value).toBe("10.1234/csl");
     const authorRows = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors);
     expect(authorRows.map((p) => p.value)).toEqual(["Noether, Emmy", "Weil, Simone"]);
-    const linkedRefs = paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors);
-    expect(linkedRefs).toHaveLength(2);
+    expect(paperProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
 
     // article-magazine → the new magazine_article subtype.
     await h.runCli("--json", "object", "get", counts.entries[2]!);
     expect(JSON.parse(h.io.stdoutText).object.classIds).toContain(SYSTEM_CLASS_UUIDS.magazine_article);
 
-    // One author person resolved by name (the book's single author, via the
-    // linkedAuthors track).
-    const bookLinkedRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as {
-      nodeId: string;
-    };
-    await h.runCli("--json", "object", "get", bookLinkedRef.nodeId);
-    expect(JSON.parse(h.io.stdoutText).object.name).toBe("Curie, Marie");
+    // No author person nodes exist (Curie, Noether, Weil stay strings) —
+    // match by exact name; a seeded agent-family demo node exists in every
+    // workspace, and the sources' own author text rows also match a token
+    // search.
+    await h.runCli("--json", "object", "list", "--q", "Curie");
+    expect(
+      (JSON.parse(h.io.stdoutText).objects as Array<{ name: string | null; classIds: string[] }>).filter(
+        (o) =>
+          o.name === "Curie, Marie" &&
+          (o.classIds.includes(SYSTEM_CLASS_UUIDS.person) || o.classIds.includes(SYSTEM_CLASS_UUIDS.agent)),
+      ),
+    ).toHaveLength(0);
   });
 
   it("errors: missing file → 2, malformed JSON → 2, no items → 1", async () => {
@@ -1362,6 +1377,30 @@ const ZOTERO_RDF_PUBLISHER_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
   </bib:Book>
 </rdf:RDF>`;
 
+const ZOTERO_RDF_MANUAL_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/">
+  <bib:Article rdf:about="#manual_article">
+    <z:citationKey>rdf-manual-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>Manual Link Article</dc:title>
+    <bib:Authors>
+      <rdf:Seq>
+        <rdf:li>
+          <foaf:Person>
+            <foaf:surname>Noether</foaf:surname>
+            <foaf:givenName>Emmy</foaf:givenName>
+          </foaf:Person>
+        </rdf:li>
+      </rdf:Seq>
+    </bib:Authors>
+  </bib:Article>
+</rdf:RDF>`;
+
 const ZOTERO_RDF_CLASH_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
 <rdf:RDF
  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -1417,18 +1456,25 @@ describe("import zotero-rdf", () => {
     await h.runCli("--json", "object", "get", pubRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("2019");
 
-    // The book: author person via foaf surname/givenName (the linkedAuthors
-    // track), year, ISBN.
+    // The book: author as the text citation track only (no person node, no linkedAuthors), year, ISBN.
     await h.runCli("--json", "object", "get", counts.entries[1]!);
     const book = JSON.parse(h.io.stdoutText).object;
     expect(book.name).toBe("The RDF Book");
     expect(book.classIds).toContain(SYSTEM_CLASS_UUIDS.book);
     const bookProps = book.properties as { schemaId: string; value: unknown }[];
-    const authorRef = bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)?.value as { nodeId: string };
-    await h.runCli("--json", "object", "get", authorRef.nodeId);
-    expect(JSON.parse(h.io.stdoutText).object.name).toBe("Roe, Richard");
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("Roe, Richard");
+    expect(bookProps.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
     expect(bookProps.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.isbn)?.value).toBe("9780123456789");
+    // No person/agent node named for the author was minted (a seeded
+    // agent-family demo node exists in every workspace — match by name).
+    await h.runCli("--json", "object", "list", "--q", "Roe");
+    expect(
+      (JSON.parse(h.io.stdoutText).objects as Array<{ name: string | null; classIds: string[] }>).filter(
+        (o) =>
+          o.name === "Roe, Richard" &&
+          (o.classIds.includes(SYSTEM_CLASS_UUIDS.person) || o.classIds.includes(SYSTEM_CLASS_UUIDS.agent)),
+      ),
+    ).toHaveLength(0);
   });
 
   it("errors: missing file → 2, malformed XML → 2, no entries → 1", async () => {
@@ -1516,16 +1562,79 @@ describe("import zotero-rdf", () => {
     const pubRef = byName("publicationDate") as { nodeId: string };
     await h.runCli("--json", "object", "get", pubRef.nodeId);
     expect(JSON.parse(h.io.stdoutText).object.name).toBe("2021");
-    // Dual-track authorship (the bibtex precedent): text literals + idx-ordered
-    // linkedAuthors node refs; editors as "Last, First" text rows.
+    // Authorship is the citation track only: text
+    // literals idx-ordered, editors as "Last, First" text rows — zero
+    // linkedAuthors refs, zero person nodes.
     expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors).map((p) => p.value)).toEqual([
       "Lovelace, Ada",
       "Hopper, Grace",
     ]);
-    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(2);
+    expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors)).toHaveLength(0);
     expect(props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.editors).map((p) => p.value)).toEqual([
       "Knuth, Donald",
     ]);
+    // The import minted no person nodes for the creators (match by exact
+    // name — a seeded agent-family demo node exists in every workspace).
+    for (const literal of ["Lovelace, Ada", "Hopper, Grace", "Knuth, Donald"]) {
+      await h.runCli("--json", "object", "list", "--q", literal);
+      expect(
+        (JSON.parse(h.io.stdoutText).objects as Array<{ name: string | null; classIds: string[] }>).filter(
+          (o) =>
+            o.name === literal &&
+            (o.classIds.includes(SYSTEM_CLASS_UUIDS.person) || o.classIds.includes(SYSTEM_CLASS_UUIDS.agent)),
+        ),
+      ).toHaveLength(0);
+    }
+  });
+
+  it("a hand-set Linked authors pick on an existing source survives the import untouched", async () => {
+    const h = harness;
+    // A manual person + a manual Linked authors pick (the user's own choice).
+    const manual = await fetch(`${h.baseUrl}/api/objects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({
+        isEmbedded: false,
+        name: "Curie, Marie",
+        classIds: [SYSTEM_CLASS_UUIDS.person],
+      }),
+    });
+    const manualId = ((await manual.json()) as { id: string }).id;
+    const source = await fetch(`${h.baseUrl}/api/objects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({
+        isEmbedded: false,
+        name: "Manual Link Article",
+        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
+      }),
+    });
+    const sourceId = ((await source.json()) as { id: string }).id;
+    for (const [propertySchemaId, value] of [
+      [SYSTEM_PROPERTY_UUIDS.citekey, "rdf-manual-1"],
+      [SYSTEM_PROPERTY_UUIDS.linkedAuthors, { nodeId: manualId }],
+    ] as const) {
+      await fetch(`${h.baseUrl}/api/objects/${sourceId}/properties`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": API_KEY },
+        body: JSON.stringify({ propertySchemaId, value }),
+      });
+    }
+
+    const file = join(h.dataDir, "zotero-import-manual.rdf");
+    writeFileSync(file, ZOTERO_RDF_MANUAL_FIXTURE);
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+
+    // The import filled the empty text Authors but left the manual pick alone.
+    await h.runCli("--json", "object", "get", sourceId);
+    const props = (JSON.parse(h.io.stdoutText).object.properties ?? []) as Array<{
+      schemaId: string;
+      value: unknown;
+    }>;
+    expect(props.find((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.authors)?.value).toBe("Noether, Emmy");
+    const linked = props.filter((p) => p.schemaId === SYSTEM_PROPERTY_UUIDS.linkedAuthors);
+    expect(linked).toHaveLength(1);
+    expect(linked[0]!.value).toEqual({ nodeId: manualId });
   });
 
   it("matched node keeps its existing values; only empty fields fill (no clobber)", async () => {

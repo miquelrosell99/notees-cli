@@ -2366,6 +2366,7 @@ interface ImportEntryPlan {
   action: "create" | "update" | "adopt" | "skip";
   nodeId?: string;
   title: string;
+  /** Legacy plan rows — imports no longer touch persons; always []. Kept for --json additive stability. */
   persons: Array<{ literal: string; action: "existing" | "create"; nodeId?: string }>;
   /** Class the adoption would assign (eligibility repair) — absent when not needed. */
   classAssign?: string;
@@ -2407,12 +2408,11 @@ function zoteroExtraFills(item: CslItem): SourceFieldFill[] {
  * the shared CSL spec fields plus the parser's ZoteroItem extras. Notees-wins:
  * only the fields the matched node does not already hold (`heldSchemaIds`;
  * freshly created nodes hold nothing, so creation fills everything).
- * `linkedRefs` is the resolved linkedAuthors refs in real mode; null in a
- * dry-run (the plan's persons rows carry the targets instead).
+ * Bibliographic imports NEVER write linkedAuthors —
+ * creators ride the text `authors`/`editors` rows only.
  */
 function plannedFills(
   spec: ReturnType<typeof cslToNodeSpecs>,
-  linkedRefs: Array<{ nodeId: string }> | null,
   item: CslItem,
   heldSchemaIds: Set<string>,
   fillOnlyEmpty: boolean,
@@ -2427,9 +2427,6 @@ function plannedFills(
   }
   const authorLiterals = spec.authors.filter((literal) => literal.length > 0);
   if (authorLiterals.length > 0) candidates.push({ name: "authors", value: authorLiterals });
-  if (linkedRefs !== null && linkedRefs.length > 0) {
-    candidates.push({ name: "linkedAuthors", value: linkedRefs });
-  }
   if (spec.editors !== undefined && spec.editors.some((literal) => literal.length > 0)) {
     candidates.push({ name: "editors", value: spec.editors.filter((literal) => literal.length > 0) });
   }
@@ -2535,8 +2532,10 @@ async function importLogseqDb(
 }
 
 /**
- * The shared source-import pipeline: schema ensure → authors find-or-create →
- * source upsert/adopt → field writes. All three formats feed it as CslItem[].
+ * The shared source-import pipeline: schema ensure → source upsert/adopt →
+ * field writes. All three formats feed it as CslItem[]. Creators ride the
+ * CSL text properties only — imports NEVER create
+ * person/org nodes and NEVER write linkedAuthors.
  *
  * Lookup order per entry: (a) citekey-property match (authoritative);
  * (b) exact node-title match on `citekey` / `@citekey` — adoption renames the
@@ -2608,8 +2607,6 @@ async function runSourceImport(
         }
       : {}),
   };
-  const personIds = new Map<string, string>(); // per-run dedupe (real mode)
-  const personPlans = new Map<string, ImportEntryPlan["persons"][number]>(); // per-run dedupe (plan mode)
   const importedIds: string[] = [];
   const skippedEntries: Array<{ citekey: string | null; title: string }> = [];
   const plans: ImportEntryPlan[] = [];
@@ -2641,39 +2638,11 @@ async function runSourceImport(
       continue;
     }
 
-    // Authors: dual-track (SCHEMA.md "Citations") — the
-    // persons are still find-or-created (one per name string; the
-    // linkedAuthors people-graph track), and the same literals land on the
-    // free-text `authors` citation track in upsertSource. Dry-run resolves
-    // without creating and reports the plan.
-    const authorIds: string[] = [];
-    const entryPersons: ImportEntryPlan["persons"] = [];
-    for (const literal of spec.authors) {
-      if (literal.length === 0) continue;
-      if (dryRun) {
-        let plan = personPlans.get(literal);
-        if (plan === undefined) {
-          const personId = await findPersonByName(ctx, literal);
-          plan =
-            personId !== undefined
-              ? { literal, action: "existing", nodeId: personId }
-              : { literal, action: "create" };
-          personPlans.set(literal, plan);
-          counts.persons += 1;
-          if (plan.action === "create") counts.personsCreated += 1;
-        }
-        entryPersons.push(plan);
-        continue;
-      }
-      let personId = personIds.get(literal);
-      if (personId === undefined) {
-        personId = await findOrCreatePerson(ctx, literal, counts);
-        personIds.set(literal, personId);
-        counts.persons += 1;
-      }
-      authorIds.push(personId);
-    }
-
+    // Creators ride the CSL text properties only — `authors`/`editors` text
+    // rows in upsertSource/plannedFills. Imports
+    // NEVER create person/org nodes and NEVER write linkedAuthors (that
+    // track is for manual, user-selected picks); the persons counters stay
+    // at 0 for --json additive stability.
     const needsClassAssign =
       action === "adopt" &&
       eligibleIds !== null &&
@@ -2690,7 +2659,7 @@ async function runSourceImport(
     const fills =
       options.extraFills === undefined
         ? []
-        : plannedFills(spec, dryRun ? null : authorIds.map((personId) => ({ nodeId: personId })), items[specIndex]!, heldSchemaIds, fillOnlyEmpty);
+        : plannedFills(spec, items[specIndex]!, heldSchemaIds, fillOnlyEmpty);
 
     if (dryRun) {
       plans.push({
@@ -2698,7 +2667,7 @@ async function runSourceImport(
         action,
         ...(matched !== undefined ? { nodeId: matched.id } : {}),
         title: spec.title,
-        persons: entryPersons,
+        persons: [],
         ...(needsClassAssign ? { classAssign: spec.className } : {}),
         ...(options.extraFills !== undefined ? { fills } : {}),
       });
@@ -2708,7 +2677,7 @@ async function runSourceImport(
       continue;
     }
 
-    const id = await upsertSource(ctx, spec, authorIds, counts, action, matched, needsClassAssign, fillOnlyEmpty, fills);
+    const id = await upsertSource(ctx, spec, counts, action, matched, needsClassAssign, fillOnlyEmpty, fills);
     importedIds.push(id);
     if (options.extraFills !== undefined) entryFills.push({ citekey: spec.citekey, nodeId: id, action, fills });
   }
@@ -2730,7 +2699,6 @@ async function runSourceImport(
     if (plans.some((p) => p.classAssign !== undefined)) headers.push("CLASS ASSIGN");
     if (withFills) headers.push("FILLS (PLANNED)");
     const wouldEnsure = schemaPlan.filter((s) => s.status === "would-ensure").map((s) => s.name);
-    const personNew = plans.flatMap((p) => p.persons).filter((p) => p.action === "create").length;
     const keylessLines =
       options.parserExtras !== undefined && options.parserExtras.keylessSkipped.length > 0
         ? options.parserExtras.keylessSkipped
@@ -2741,7 +2709,6 @@ async function runSourceImport(
       ctx,
       `dry run (${format}, ${filePath}) — no writes\n` +
         `${formatTable([headers, ...rows])}\n` +
-        `persons: ${counts.persons} planned (${personNew} would be created)\n` +
         `schemas: ${schemaPlan.map((s) => s.name).join(", ")}` +
         (wouldEnsure.length > 0 ? ` (${wouldEnsure.join(", ")} would be ensured)` : " (all present)") +
         (keylessLines.length > 0 ? `\n${keylessLines}` : "") +
@@ -2788,8 +2755,7 @@ async function runSourceImport(
     ctx,
     entryLines +
       `imported ${importedIds.length} entries: ${counts.created} created, ${counts.updated} updated, ` +
-      `${counts.adopted} adopted, ${counts.skipped} skipped, ${counts.ambiguous} ambiguous, ` +
-      `${counts.persons} persons (${counts.personsCreated} new)` +
+      `${counts.adopted} adopted, ${counts.skipped} skipped, ${counts.ambiguous} ambiguous` +
       extraSummary +
       `\n`,
     machine,
@@ -2819,7 +2785,6 @@ async function findSourcesByTitle(ctx: CommandContext, citekey: string): Promise
 async function upsertSource(
   ctx: CommandContext,
   spec: ReturnType<typeof cslToNodeSpecs>,
-  authorIds: string[],
   counts: SourceImportCounts,
   action: "create" | "update" | "adopt",
   matched: FullApiObject | undefined,
@@ -2909,12 +2874,13 @@ async function upsertSource(
       await setIfChanged(SYSTEM_PROPERTY_UUIDS.publicationDate, spec.publicationDate);
     }
   }
-  // Authorship is dual-track (SCHEMA.md "Citations"):
+  // Authorship rides the CSL text properties only:
   // `authors` carries the "Family, Given" text literals (the citation track
-  // export reads first); `linkedAuthors` carries the {nodeId} refs to the
-  // find-or-created agent nodes (the people-graph track). Both lists are
-  // replaced wholesale — set the new values, unset the stale tail. Notees-wins
-  // fill (zotero-rdf) instead keeps any list the node already holds.
+  // export reads first); imports NEVER create persons and NEVER write
+  // `linkedAuthors` — that people-graph track is for manual, user-selected
+  // picks. Both text lists are replaced wholesale — set the new values, unset
+  // the stale tail. Notees-wins fill (zotero-rdf) instead keeps any list the
+  // node already holds.
   const replaceList = async (
     schemaId: string,
     values: unknown[],
@@ -2931,10 +2897,6 @@ async function upsertSource(
     SYSTEM_PROPERTY_UUIDS.authors,
     spec.authors.filter((literal) => literal.length > 0),
   );
-  await replaceList(
-    SYSTEM_PROPERTY_UUIDS.linkedAuthors,
-    authorIds.map((personId) => ({ nodeId: personId })),
-  );
   if (spec.editors !== undefined) {
     await replaceList(
       SYSTEM_PROPERTY_UUIDS.editors,
@@ -2942,18 +2904,6 @@ async function upsertSource(
     );
   }
   return id;
-}
-
-/** Person match: exact display name via the objects?q= title search. */
-async function findPersonByName(ctx: CommandContext, literal: string): Promise<string | undefined> {
-  const query = queryString({ q: literal });
-  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/objects${query}`);
-  return body.objects.find(
-    (object) =>
-      object.name === literal &&
-      (object.classIds.includes(SYSTEM_CLASS_UUIDS.person) ||
-        object.classIds.includes(SYSTEM_CLASS_UUIDS.agent)),
-  )?.id;
 }
 
 /** Local midnight ISO (the CLI is a local client — never UTC). */
@@ -3069,22 +3019,6 @@ async function journal(ctx: CommandContext, options: { limit: string }): Promise
     machine.days.map((day) => `${day.id}  ${day.name ?? ""}`).join("\n") + (machine.days.length > 0 ? "\n" : ""),
     machine,
   );
-}
-
-async function findOrCreatePerson(
-  ctx: CommandContext,
-  literal: string,
-  counts: { personsCreated: number },
-): Promise<string> {
-  const existing = await findPersonByName(ctx, literal);
-  if (existing !== undefined) return existing;
-  const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
-    isEmbedded: false,
-    name: literal,
-    classIds: [SYSTEM_CLASS_UUIDS.person],
-  });
-  counts.personsCreated += 1;
-  return created.id;
 }
 
 /** Citekey lookup — the property filter matches the JSON-encoded scalar. */
@@ -4126,11 +4060,11 @@ function buildProgram(): Command {
   const importCmd = program.command("import").description("import operations (bibtex / csl-json / zotero-rdf sources)");
   const importOptions = (cmd: Command): Command =>
     cmd
-      .option("--dry-run", "plan only: report per-entry actions and planned persons/schemas, write nothing", false)
+      .option("--dry-run", "plan only: report per-entry actions and planned fills/schemas, write nothing", false)
       .addOption(new Option("--no-create", "match only: skip entries that would create a new source"));
   importOptions(importCmd.command("bibtex <file>"))
     .description(
-      "import a .bib file (find-or-create author persons; upsert by citekey, adopt @citekey-titled nodes)",
+      "import a .bib file (creators land on the text Authors/Editors properties only — no person nodes; upsert by citekey, adopt @citekey-titled nodes)",
     )
     .action(async (filePath: string, options: SourceImportOptions, command: Command) => {
       await importBibtex(ctxOf(command), filePath, options);
