@@ -107,7 +107,10 @@ AGENTS.md
 
 - **The changelog is the record**: what shipped and why lives in
   `CHANGELOG.md` at the repo root — one entry per shipped slice, newest
-  first. `AGENTS.md` itself is static guidance: never append history, dates,
+  first. App changes only — never operations on a
+  personal workspace or its specifics (workspace names/ids, data sizes,
+  per-workspace counts, personal node samples); data work is reported to the
+  owner, not recorded in the repo's public record. `AGENTS.md` itself is static guidance: never append history, dates,
   or work-record entries to it; edit it only when the guidance changes.
   Before implementing, skim `CHANGELOG.md` for recent related work and check
   `.plans/` for an in-flight proposal folder. A change without its changelog
