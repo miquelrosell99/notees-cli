@@ -72,6 +72,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `date` | the deterministic date chain | `ensure <YYYY-MM-DD>` |
 | `journal` | list daily notes, newest first | `--limit` |
 | `class` | class membership, extends, bulk remap | `list --tree`, `remap --dry-run` |
+| `tag` | tag membership (a tag is any page) | `assign`, `unassign` |
 | `auth` | sign in / store / probe the credential | `login`, `store --key-stdin`, `status` |
 | `config` | per-profile default server / workspace | `set`, `get`, `list` |
 | `ops` | the operation catalog (or one op's shape) | `[opType]` |

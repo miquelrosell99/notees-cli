@@ -4072,7 +4072,7 @@ describe("help command", () => {
     expect(code).toBe(EXIT.ok);
     for (const name of [
       "object", "cover", "property", "search", "today", "date", "journal",
-      "class", "auth", "config", "ops", "backlinks", "asset", "sync",
+      "class", "tag", "auth", "config", "ops", "backlinks", "asset", "sync",
       "doctor", "shell", "export", "import", "help",
     ]) {
       expect(io.stdoutText).toMatch(new RegExp(`^${name}\\s\\s`, "m"));

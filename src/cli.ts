@@ -169,8 +169,32 @@ function resolveKey(
 // --- command handlers --------------------------------------------------------
 
 async function objectGet(ctx: CommandContext, id: string): Promise<void> {
-  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
-  emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, body);
+  const body = await ctx.client.getJson<{ object: Record<string, unknown> }>(`/api/objects/${encodeURIComponent(id)}`);
+  emit(ctx, `${objectMembershipLines(body.object)}\n\n${JSON.stringify(body.object, null, 2)}\n`, body);
+}
+
+/**
+ * The `Classes:` / `Tags:` summary lines above `object get`'s JSON dump:
+ * resolved names from the projection's `classes` / `tags` arrays (same
+ * slot, added server-side with the tags surface), falling back to the raw
+ * id arrays when a row is unresolvable, `—` when empty. An absent `tags`
+ * field (a server predating the tags surface) reads as no tags, never an
+ * error.
+ */
+function objectMembershipLines(object: Record<string, unknown>): string {
+  const names = (resolvedKey: "classes" | "tags", idsKey: "classIds" | "tagIds"): string => {
+    const resolved = object[resolvedKey];
+    if (Array.isArray(resolved)) {
+      const entries = resolved.flatMap((entry) =>
+        isRecord(entry) && typeof entry.name === "string" ? [entry.name] : [],
+      );
+      if (entries.length > 0) return entries.join(", ");
+    }
+    const ids = object[idsKey];
+    if (Array.isArray(ids) && ids.length > 0) return ids.map(String).join(", ");
+    return "—";
+  };
+  return `Classes: ${names("classes", "classIds")}\nTags: ${names("tags", "tagIds")}`;
 }
 
 /** `notees object get --ids <uuid…>` — multi-read: one fetch per id, in
@@ -1330,6 +1354,56 @@ async function classMembership(
       : await ctx.client.deleteJson<{ object: { classIds: string[] } }>(url);
   const machine = { objectId, classId: klass.id, className: klass.name, classIds: body.object.classIds };
   emit(ctx, `${action}ed ${objectId} — classes now: ${machine.classIds.join(", ") || "(none)"}\n`, machine);
+}
+
+/**
+ * Tag argument: a uuid is used verbatim; anything else resolves against
+ * the object listing by (case-insensitive) page title — a tag IS a page
+ * (any page can be assigned as a tag), so the lookup filters to page-role
+ * rows: a class node or an embedded block never resolves, mirroring
+ * resolveClassRef's exact-title / zero-or-many usage-error contract. The
+ * bare listing is active rows only, so trashed pages never match either.
+ */
+async function resolveTagRef(ctx: CommandContext, ref: string): Promise<{ id: string; name: string }> {
+  if (CLASS_UUID_PATTERN.test(ref)) return { id: ref, name: ref };
+  const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>> }>(
+    `/api/objects${queryString({ q: ref, limit: 500 })}`,
+  );
+  const wanted = ref.trim().toLowerCase();
+  const matches = body.objects.filter(
+    (object) =>
+      typeof object.name === "string" &&
+      object.name.trim().toLowerCase() === wanted &&
+      object.isClass !== true &&
+      (object.parentId === null || object.parentId === undefined || object.isEmbedded === false),
+  );
+  if (matches.length === 0) {
+    failUsage(`no page named "${ref}" (pass a page id, or one of the listed titles)`);
+  }
+  if (matches.length > 1) {
+    failUsage(`page name "${ref}" is ambiguous (${matches.length} pages share it) — pass a page id`);
+  }
+  const found = matches[0]!;
+  return { id: String(found.id), name: found.name as string };
+}
+
+async function tagMembership(
+  ctx: CommandContext,
+  objectId: string,
+  tagRef: string,
+  action: "assign" | "unassign",
+): Promise<void> {
+  const tag = await resolveTagRef(ctx, tagRef);
+  const url = `/api/objects/${encodeURIComponent(objectId)}/tags/${encodeURIComponent(tag.id)}`;
+  // Both ops are idempotent: assign re-adds (OR-Set add-wins), unassign
+  // tombstones (a no-op when the tag is already absent).
+  const body =
+    action === "assign"
+      ? await ctx.client.putJson<{ object: { tagIds?: string[] } }>(url)
+      : await ctx.client.deleteJson<{ object: { tagIds?: string[] } }>(url);
+  const tagIds = Array.isArray(body.object.tagIds) ? body.object.tagIds : [];
+  const machine = { objectId, tagId: tag.id, tagName: tag.name, tagIds };
+  emit(ctx, `${action}ed ${objectId} — tags now: ${tagIds.join(", ") || "(none)"}\n`, machine);
 }
 
 /**
@@ -3498,6 +3572,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   date: { flags: "ensure <YYYY-MM-DD>" },
   journal: { flags: "--limit" },
   class: { flags: "list --tree · remap --dry-run · set-extends" },
+  tag: { flags: "assign · unassign" },
   auth: { flags: "login · store --key-stdin · status" },
   config: { flags: "set · get · list" },
   ops: { flags: "[opType]" },
@@ -3948,6 +4023,20 @@ function buildProgram(): Command {
     .option("--parent <id>", "scope: only members whose direct parent is this object id", undefined)
     .action(async (classRef: string, options: { dryRun?: boolean; yes?: boolean; parent?: string }, command: Command) => {
       await classBulkMembers(ctxOf(command), classRef, "trash", options);
+    });
+
+  const tag = program.command("tag").description("tag operations (a tag is any page)");
+  tag
+    .command("assign <objectId> <tag>")
+    .description("assign a tag to an object (tag: page uuid or page title; idempotent)")
+    .action(async (objectId: string, tagRef: string, _options: object, command: Command) => {
+      await tagMembership(ctxOf(command), objectId, tagRef, "assign");
+    });
+  tag
+    .command("unassign <objectId> <tag>")
+    .description("remove an object's tag (tag: page uuid or page title; idempotent)")
+    .action(async (objectId: string, tagRef: string, _options: object, command: Command) => {
+      await tagMembership(ctxOf(command), objectId, tagRef, "unassign");
     });
 
   const auth = program.command("auth").description("sign in and store a credential for this server");
