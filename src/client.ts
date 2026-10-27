@@ -87,10 +87,12 @@ export class ApiClient {
       clearTimeout(timer);
     }
     if (!response.ok) {
-      // The workspace listing is account-scoped: 401 here means the
-      // credential is not an account credential (e.g. the operator key) —
-      // name resolution needs a session token or user API key; a workspace
-      // id passes through verbatim and works with any credential.
+      // The workspace listing accepts an account credential or the operator
+      // key (the operator sees the whole directory since the server accepted
+      // operator sign-in on account-discovery reads); 401 here means the
+      // credential is neither (invalid or absent) — name resolution needs a
+      // working credential, while a workspace id passes through verbatim and
+      // works with any credential.
       if (response.status === 401) {
         throw new CliError(
           EXIT.usage,

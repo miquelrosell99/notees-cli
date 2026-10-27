@@ -2381,11 +2381,11 @@ describe("workspace selection (--workspace)", () => {
     expect(cached).toBeDefined();
   });
 
-  it("operator key cannot resolve names (account-scoped listing) — the error says to pass an id", async () => {
+  it("operator key resolves names against the whole directory — an unknown name fails listing the available ones", async () => {
     const h = harness;
     const code = await h.runCli("--workspace", "whatever", "object", "list");
     expect(code).toBe(EXIT.usage);
-    expect(h.io.stderrText).toContain("needs an account credential");
+    expect(h.io.stderrText).toContain('workspace "whatever" not found');
   });
 
   it("unknown workspace name fails with a usage error listing the available names", async () => {
@@ -2588,11 +2588,12 @@ describe("config (per-profile defaults)", () => {
       const defaultWsId = defaultWorkspaceId();
       expect(await run(["config", "set", "server", h.baseUrl], new Capture())).toBe(EXIT.ok);
       expect(await run(["config", "set", "workspace", "whatever"], new Capture())).toBe(EXIT.ok);
-      // An operator key can only take a workspace id, not a name — so this fails
-      // with "needs an account credential" only if the stored default was applied.
+      // An operator key resolves names against the whole directory — the
+      // stored default was applied iff resolution fails on the bogus NAME
+      // ("whatever" is not in the directory).
       const io = new Capture();
       expect(await run(["--key", API_KEY, "object", "list"], io)).toBe(EXIT.usage);
-      expect(io.stderrText).toContain("needs an account credential");
+      expect(io.stderrText).toContain('workspace "whatever" not found');
       // flag > stored: an explicit id works.
       expect(await run(["--workspace", defaultWsId, "--key", API_KEY, "object", "list"], new Capture())).toBe(
         EXIT.ok,

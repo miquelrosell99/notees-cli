@@ -8,6 +8,26 @@ history.
 
 ## 2026-10-27
 
+- **chore(vendor): bump `vendor/notees` to main `046b2fb00` — the
+  `class.property.set` `pinned` lockstep boundary closes (fixture gate
+  converged across the TS reference + GTK + Flutter, byte-identical
+  fixtures) — and the workspace-name resolution tests track the
+  operator-key sign-in change that rode along.** The bump spans the pinned
+  binding tier flag (schema v34, additive, no CLI surface change — the CLI
+  authors bindings through the server API) and the server commit that
+  accepts the operator key on account-discovery reads: `GET /workspaces`
+  now resolves for the operator key against the whole directory, so the
+  two tests that pinned the old 401 "needs an account credential" path now
+  assert the directory-listing reality (unknown name → usage error naming
+  the available workspaces; the stored-default-workspace test proves the
+  default was applied via the same not-found error). The 401 branch in
+  `client.ts` stays for genuinely invalid/absent credentials; its comment
+  no longer names the operator key as the example. No `--pinned` flag on
+  `property bind` yet — wiring arrives when a slice needs it.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm build`
+    + `pnpm typecheck && pnpm test` — all green (155/155, incl. the two
+    rewritten operator-key resolution specs).
+
 - **fix(object): the `children`/`list` NAME column renders rich-token content — a lone-mention child shows the target's current title, not "(untitled)".** The API `name` is a text-only flatten (title-is-content), and a mention stores no link text by design (the label resolves at render time), so every mention-only block arrived name-less and the human tables read `(untitled)` — a references section (a bullet per mention) was unreadable in CLI listings. The CLI now derives the display name for name-less rows from the row's contentAst via the domain's `fullTitleOf`, resolving mention targets to their current API names (one GET per target, deduped, 8-way — the `object get --ids` precedent; failures degrade to no prose, never a failed listing). Resolution is live and never stored — a rename re-resolves on the next read; an unresolvable target still reads `(untitled)`, exactly like the web mention chip. List rows carry no contentAst (the summary projection), so name-less list rows are re-read one GET each before the flatten (8-way; they are the rare case). Named rows are untouched; the `--json` machine surface is unchanged (rows ride the API verbatim — the derivation is human-table-only); `children --fields` stays the raw projection. Help text for both commands states the derivation; README's Command reference gains a Display names note.
   - **Verification**: `pnpm typecheck && pnpm test` — all green (155/155, incl. the new spec: a mention-only block renders the target's title in both the `children` and the `list --parent` tables, with no `(untitled)` in either).
 
