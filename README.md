@@ -85,6 +85,8 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 
 Destructive commands refuse without `--yes`: they print a blast-radius preview and exit 2. Exit codes: 0 ok, 1 domain, 2 usage, 3 auth, 4 conflict, 5 network.
 
+Display names: the human tables of `object children` / `object list` render a row's NAME from its content (title-is-content). The API `name` flattens text tokens only, so a node whose content is rich tokens alone — a lone mention, a class chip, math — has no API name; the CLI then derives the display text from the content, resolving mentions to the target's *current* title (live, never stored — an unresolvable target reads as `(untitled)`, like the web mention chip).
+
 ## Installing
 
 Every `v*` tag carries a prebuilt bundle (`cli.mjs`, ESM with a `node` shebang, sha256 sidecar) on its GitHub Release, built by `.github/workflows/release.yml`. The install script fetches it, verifies the checksum, and links `notees` into `~/.local/bin` (override with `NOTEES_INSTALL_DIR`):

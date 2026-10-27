@@ -3084,6 +3084,31 @@ describe("object children", () => {
     expect(h.io.stdoutText).toMatch(/child-main\s+page/);
     expect(h.io.stdoutText).toMatch(/child-block-1\s+block/);
   });
+
+  it("mention-only children render the target's current title, not (untitled)", async () => {
+    const h = harness;
+    const target = await h.createPage("children-mention-target", []);
+    const parent = await h.createPage("children-mention-parent", []);
+    // A block whose whole body is one mention: no text tokens, so the API
+    // name (a text-only flatten) is null — the wire stores no link text.
+    expect(
+      await h.runCliWithStdin(
+        JSON.stringify({ isEmbedded: true, parentId: parent, contentAst: [{ type: "mention", targetNodeId: target }] }),
+        "--json", "object", "create", "--stdin",
+      ),
+    ).toBe(EXIT.ok);
+
+    // The children table resolves the mention to the target's current title.
+    expect(await h.runCli("object", "children", parent)).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("children-mention-target");
+    expect(h.io.stdoutText).not.toContain("(untitled)");
+
+    // The list table resolves the same way — its rows carry no contentAst,
+    // so name-less rows are re-read to flatten their rich tokens.
+    expect(await h.runCli("object", "list", "--parent", parent)).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("children-mention-target");
+    expect(h.io.stdoutText).not.toContain("(untitled)");
+  });
 });
 
 describe("object create --batch", () => {

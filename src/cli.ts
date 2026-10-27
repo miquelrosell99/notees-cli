@@ -27,6 +27,7 @@ import {
   chainNodeIds,
   dateNodeId,
   dateNodeLabel,
+  fullTitleOf,
   parseDateNodeId,
   parseIsoDate,
   type SystemClassName,
@@ -47,7 +48,7 @@ import {
   yearFromDate,
   type CslItem,
 } from "@notees/export";
-import { OP_CATALOG, describeOp, newEnvelope, Clock } from "@notees/protocol";
+import { OP_CATALOG, describeOp, newEnvelope, Clock, type ContentAst } from "@notees/protocol";
 import {
   looksLikeQueryLanguage,
   parseQueryLanguage,
@@ -444,8 +445,10 @@ async function objectChildren(ctx: CommandContext, id: string, options: {
     return;
   }
 
+  const displayNames = await resolveNamelessDisplayNames(ctx, children);
   const rows = children.map((child) => [
-    typeof child.name === "string" && child.name.length > 0 ? child.name : "(untitled)",
+    displayNames.get(String(child.id)) ??
+      (typeof child.name === "string" && child.name.length > 0 ? child.name : "(untitled)"),
     renderKindLabel(child as { isClass?: boolean; isEmbedded?: boolean; parentId?: string | null }),
     String(child.id),
   ]);
@@ -673,6 +676,112 @@ function renderKindLabel(node: { isClass?: boolean; isEmbedded?: boolean; parent
   return "object";
 }
 
+/**
+ * Rich-token display names for the NAME column (title-is-content): the API
+ * `name` flattens text tokens only, so a node whose content is just a rich
+ * token — a lone mention, a class chip, math — arrives name-less and used to
+ * read as "(untitled)". A mention stores no link text by design (the label
+ * resolves at render time), so the flatten needs the target's CURRENT title.
+ * The resolution is never stored: a rename re-resolves on the next read, and
+ * an unresolvable target contributes nothing — exactly like the web mention
+ * chip ("when possible").
+ */
+
+/** Every mention target in a contentAst (quotes/headings recurse), deduped. */
+function mentionTargetIds(ast: unknown): string[] {
+  const out: string[] = [];
+  const walk = (tokens: unknown): void => {
+    if (!Array.isArray(tokens)) return;
+    for (const token of tokens) {
+      if (typeof token !== "object" || token === null) continue;
+      const candidate = token as { type?: unknown; targetNodeId?: unknown; children?: unknown };
+      if (candidate.type === "mention" && typeof candidate.targetNodeId === "string") out.push(candidate.targetNodeId);
+      if (Array.isArray(candidate.children)) walk(candidate.children);
+    }
+  };
+  walk(ast);
+  return [...new Set(out)];
+}
+
+/**
+ * Resolve a batch of node ids to their current API names (one GET per id —
+ * the `object get --ids` precedent; failures stay absent so a trashed or
+ * unreadable target degrades to "no prose", never a failed listing).
+ */
+async function fetchObjectNames(ctx: CommandContext, ids: readonly string[]): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  const queue = [...ids];
+  await Promise.all(
+    Array.from({ length: Math.min(8, queue.length) }, async () => {
+      for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
+        try {
+          const body = await ctx.client.getJson<{ object: { name?: string | null } }>(
+            `/api/objects/${encodeURIComponent(id)}`,
+          );
+          if (typeof body.object.name === "string" && body.object.name.length > 0) names.set(id, body.object.name);
+        } catch {
+          // unresolvable target → the mention contributes nothing
+        }
+      }
+    }),
+  );
+  return names;
+}
+
+/**
+ * Display name for every NAME-less row of a table listing, derived from the
+ * row's rich tokens with mentions resolved live. Rows that carry no
+ * contentAst (the list endpoint's summary projection) are re-read one GET
+ * each first — they are the rare case. Returns only the name-less rows:
+ * named rows render their API name unchanged.
+ */
+async function resolveNamelessDisplayNames(
+  ctx: CommandContext,
+  rows: Array<Record<string, unknown>>,
+): Promise<Map<string, string>> {
+  const nameless = rows.filter((row) => typeof row.name !== "string" || row.name.length === 0);
+  const targets = new Set<string>();
+  const needsAst = new Map<string, Record<string, unknown>>();
+  for (const row of nameless) {
+    if (row.contentAst === undefined) needsAst.set(String(row.id), row);
+    else for (const target of mentionTargetIds(row.contentAst)) targets.add(target);
+  }
+  const astQueue = [...needsAst.keys()];
+  await Promise.all(
+    Array.from({ length: Math.min(8, astQueue.length) }, async () => {
+      for (let id = astQueue.pop(); id !== undefined; id = astQueue.pop()) {
+        try {
+          const body = await ctx.client.getJson<{ object: Record<string, unknown> }>(
+            `/api/objects/${encodeURIComponent(id)}`,
+          );
+          const row = needsAst.get(id)!;
+          row.contentAst = body.object.contentAst ?? null;
+          for (const target of mentionTargetIds(row.contentAst)) targets.add(target);
+        } catch {
+          // unresolvable row stays name-less
+        }
+      }
+    }),
+  );
+  const mentionNames = await fetchObjectNames(ctx, [...targets]);
+  const resolved = new Map<string, string>();
+  for (const row of nameless) {
+    const derived = fullTitleOf(
+      {
+        id: String(row.id),
+        isClass: row.isClass === true,
+        isEmbedded: row.isEmbedded === true,
+        contentAst: Array.isArray(row.contentAst) ? (row.contentAst as ContentAst) : null,
+        classIds: Array.isArray(row.classIds) ? (row.classIds as string[]) : [],
+      },
+      undefined,
+      (targetNodeId) => mentionNames.get(targetNodeId) ?? null,
+    );
+    resolved.set(String(row.id), derived.length > 0 ? derived : "(untitled)");
+  }
+  return resolved;
+}
+
 async function objectDelete(ctx: CommandContext, id: string, options: { permanent?: boolean; yes?: boolean }): Promise<void> {
   const permanent = options.permanent === true;
   if (options.yes !== true) {
@@ -756,8 +865,10 @@ async function objectList(ctx: CommandContext, options: {
     cursor = body.nextCursor ?? undefined;
   } while (options.all === true && cursor !== undefined);
   const machine = { objects, nextCursor: options.all === true ? null : (nextCursor ?? null) };
+  const displayNames = await resolveNamelessDisplayNames(ctx, objects);
   const rows = objects.map((object) => [
-    typeof object.name === "string" && object.name.length > 0 ? object.name : "(untitled)",
+    displayNames.get(String(object.id)) ??
+      (typeof object.name === "string" && object.name.length > 0 ? object.name : "(untitled)"),
     renderKindLabel(object as { isClass?: boolean; isEmbedded?: boolean; parentId?: string | null }),
     String(object.id),
   ]);
@@ -3640,7 +3751,8 @@ function buildProgram(): Command {
     .command("children <id>")
     .description(
       "list an object's children in child-position order (main children and inline blocks; " +
-        "the endpoint is unpaginated — --offset/--limit window client-side, --count prints just the number, --fields projects rows)",
+        "the endpoint is unpaginated — --offset/--limit window client-side, --count prints just the number, --fields projects rows). " +
+        "Name-less rich-token children (e.g. a lone mention) display the target's current title — resolved live, never stored",
     )
     .option("--offset <n>", "skip the first n children", undefined)
     .option("--limit <n>", "return at most n children", undefined)
@@ -3691,7 +3803,10 @@ function buildProgram(): Command {
     });
   object
     .command("list")
-    .description("list objects")
+    .description(
+      "list objects. Name-less rows whose content is rich tokens only (e.g. a lone mention) display " +
+        "the resolved target title — derived live, never stored",
+    )
     .addOption(new Option("--isClass", "filter: class nodes only").default(undefined))
     .addOption(new Option("--no-isClass", "filter: non-class nodes only"))
     .addOption(
