@@ -8,6 +8,17 @@ history.
 
 ## 2026-10-28
 
+- **chore(vendor): bump `vendor/notees` to main `922f7a556` — the `url`
+  property-type retirement lands (fixture gate converged across the TS
+  reference + GTK + Flutter, byte-identical fixtures).** The wire enum loses
+  `"url"` outright (strict rejection) while the seeded `url` property survives
+  as `type: "text"`; the CLI already tracks the retirement client-side
+  (`861e7ed` — `--type url` fails loud at exit 2, the importer's
+  canonicalization arms dropped the `url` alternative), so this bump is the
+  pin catch-up with no further CLI surface change.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm build`
+    + `pnpm typecheck && pnpm test` — all green (167/167).
+
 - **feat(property): accept the retired `url` property type (`url` → `text`).** The core retires the dedicated `url` property type (the wire enum loses `"url"` outright, strict rejection) while the seeded `url` property survives as `type: "text"` — values are plain strings, legal under text; `email` is untouched. The CLI tracks the retirement ahead of the vendor bump: `url` leaves the `property create --type` allowlist (`PROPERTY_TYPES`, which never carried `asset` — that asymmetry stays) so a `--type url` attempt fails loud client-side at exit 2 (the server's strict enum would 422 anyway), and the Logseq-DB importer's value-canonicalization arms drop the `url` alternative — `text`/`email` cover exactly what `url` did (plain-string literals and text-carried node refs). Zotero/CSL data fields named `url` are bibliographic data mapped onto the seeded property, not the type — untouched, and the seeded `url` property keeps accepting plain-string values under text.
   - **Verification**: `pnpm typecheck && pnpm test` — all green (incl. the new spec: `property create --type url` fails at exit 2 with the unknown-type usage error).
 
