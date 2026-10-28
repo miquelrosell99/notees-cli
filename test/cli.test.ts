@@ -2062,6 +2062,11 @@ describe("property schema verbs", () => {
   it("usage and domain failures fail loud", async () => {
     const h = harness;
     expect(await h.runCli("property", "create", "x", "--type", "bogus")).toBe(EXIT.usage);
+    // The retired url type fails loud client-side (the server's strict enum
+    // would 422 anyway — exit 2 first); the seeded url property survives as
+    // type text, so plain-string url values stay legal under text.
+    expect(await h.runCli("property", "create", "x-url", "--type", "url")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("unknown property type");
     expect(await h.runCli("property", "get", "no-such-schema")).toBe(EXIT.usage);
     expect(await h.runCli("property", "get", "10000000-0000-4000-8000-00000000dead")).toBe(EXIT.domain);
     expect(await h.runCli("property", "rename", "citekey", "")).toBe(EXIT.usage);

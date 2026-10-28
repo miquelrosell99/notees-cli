@@ -2223,7 +2223,6 @@ const PROPERTY_TYPES = [
   "number",
   "boolean",
   "datetime",
-  "url",
   "email",
   "select",
   "multi_select",

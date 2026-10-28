@@ -609,7 +609,7 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
       const nodeId = (v as { nodeId: string }).nodeId;
       const dayMatch = /00dd-(\d{8})/.exec(nodeId);
       if (schemaType === "datetime" && dayMatch !== null) return `day:${dayMatch[1]}`;
-      if (schemaType === "text" || schemaType === "url" || schemaType === "email") {
+      if (schemaType === "text" || schemaType === "email") {
         // Text values ride node-backed carriers — compare the carried TEXT.
         const name = targetById.get(nodeId)?.name ?? "";
         return `lit:${mdnorm(name)}`;
@@ -624,7 +624,7 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
       const m = /(\d{4})-(\d{2})-(\d{2})/.exec(String(v));
       return m !== null ? `day:${m[1]}${m[2]}${m[3]}` : `raw:${String(v)}`;
     }
-    if (schemaType === "text" || schemaType === "url" || schemaType === "email") {
+    if (schemaType === "text" || schemaType === "email") {
       return `lit:${mdnorm(v)}`;
     }
     return `lit:${String(v).trim().toLowerCase()}`;
