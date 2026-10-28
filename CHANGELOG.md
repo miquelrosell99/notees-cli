@@ -8,6 +8,19 @@ history.
 
 ## 2026-10-28
 
+- **chore(vendor): bump `vendor/notees` to main `429e408bf` — the seeded
+  `project` property lands (the task→project membership relation) plus the
+  Tasks-hub subtask nesting.** The range is `429e408bf` (the seeded `project`
+  property schema — object-typed `{nodeId}` refs, multi, targetClassFilter
+  `["project"]`, global scope with the class-local binding on `task`, and the
+  first `hideWhenEmpty` seed) over `ebea36e7a` (the Tasks hub joins the
+  `nestUnderParents` family — a subtask nests under its parent task). Both are
+  server-side seed/render configuration with zero wire cost — no new ops, no
+  envelope or enum change — so this is pin catch-up with no CLI surface
+  change.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` +
+    `pnpm typecheck && pnpm test` — all green (167/167).
+
 - **chore(vendor): bump `vendor/notees` to main `922f7a556` — the `url`
   property-type retirement lands (fixture gate converged across the TS
   reference + GTK + Flutter, byte-identical fixtures).** The wire enum loses
