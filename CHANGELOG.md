@@ -6,6 +6,22 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-29
+
+- **chore(vendor): bump `vendor/notees` to main `8ad67a374` — the
+  citekey-centric feature lands (fixture gate converged across the TS
+  reference + GTK + Flutter, byte-identical fixtures).** The range carries
+  the class `displayTemplate` wire key + store schema v36 (the
+  extends-aware nearest-non-NULL-ancestor resolution, `""` opt-out stops
+  the walk), the search fan-out over authored property values + UUID
+  exact-match, the sources duplicates view + merge, and the citekey
+  regenerate / empty-field placeholder UI; it also lands `card.review`
+  (the new op pushes the catalog count 29 → 30, so the shell ops-count
+  pin moves to `3[0-9]`). No CLI surface change — the bump tracks the
+  main repo's protocol/store head.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` + `pnpm build`
+    + `pnpm typecheck && pnpm test` — all green (167/167).
+
 ## 2026-10-28
 
 - **chore(vendor): bump `vendor/notees` to main `429e408bf` — the seeded

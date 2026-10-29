@@ -3061,7 +3061,7 @@ describe("ops catalog", () => {
     `;
     expect(await h.runCliWithStdin(script, "shell")).toBe(EXIT.ok);
     expect(h.io.stdoutText).toContain("affected objectId");
-    expect(h.io.stdoutText).toMatch(/count 2[0-9]/);
+    expect(h.io.stdoutText).toMatch(/count 3[0-9]/);
   });
 });
 
