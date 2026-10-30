@@ -73,6 +73,8 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `journal` | list daily notes, newest first | `--limit` |
 | `class` | class membership, extends, bulk remap | `list --tree`, `remap --dry-run` |
 | `tag` | tag membership (a tag is any page) | `assign`, `unassign` |
+| `workflow` | workflow vocabulary — opt-in materialized class families (install state derives from one anchor-page probe, never a ledger) | `list`, `enable <id>`, `disable <id>` |
+| `feature` | workspace feature toggles (the core class families + the journal surfaces) | `list`, `enable <feature>`, `disable <feature>` |
 | `auth` | sign in / store / probe the credential | `login`, `store --key-stdin`, `status` |
 | `config` | per-profile default server / workspace | `set`, `get`, `list` |
 | `ops` | the operation catalog (or one op's shape) | `[opType]` |
@@ -85,6 +87,8 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `import` | bibtex / csl-json / zotero-rdf (value-filling upsert) / logseq-db sources | `--dry-run` |
 
 Destructive commands refuse without `--yes`: they print a blast-radius preview and exit 2. Exit codes: 0 ok, 1 domain, 2 usage, 3 auth, 4 conflict, 5 network.
+
+Workflows and features: `workflow list` derives install state from ONE `GET /api/objects/:anchorId` probe per workflow (absent = available, present + active = installed, present + archived = disabled — no ledger); `workflow enable|disable <id>` executes `@notees/domain`'s pure `planWorkflowToggle` as ONE relay batch, skipping steps that already converge (re-runs never overwrite user edits). `feature list` reads `GET /api/features` and defaults untoggled features to enabled; `feature enable|disable <feature>` writes one `workspace.feature.set` envelope, read-modify-merging an existing settings record forward (a plain toggle never wipes the Sources settings).
 
 Display names: the human tables of `object children` / `object list` render a row's NAME from its content (title-is-content). The API `name` flattens text tokens only, so a node whose content is rich tokens alone — a lone mention, a class chip, math — has no API name; the CLI then derives the display text from the content, resolving mentions to the target's *current* title (live, never stored — an unresolvable target reads as `(untitled)`, like the web mention chip).
 

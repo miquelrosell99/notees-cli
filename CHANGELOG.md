@@ -6,6 +6,50 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-10-30
+
+- **feat: `notees workflow` + `notees feature` — CLI parity for the
+  workflows mechanism (vendor bump to main `b3558430f`).** The workflows
+  slice lands from the main repo (the `@notees/domain` workflow registry —
+  `WORKFLOWS` / `planWorkflowToggle` / `workflowAnchorId` / `workflowEntityId`
+  — plus `GET /api/features` on the server), and the CLI becomes the second
+  executor of the shared pure plan (D2: one definition, two executors).
+  - `notees workflow list` — ONE `GET /api/objects/:anchorId` probe per
+    workflow (never per-entity walks); absent = available, present + active
+    = installed, present + archived = disabled (installed state derives
+    from the probe, never a ledger).
+  - `notees workflow enable|disable <id>` — `planWorkflowToggle` wrapped in
+    `newEnvelope` (the `class set-extends` precedent) and posted as ONE
+    `/api/relay/v2/batch`; each step is existence-checked against the REST
+    read surface first (the web materializer's `stepConverged` shapes,
+    mirrored) and converged steps are skipped. An archived existing row
+    un-archives via `object.update {active: true}` (a plain create would
+    no-op without un-archiving). `class.property.set` steps are always
+    written: the server exposes bindings on no REST route, and the op is a
+    COALESCE partial-update upsert — a re-issue cannot clobber user edits.
+    Re-runs never reconcile drift (D1): user renames and option edits
+    survive.
+  - `notees feature list` — reads `GET /api/features` and defaults every
+    untoggled feature to enabled (the absent row IS the default-on state,
+    F2). `notees feature enable|disable <feature>` writes one
+    `workspace.feature.set` envelope, read-modify-merging an existing
+    `settings` record forward — a plain toggle never wipes the Sources
+    settings (the whole-row LWW settings-wiping hazard, the web client's
+    `setFeatureEnabled` contract).
+  - `--json` on all six commands (the `emit()` contract); HELP_ROWS +
+    README command reference.
+  - Tests: `test/workflow.test.ts` — 16 specs. Mocked-wire (the
+    `tag.test.ts` precedent): exactly-one-anchor-probe, the 48-step enable
+    envelope shapes + order against the pinned derived-id literals, the
+    un-archive swap, the 6-step disable archive shape (anchor first), the
+    converged re-enable (only the 7 binding upserts), the settings merge,
+    feature-list default-on parsing, usage errors. Plus an e2e block
+    against the vendored server: the full available → enable → installed →
+    re-enable → disable → disabled lifecycle, and the settings-preserving
+    feature toggle over a real `workspace_feature` row.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` (after the vendor
+    bump) + `pnpm typecheck && pnpm test` — all green (183/183, 4 files).
+
 ## 2026-10-29
 
 - **chore(vendor): bump `vendor/notees` to main `8ad67a374` — the

@@ -24,14 +24,21 @@ import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_SPECS,
   SYSTEM_PROPERTY_UUIDS,
+  WORKFLOWS,
+  WORKSPACE_FEATURE_MAP,
   chainNodeIds,
   dateNodeId,
   dateNodeLabel,
   fullTitleOf,
   parseDateNodeId,
   parseIsoDate,
+  planWorkflowToggle,
+  workflowAnchorId,
+  type FamilyFeature,
   type SystemClassName,
   type SystemPropertyName,
+  type WorkflowId,
+  type WorkflowOpStep,
 } from "@notees/domain";
 import {
   bibToCsl,
@@ -48,7 +55,7 @@ import {
   yearFromDate,
   type CslItem,
 } from "@notees/export";
-import { OP_CATALOG, describeOp, newEnvelope, Clock, type ContentAst } from "@notees/protocol";
+import { OP_CATALOG, WORKSPACE_FEATURES, describeOp, newEnvelope, Clock, type ContentAst, type WorkspaceFeature } from "@notees/protocol";
 import {
   looksLikeQueryLanguage,
   parseQueryLanguage,
@@ -1404,6 +1411,290 @@ async function tagMembership(
   const tagIds = Array.isArray(body.object.tagIds) ? body.object.tagIds : [];
   const machine = { objectId, tagId: tag.id, tagName: tag.name, tagIds };
   emit(ctx, `${action}ed ${objectId} — tags now: ${tagIds.join(", ") || "(none)"}\n`, machine);
+}
+
+// --- workflows + features (research-tier2 CLI parity) ------------------------
+//
+// `notees workflow` executes the SAME pure plan the web materializer runs
+// (D2: one definition, two executors — `planWorkflowToggle` from
+// @notees/domain), existence-checking each step against the REST read
+// surface and skipping what already holds (the deploySystemClass idiom,
+// mirrored from vendor/apps/web/src/features/workflows/materialize.ts).
+// Nothing reconciles drift: a re-run re-plans the same creates, which no-op
+// on existing rows, so user renames and option edits survive (D1).
+
+/** The anchor-probe states (the D1 ruling): absent / present+active / present+archived. */
+type WorkflowState = "available" | "installed" | "disabled";
+
+interface ProbeNode {
+  id: string;
+  isActive: boolean;
+}
+
+/**
+ * ONE object read; `undefined` when the node is ABSENT (a 404 — the server's
+ * GET /objects/:id returns archived rows with isActive false, so the probe
+ * distinguishes all three D1 states). Any other wire error propagates.
+ */
+async function probeObject(ctx: CommandContext, id: string): Promise<ProbeNode | undefined> {
+  try {
+    const body = await ctx.client.getJson<{ object: ProbeNode }>(`/api/objects/${encodeURIComponent(id)}`);
+    return body.object;
+  } catch (error) {
+    const status = error instanceof CliError ? (error.details as { status?: number } | undefined)?.status : undefined;
+    if (status === 404) return undefined;
+    throw error;
+  }
+}
+
+/** `notees workflow list` — ONE anchor probe per workflow (never per-entity walks). */
+async function workflowList(ctx: CommandContext): Promise<void> {
+  const rows: Array<{ id: WorkflowId; label: string; state: WorkflowState; anchorId: string }> = [];
+  for (const wfId of Object.keys(WORKFLOWS) as WorkflowId[]) {
+    const anchorId = workflowAnchorId(wfId);
+    const anchor = await probeObject(ctx, anchorId);
+    const state: WorkflowState = anchor === undefined ? "available" : anchor.isActive ? "installed" : "disabled";
+    rows.push({ id: wfId, label: WORKFLOWS[wfId].label, state, anchorId });
+  }
+  const table = formatTable([["WORKFLOW", "STATE", "ANCHOR"], ...rows.map((row) => [row.id, row.state, row.anchorId])]);
+  emit(ctx, `${table}\n`, { workflows: rows });
+}
+
+/**
+ * Per-toggle read caches: the REST reads behind the convergence checks.
+ * Nodes are probed once per id (a create and a later update touch the same
+ * ids); the schema listing is one GET for the whole plan; effective-property
+ * rows are read once per target object.
+ */
+interface WorkflowReadCaches {
+  nodes: Map<string, ProbeNode | undefined>;
+  schemas?: Promise<Array<{ id: string }>>;
+  effective: Map<string, Promise<Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>>>;
+}
+
+function workflowCaches(): WorkflowReadCaches {
+  return { nodes: new Map(), effective: new Map() };
+}
+
+async function workflowProbeCached(ctx: CommandContext, caches: WorkflowReadCaches, id: string): Promise<ProbeNode | undefined> {
+  let hit = caches.nodes.get(id);
+  if (hit === undefined && !caches.nodes.has(id)) {
+    hit = await probeObject(ctx, id);
+    caches.nodes.set(id, hit);
+  }
+  return hit;
+}
+
+function workflowSchemaList(ctx: CommandContext, caches: WorkflowReadCaches): Promise<Array<{ id: string }>> {
+  caches.schemas ??= ctx.client
+    .getJson<{ propertySchemas: Array<{ id: string }> }>("/api/property-schemas")
+    .then((body) => body.propertySchemas);
+  return caches.schemas;
+}
+
+function workflowEffectiveRows(
+  ctx: CommandContext,
+  caches: WorkflowReadCaches,
+  objectId: string,
+): Promise<Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>> {
+  let hit = caches.effective.get(objectId);
+  if (hit === undefined) {
+    hit = ctx.client
+      .getJson<{
+        properties: Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>;
+      }>(`/api/objects/${encodeURIComponent(objectId)}/effective-properties`)
+      .then((body) => body.properties);
+    caches.effective.set(objectId, hit);
+  }
+  return hit;
+}
+
+/**
+ * The CLI half of the web materializer's `stepConverged`: does this plan
+ * step need NO write? The shapes mirror materialize.ts exactly, translated
+ * onto REST reads. One deliberate difference: `class.property.set` has no
+ * REST binding read (the server exposes bindings on no route), and the op
+ * is a COALESCE partial-update upsert — a re-issue cannot clobber user
+ * edits (omitted active/pinned keys keep their stored values), so binding
+ * steps are always written instead of convergence-checked. Everything else
+ * matches: enable creates converge on an existing ACTIVE row only (an
+ * archived row still needs the un-archive), property values converge on the
+ * element id / the authored row, disable archives converge when the node is
+ * absent or already archived. Returns the step to WRITE (the enable's
+ * un-archive swap for an archived existing row), or null when converged.
+ */
+async function workflowStepWrite(
+  ctx: CommandContext,
+  target: "enabled" | "disabled",
+  step: WorkflowOpStep,
+  caches: WorkflowReadCaches,
+): Promise<WorkflowOpStep | null> {
+  const p = step.payload;
+  switch (step.opType) {
+    case "object.create":
+    case "class.create": {
+      const id = String(p.objectId ?? p.classId);
+      const node = await workflowProbeCached(ctx, caches, id);
+      if (node === undefined) return step;
+      if (node.isActive) return null;
+      // Archived existing row: plain create would no-op WITHOUT un-archiving
+      // (the applier's duplicate-create early return) — the materializer's
+      // un-archive arm, as an op.
+      return target === "enabled" ? { opType: "object.update", payload: { objectId: id, active: true } } : null;
+    }
+    case "propertySchema.create": {
+      const schemas = await workflowSchemaList(ctx, caches);
+      return schemas.some((schema) => schema.id === p.propertySchemaId) ? null : step;
+    }
+    case "class.property.set":
+      // No REST binding read exists; the COALESCE upsert is always safe.
+      return step;
+    case "property.set": {
+      const objectId = String(p.objectId);
+      const rows = (await workflowEffectiveRows(ctx, caches, objectId)).filter(
+        (row) => row.schemaId === p.propertySchemaId,
+      );
+      if (typeof p.elementId === "string") {
+        // OR-Set add: the deterministic element id is the convergence key.
+        return rows.some((row) => row.elementId === p.elementId) ? null : step;
+      }
+      return rows.some(
+        (row) => row.source === "authored" && JSON.stringify(row.value) === JSON.stringify(p.value),
+      )
+        ? null
+        : step;
+    }
+    case "object.update": {
+      // The disable shape: archive when active; absent/already-archived is a no-op.
+      const node = await workflowProbeCached(ctx, caches, String(p.objectId));
+      return node === undefined || !node.isActive ? null : step;
+    }
+    default:
+      return step;
+  }
+}
+
+/**
+ * `notees workflow enable|disable <id>` — execute `planWorkflowToggle` as
+ * ONE relay batch: each pending step wrapped in `newEnvelope` (the
+ * `class set-extends` precedent) and posted to /api/relay/v2/batch.
+ * Converged steps write nothing, so a re-run converges to an empty batch
+ * ({applied: 0, skipped: plan.length}, the materializer's contract).
+ */
+async function workflowToggle(ctx: CommandContext, wfIdRaw: string, target: "enabled" | "disabled"): Promise<void> {
+  if (!Object.prototype.hasOwnProperty.call(WORKFLOWS, wfIdRaw)) {
+    failUsage(`unknown workflow "${wfIdRaw}" — known workflows: ${(Object.keys(WORKFLOWS) as WorkflowId[]).join(", ")}`);
+  }
+  const wfId = wfIdRaw as WorkflowId;
+  const plan = planWorkflowToggle(wfId, target);
+  const caches = workflowCaches();
+  const pending: WorkflowOpStep[] = [];
+  let skipped = 0;
+  for (const step of plan) {
+    const write = await workflowStepWrite(ctx, target, step, caches);
+    if (write === null) skipped += 1;
+    else pending.push(write);
+  }
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelopes = pending.map((step) => {
+    const objectId = step.payload.objectId ?? step.payload.classId;
+    return newEnvelope({
+      workspaceId,
+      actorId,
+      deviceId: "notees-cli",
+      client: "cli",
+      hlc: clock.now(),
+      affectedNodeIds: typeof objectId === "string" ? [objectId] : [],
+      opType: step.opType,
+      payload: step.payload,
+    });
+  });
+  let applied = 0;
+  if (envelopes.length > 0) {
+    const res = await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
+    applied = res.savedCount;
+  }
+  const state: WorkflowState = target === "enabled" ? "installed" : "disabled";
+  emit(ctx, `${wfId}: ${state} (${applied} ops applied, ${skipped} already converged)\n`, {
+    workflow: wfId,
+    target,
+    state,
+    applied,
+    skipped,
+  });
+}
+
+/** The journal feature is NOT a class family — its label/powers live here, like the web settings tab. */
+const JOURNAL_FEATURE: { label: string; powers: string } = {
+  label: "Journal",
+  powers: "The journal view and Today-page management — the date classes stay",
+};
+
+interface FeatureRow {
+  feature: string;
+  label: string;
+  enabled: boolean;
+  settings: Record<string, unknown> | null;
+}
+
+function featureSpec(feature: string): { label: string; powers: string } {
+  if (feature === "journal") return JOURNAL_FEATURE;
+  return WORKSPACE_FEATURE_MAP[feature as FamilyFeature];
+}
+
+/**
+ * `notees feature list` — read GET /api/features (the workspace_feature
+ * projection) and default every untoggled feature to ON: an absent row
+ * means enabled (F2 — the empty table is the pre-toggle state), so the
+ * listing always shows the full vocabulary, not just the toggled rows.
+ */
+async function featureList(ctx: CommandContext): Promise<void> {
+  const body = await ctx.client.getJson<{ features: Array<{ feature: string; enabled: boolean; settings: Record<string, unknown> | null }> }>(
+    "/api/features",
+  );
+  const toggled = new Map(body.features.map((row) => [row.feature, row]));
+  const rows: FeatureRow[] = ([...Object.keys(WORKSPACE_FEATURE_MAP), "journal"] as WorkspaceFeature[]).map((feature) => {
+    const row = toggled.get(feature);
+    return { feature, label: featureSpec(feature).label, enabled: row?.enabled ?? true, settings: row?.settings ?? null };
+  });
+  const table = formatTable([["FEATURE", "LABEL", "ENABLED"], ...rows.map((row) => [row.feature, row.label, String(row.enabled)])]);
+  emit(ctx, `${table}\n`, { features: rows });
+}
+
+/**
+ * `notees feature enable|disable <feature>` — one `workspace.feature.set`
+ * envelope. The row is ONE whole-row LWW unit, so a plain toggle write
+ * against a row that CARRIES SETTINGS would wipe them (the
+ * settings-wiping hazard) — this seam reads the current row first and
+ * carries `settings` forward when present, mirroring the web client's
+ * setFeatureEnabled read-modify-merge exactly.
+ */
+async function featureToggle(ctx: CommandContext, featureRaw: string, enabled: boolean): Promise<void> {
+  if (!(WORKSPACE_FEATURES as readonly string[]).includes(featureRaw)) {
+    failUsage(`unknown feature "${featureRaw}" — known features: ${WORKSPACE_FEATURES.join(", ")}`);
+  }
+  const feature = featureRaw as WorkspaceFeature;
+  const body = await ctx.client.getJson<{ features: Array<{ feature: string; enabled: boolean; settings: Record<string, unknown> | null }> }>(
+    "/api/features",
+  );
+  const settings = body.features.find((row) => row.feature === feature)?.settings ?? null;
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelope = newEnvelope({
+    workspaceId,
+    actorId,
+    deviceId: "notees-cli",
+    client: "cli",
+    hlc: clock.now(),
+    affectedNodeIds: [],
+    opType: "workspace.feature.set",
+    payload: settings !== null ? { feature, enabled, settings } : { feature, enabled },
+  });
+  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  emit(ctx, `${feature}: ${String(enabled)}\n`, { feature, label: featureSpec(feature).label, enabled, settings });
 }
 
 /**
@@ -3572,6 +3863,8 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   journal: { flags: "--limit" },
   class: { flags: "list --tree · remap --dry-run · set-extends" },
   tag: { flags: "assign · unassign" },
+  workflow: { flags: "list · enable <id> · disable <id>" },
+  feature: { flags: "list · enable <feature> · disable <feature>" },
   auth: { flags: "login · store --key-stdin · status" },
   config: { flags: "set · get · list" },
   ops: { flags: "[opType]" },
@@ -4036,6 +4329,62 @@ function buildProgram(): Command {
     .description("remove an object's tag (tag: page uuid or page title; idempotent)")
     .action(async (objectId: string, tagRef: string, _options: object, command: Command) => {
       await tagMembership(ctxOf(command), objectId, tagRef, "unassign");
+    });
+
+  const workflow = program
+    .command("workflow")
+    .description(
+      "workflow vocabulary — opt-in, fully editable user-space class families materialized from @notees/domain's declarative registry " +
+        "(installed state derives from one anchor-page probe per workflow, never a ledger; NOT the server-side /api/workflows automation rules)",
+    );
+  workflow
+    .command("list")
+    .description(
+      "list the known workflows with their derived install state: one GET /api/objects/:anchorId probe each — " +
+        "absent = available, present + active = installed, present + archived = disabled",
+    )
+    .action(async (_options: object, command: Command) => {
+      await workflowList(ctxOf(command));
+    });
+  workflow
+    .command("enable <id>")
+    .description(
+      "materialize a workflow (anchor tag page, classes, property schemas + options, bindings, templates) — executes planWorkflowToggle as " +
+        "ONE relay batch, skipping steps that already converge; re-runs never overwrite user edits (idempotent)",
+    )
+    .action(async (wfId: string, _options: object, command: Command) => {
+      await workflowToggle(ctxOf(command), wfId, "enabled");
+    });
+  workflow
+    .command("disable <id>")
+    .description(
+      "archive what a workflow materialized (the anchor tag page + its classes + template nodes; instances keep their class_ids — " +
+        "hide-surfaces-keep-data, reversible with `workflow enable`; no uninstall/delete)",
+    )
+    .action(async (wfId: string, _options: object, command: Command) => {
+      await workflowToggle(ctxOf(command), wfId, "disabled");
+    });
+
+  const feature = program
+    .command("feature")
+    .description("workspace feature toggles — the core class families (tasks, events, meetings, sources, persons) + the journal surfaces");
+  feature
+    .command("list")
+    .description("list every feature with its enabled state (an untoggled feature reads enabled — the absent row IS the default-on state)")
+    .action(async (_options: object, command: Command) => {
+      await featureList(ctxOf(command));
+    });
+  feature
+    .command("enable <feature>")
+    .description("enable a feature (one workspace.feature.set envelope; a row carrying a settings record keeps it — read-modify-merged, never wiped)")
+    .action(async (name: string, _options: object, command: Command) => {
+      await featureToggle(ctxOf(command), name, true);
+    });
+  feature
+    .command("disable <feature>")
+    .description("disable a feature (hide-surfaces-keep-data: the family's classes leave pickers/hubs, existing objects keep their data)")
+    .action(async (name: string, _options: object, command: Command) => {
+      await featureToggle(ctxOf(command), name, false);
     });
 
   const auth = program.command("auth").description("sign in and store a credential for this server");
