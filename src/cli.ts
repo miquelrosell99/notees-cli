@@ -1456,7 +1456,7 @@ async function workflowList(ctx: CommandContext): Promise<void> {
     const state: WorkflowState = anchor === undefined ? "available" : anchor.isActive ? "installed" : "disabled";
     rows.push({ id: wfId, label: WORKFLOWS[wfId].label, state, anchorId });
   }
-  const table = formatTable([["WORKFLOW", "STATE", "ANCHOR"], ...rows.map((row) => [row.id, row.state, row.anchorId])]);
+  const table = formatTable([["LABEL", "WORKFLOW", "STATE", "ANCHOR"], ...rows.map((row) => [row.label, row.id, row.state, row.anchorId])]);
   emit(ctx, `${table}\n`, { workflows: rows });
 }
 

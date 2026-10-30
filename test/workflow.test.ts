@@ -128,6 +128,15 @@ describe("workflow list (anchor-only probe)", () => {
     });
   });
 
+  it("human table renders the label as the first column", async () => {
+    const io = new Capture();
+    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => NOT_FOUND, 404);
+
+    expect(await runCli(io, "workflow", "list")).toBe(EXIT.ok);
+    expect(io.stdoutText).toMatch(/^LABEL\s+/m);
+    expect(io.stdoutText).toMatch(/Research\s+research\s+available\s+/);
+  });
+
   it("present + active reads installed; present + archived reads disabled", async () => {
     const io = new Capture();
     route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => ({ object: { id: ANCHOR_ID, isActive: true } }));

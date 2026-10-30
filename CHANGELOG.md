@@ -8,6 +8,14 @@ history.
 
 ## 2026-10-30
 
+- **fix: `notees workflow list` human table renders the workflow label as its
+  first column.** The label (from `@notees/domain`'s `WORKFLOWS` registry) was
+  collected into every row but surfaced only in `--json`; the human table now
+  leads with `LABEL` (then WORKFLOW / STATE / ANCHOR), matching the other
+  human tables' display-name-first idiom. The `--json` shape is unchanged.
+  - Verification: `pnpm typecheck && pnpm test` — all green (184 tests,
+    including a new human-table assertion on the label column).
+
 - **feat: `notees workflow` + `notees feature` — CLI parity for the
   workflows mechanism (vendor bump to main `b3558430f`).** The workflows
   slice lands from the main repo (the `@notees/domain` workflow registry —
