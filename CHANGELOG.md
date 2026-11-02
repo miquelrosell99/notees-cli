@@ -6,6 +6,19 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-02
+
+- **docs(agents): gate economics + host memory discipline in the development
+  skill.** Two-tier gate (mirroring the main repo's 2026-10-30 ruling):
+  typecheck + the covering test files are the per-task loop; the full gate
+  (`pnpm typecheck && pnpm test` from the root) is blocking at pre-landing,
+  after a rebase onto a moved main, and when the change touches the vendored
+  packages' public API or the batch/shell write paths. Same pass records the
+  host discipline: one suite at a time (never parallel full gates — the suite
+  boots a real vendored server and two concurrent gates OOM the dev host).
+  Files: `.agents/skills/notees-cli-development/SKILL.md`. Docs-only; no code
+  surface.
+
 ## 2026-10-30
 
 - **fix: `notees workflow list` human table renders the workflow label as its

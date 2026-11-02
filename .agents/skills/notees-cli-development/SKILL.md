@@ -51,9 +51,19 @@ through the submodule, the main repo's `docs/developers/` runbooks.
 
 ## Gate before declaring done
 
-```sh
-pnpm typecheck && pnpm test   # from the repo root; all green = blocking gate
-```
+Two tiers:
+
+- **Scoped (the per-task loop):** `pnpm typecheck` + `pnpm test` on the test
+  files covering the change (or `pnpm --filter <area> test -- <files>`).
+  Red-green rides those files.
+- **Full (`pnpm typecheck && pnpm test` from the repo root): blocking at
+  pre-landing, after a rebase onto a moved main, and when the change touches
+  the vendored packages' public API or the batch/shell write paths.**
+
+Host memory discipline: one suite at a time — never parallel full gates (two
+concurrent gates OOM the dev host); sequential dispatches whose gates overlap;
+the suite boots a real vendored server, so give it room; a red that vanishes
+on an unloaded re-run is a load symptom — root-cause before retrying.
 
 ## Read by topic
 
