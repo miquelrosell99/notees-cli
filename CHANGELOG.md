@@ -8,6 +8,17 @@ history.
 
 ## 2026-11-02
 
+- **fix(ci): build the root bundle before the test gate.** `pnpm-workspace.yaml`
+  does not list the root project, so `pnpm -r build` compiled only the
+  vendored packages and CI tested with no `dist/cli.js` — the
+  `release-bundle.test.ts` gate (shipped with the sax fix) failed every push
+  with "dist/cli.js missing", and release.yml had the same ordering.
+  ci.yml now runs `pnpm -r build && pnpm build`; release.yml builds the root
+  bundle before typecheck/test in its gate step.
+  - Verification: the two red CI runs failed only at
+    `test/release-bundle.test.ts` ("dist/cli.js missing"); local gate
+    (`pnpm build && pnpm typecheck && pnpm test`) green on node 22 and 26.
+
 - **feat: `notees import zotero-rdf` writes the full Zotero-aligned field set
   (vendor bump to main `d2c5d0f69`).** The full-alignment slice lands from the
   main repo (31 new source pool properties, the complete 39-class

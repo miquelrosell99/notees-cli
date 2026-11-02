@@ -29,11 +29,14 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Gate + build the bundle
+        # pnpm -r builds only the vendored workspace packages
+        # (pnpm-workspace.yaml excludes the root), so build the root bundle
+        # before the test gate — test/release-bundle.test.ts gates dist/cli.js.
         run: |
           pnpm -r --workspace-concurrency=1 build
+          pnpm build
           pnpm typecheck
           pnpm test
-          pnpm build
       - name: Stage the release asset
         run: |
           # The bundle is ESM; a bare .js file without a package.json beside

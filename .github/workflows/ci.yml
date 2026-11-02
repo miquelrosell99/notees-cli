@@ -28,6 +28,9 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Build
-        run: pnpm -r --workspace-concurrency=1 build
+        # pnpm -r builds only the vendored workspace packages
+        # (pnpm-workspace.yaml excludes the root); the root bundle must be
+        # built explicitly — test/release-bundle.test.ts gates dist/cli.js.
+        run: pnpm -r --workspace-concurrency=1 build && pnpm build
       - name: Test
         run: pnpm test
