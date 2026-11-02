@@ -84,7 +84,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `doctor` | auth + reachability + version probe | (resolves flag > env > stored) |
 | `shell` | scripting REPL over the object API | `[script]` |
 | `export` | Markdown / JSON archive / BibTeX bundles | `markdown --ids`, `json --class` |
-| `import` | bibtex / csl-json / zotero-rdf (value-filling upsert) / logseq-db sources | `--dry-run` |
+| `import` | bibtex / csl-json / zotero-rdf (value-filling upsert over the full aligned Zotero vocabulary, gated by the item class's bound field roster; match citekey → doi → isbn → title → create) / logseq-db sources | `--dry-run` |
 
 Destructive commands refuse without `--yes`: they print a blast-radius preview and exit 2. Exit codes: 0 ok, 1 domain, 2 usage, 3 auth, 4 conflict, 5 network.
 

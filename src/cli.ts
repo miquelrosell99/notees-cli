@@ -24,6 +24,7 @@ import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_SPECS,
   SYSTEM_PROPERTY_UUIDS,
+  SYSTEM_SOURCE_CLASS_BINDINGS,
   WORKFLOWS,
   WORKSPACE_FEATURE_MAP,
   chainNodeIds,
@@ -33,6 +34,7 @@ import {
   parseDateNodeId,
   parseIsoDate,
   planWorkflowToggle,
+  sourceBindingPropertyOf,
   workflowAnchorId,
   type FamilyFeature,
   type SystemClassName,
@@ -2800,6 +2802,8 @@ interface SourceImportOptions {
   dryRun?: boolean;
   /** Match-only mode (the --no-create flag): apply updates/adoptions, skip entries that would create a source. */
   create?: boolean;
+  /** Identifier adoption tiers (zotero-rdf): when the citekey misses, match by doi, then isbn, before the title adoption. */
+  adoptByIdentifier?: boolean;
   /** Notees-wins fill (zotero-rdf): write only the properties the matched node does not already hold a value for. */
   fillOnlyEmpty?: boolean;
   /** Per-item extra schema fills beyond the shared CSL spec (zotero-rdf). */
@@ -2850,30 +2854,95 @@ interface ImportEntryPlan {
 }
 
 /**
+ * The source base family: the vendored SYSTEM_PROPERTY_SPECS entries riding
+ * `bindTo: "source"` WITHOUT `bind: false` — bound on the source base itself
+ * (citekey, authors, doi, isbn, publicationDate, publisher, url, attachments,
+ * pmid, pmcid, linkedAuthors, editors), so every source-class member carries
+ * them through the extends chain. Everything else in the pool is per-class
+ * and gated by the binding roster below.
+ */
+const SOURCE_BASE_PROPERTIES: ReadonlySet<SystemPropertyName> = new Set(
+  (Object.entries(SYSTEM_PROPERTY_SPECS) as Array<[
+    SystemPropertyName,
+    { bindTo?: string; bind?: boolean },
+  ]>)
+    .filter(([, spec]) => spec.bindTo === "source" && spec.bind !== false)
+    .map(([name]) => name),
+);
+
+/**
+ * Every pool property an item of one source class may take: the vendored
+ * SYSTEM_SOURCE_CLASS_BINDINGS roster for the class (the full Zotero
+ * alignment table) plus the base family. A parsed field bound nowhere on the
+ * item's class never becomes a fill — the aligned set is exactly this.
+ */
+function sourceClassProperties(className: string): ReadonlySet<SystemPropertyName> {
+  const allowed = new Set<SystemPropertyName>(SOURCE_BASE_PROPERTIES);
+  const bindings = (SYSTEM_SOURCE_CLASS_BINDINGS as Partial<Record<string, readonly (SystemPropertyName | { property: SystemPropertyName; pinned?: boolean })[]>>)[className];
+  if (bindings !== undefined) {
+    for (const ref of bindings) allowed.add(sourceBindingPropertyOf(ref));
+  }
+  return allowed;
+}
+
+/**
  * zotero-rdf only: the schema fills beyond the shared CSL spec (the parser's
- * ZoteroItem extras). The container title follows the CSL convention the
- * schema names imply — a book_section's parent title is the Book title,
- * everything else's is the Publication title.
+ * ZoteroItem extras), gated by the item's class binding roster — a field the
+ * class does not bind (numPages on a journal article, z:code on a document)
+ * is parsed but never filled. The container title follows the container
+ * resource's tag when the parser resolved one (bib:Journal → publicationTitle,
+ * bib:Book → bookTitle, bib:ConferenceProceedings → proceedingsTitle,
+ * bib:Series → series, bib:Website → websiteTitle, bib:Blog → blogTitle);
+ * otherwise the class convention — a book_section's parent title is the Book
+ * title, everything else's is the Publication title.
  */
 function zoteroExtraFills(item: CslItem): SourceFieldFill[] {
   const z = item as ZoteroItem;
+  const className = cslTypeToClassName(item.type);
+  const allowed = sourceClassProperties(className);
   const fills: SourceFieldFill[] = [];
-  if (z.abstract !== undefined && z.abstract.length > 0) fills.push({ name: "abstract", value: z.abstract });
-  if (z.volume !== undefined && z.volume.length > 0) fills.push({ name: "volume", value: z.volume });
-  if (z.issue !== undefined && z.issue.length > 0) fills.push({ name: "issue", value: z.issue });
-  if (z.page !== undefined && z.page.length > 0) fills.push({ name: "pages", value: z.page });
-  if (z.ISSN !== undefined && z.ISSN.length > 0) fills.push({ name: "issn", value: z.ISSN });
-  if (z.language !== undefined && z.language.length > 0) fills.push({ name: "language", value: z.language });
-  if (z.shortTitle !== undefined && z.shortTitle.length > 0) fills.push({ name: "shortTitle", value: z.shortTitle });
-  if (z.extra !== undefined && z.extra.length > 0) fills.push({ name: "extra", value: z.extra });
+  const push = (name: SystemPropertyName, value: string | undefined): void => {
+    if (value !== undefined && value.length > 0 && allowed.has(name)) {
+      fills.push({ name, value });
+    }
+  };
+  push("abstract", z.abstract);
+  push("volume", z.volume);
+  push("issue", z.issue);
+  push("pages", z.page);
+  push("issn", z.ISSN);
+  push("language", z.language);
+  push("shortTitle", z.shortTitle);
+  push("extra", z.extra);
   if (z.identifiers !== undefined && z.identifiers.length > 0) {
-    fills.push({ name: "identifier", value: z.identifiers.join("; ") });
+    push("identifier", z.identifiers.join("; "));
   }
+  push("rights", z.rights);
+  push("edition", z.edition);
+  push("pmcid", z.pmcid);
+  push("pmid", z.pmid);
+  push("numPages", z.numPages);
+  push("libraryCatalog", z.libraryCatalog);
+  push("court", z.court);
+  push("code", z.code);
+  push("codeNumber", z.codeNumber);
+  push("workType", z.workType);
+  push("session", z.session);
+  push("accessDate", z.accessDate);
+  push("callNumber", z.callNumber);
+  // dcterms:isPartOf merges (the item's own values already won in the
+  // parser): the container's scalar fields, its ISSN, and its title.
+  if (z.poolFields !== undefined) {
+    for (const [name, value] of Object.entries(z.poolFields)) {
+      push(name as SystemPropertyName, value);
+    }
+  }
+  push("issn", z.containerIssn);
   if (z["container-title"] !== undefined && z["container-title"].length > 0) {
-    fills.push({
-      name: cslTypeToClassName(item.type) === "book_section" ? "bookTitle" : "publicationTitle",
-      value: z["container-title"],
-    });
+    push(
+      z.containerTitleProperty ?? (className === "book_section" ? "bookTitle" : "publicationTitle"),
+      z["container-title"],
+    );
   }
   return fills;
 }
@@ -2957,6 +3026,9 @@ async function importZoteroRdf(ctx: CommandContext, filePath: string, options: S
   }
   await runSourceImport(ctx, "zotero-rdf", filePath, result.items, result.skipped, {
     ...options,
+    // Identifier adoption: when the citekey misses, a doi (then isbn) match
+    // adopts the node before the @citekey title tier.
+    adoptByIdentifier: true,
     // Notees-wins (the fleet's drift-reconcile ruling): the import fills only
     // the properties a matched (or freshly created) source does not already
     // hold — owner-fixed values are never clobbered, and a re-run is a no-op.
@@ -3089,20 +3161,35 @@ async function runSourceImport(
   const entryFills: Array<{ citekey: string; nodeId: string; action: string; fills: SourceFieldFill[] }> = [];
 
   for (const [specIndex, spec] of specs.entries()) {
-    // (a) citekey-property match stays authoritative; (b) title match adopts.
+    // (a) citekey-property match stays authoritative; (b) a doi, then an
+    // isbn identifier adopts (the main repo's match order — the Zotero
+    // citationKey rides into the citekey fill); (c) title match adopts.
     const existing = await findSourceByCitekey(ctx, spec.citekey);
     let matched = existing;
     let action: "create" | "update" | "adopt";
     if (existing !== undefined) {
       action = "update";
     } else {
-      const titleMatches = await findSourcesByTitle(ctx, spec.citekey);
-      if (titleMatches.length > 0) {
-        matched = titleMatches[0];
+      // (b) Identifier adoption tiers (zotero-rdf only — a bibtex citekey
+      // identifies an ENTRY, two entries may legitimately share a doi): a
+      // doi, then an isbn hit adopts (the main repo's match order — the
+      // Zotero citationKey rides into the citekey fill).
+      const identifierMatch = options.adoptByIdentifier === true
+        ? (spec.doi !== undefined ? await findSourceByIdentifier(ctx, "doi", spec.doi) : undefined) ??
+          (spec.isbn !== undefined ? await findSourceByIdentifier(ctx, "isbn", spec.isbn) : undefined)
+        : undefined;
+      if (identifierMatch !== undefined) {
+        matched = identifierMatch;
         action = "adopt";
-        counts.ambiguous += titleMatches.length - 1;
       } else {
-        action = "create";
+        const titleMatches = await findSourcesByTitle(ctx, spec.citekey);
+        if (titleMatches.length > 0) {
+          matched = titleMatches[0];
+          action = "adopt";
+          counts.ambiguous += titleMatches.length - 1;
+        } else {
+          action = "create";
+        }
       }
     }
 
@@ -3319,6 +3406,26 @@ async function upsertSource(
         }
         continue;
       }
+      if (fill.name === "accessDate") {
+        // accessDate is a datetime schema (day precision): a Zotero
+        // dcterms:dateSubmitted value ("2021-04-05", optionally with a time
+        // part) resolves through the date chain at day precision; anything
+        // else falls back to the raw string (the publicationDate precedent).
+        const day = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ].*)?$/.exec(String(fill.value));
+        if (day !== null) {
+          const iso = `${day[1]}-${day[2]!.padStart(2, "0")}-${day[3]!.padStart(2, "0")}`;
+          try {
+            parseIsoDate(iso);
+            const ref = await ensureDateChainRef(ctx, iso, "day");
+            await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.accessDate, ref);
+            continue;
+          } catch {
+            // Not a real calendar day — the raw fallback below.
+          }
+        }
+        await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS.accessDate, fill.value);
+        continue;
+      }
       const values = Array.isArray(fill.value) ? fill.value : [fill.value];
       for (let idx = 0; idx < values.length; idx += 1) {
         await setProperty(ctx, id, SYSTEM_PROPERTY_UUIDS[fill.name], values[idx], idx);
@@ -3424,6 +3531,41 @@ async function ensureYearNode(ctx: CommandContext, yearId: string, label: string
   await ensureChainNode(ctx, yearId, label, SYSTEM_CLASS_UUIDS.year, null);
 }
 
+/**
+ * Ensure the year → month → day chain for an ISO date exists and return the
+ * {nodeId} ref at the requested precision. The nodes ride the compact
+ * dateNodeLabel names (the `today`/`date ensure` convention); the ids are
+ * content-addressed (deterministic), so ensure-then-link is idempotent.
+ */
+async function ensureDateChainRef(
+  ctx: CommandContext,
+  iso: string,
+  precision: "year" | "month" | "day",
+): Promise<{ nodeId: string }> {
+  const parts = parseIsoDate(iso);
+  const yearId = dateNodeId(iso, "year");
+  await ensureChainNode(ctx, yearId, dateNodeLabel(parts, "year"), SYSTEM_CLASS_UUIDS.year, null);
+  if (precision === "month" || precision === "day") {
+    await ensureChainNode(
+      ctx,
+      dateNodeId(iso, "month"),
+      dateNodeLabel(parts, "month"),
+      SYSTEM_CLASS_UUIDS.month,
+      yearId,
+    );
+  }
+  if (precision === "day") {
+    await ensureChainNode(
+      ctx,
+      dateNodeId(iso, "day"),
+      dateNodeLabel(parts, "day"),
+      SYSTEM_CLASS_UUIDS.day,
+      dateNodeId(iso, "month"),
+    );
+  }
+  return { nodeId: dateNodeId(iso, precision) };
+}
+
 /** `notees today`: ensure the local date chain + the day page,
  *  print the day object; --append adds a text block to it and reports
  *  the created block's id (human line / `appendedBlock` in --json). */
@@ -3502,6 +3644,23 @@ async function findSourceByCitekey(
   citekey: string,
 ): Promise<FullApiObject | undefined> {
   const query = queryString({ property: `${SYSTEM_PROPERTY_UUIDS.citekey}:${citekey}` });
+  const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/objects${query}`);
+  const first = body.objects[0];
+  if (first === undefined) return undefined;
+  return getFullObject(ctx, first.id);
+}
+
+/**
+ * Identifier lookup for the doi/isbn adoption tier: an exact
+ * property-value hit on the identifier schema (the citekey lookup's
+ * mechanism, applied to doi/isbn).
+ */
+async function findSourceByIdentifier(
+  ctx: CommandContext,
+  prop: "doi" | "isbn",
+  value: string,
+): Promise<FullApiObject | undefined> {
+  const query = queryString({ property: `${SYSTEM_PROPERTY_UUIDS[prop]}:${value}` });
   const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/objects${query}`);
   const first = body.objects[0];
   if (first === undefined) return undefined;
@@ -4628,7 +4787,7 @@ function buildProgram(): Command {
     });
   importOptions(importCmd.command("zotero-rdf <file>"))
     .description(
-      "import a Zotero RDF export as a value-filling upsert (Notees-wins: only properties a matched source does not already hold are filled; " +
+      "import a Zotero RDF export as a value-filling upsert (match: citekey → doi → isbn → @citekey title → create; Notees-wins: only properties a matched source does not already hold are filled, gated by the item class's bound field roster; " +
       "dc:subject tags and attachments are counted but never mapped; unkeyed items are skipped and listed)",
     )
     .action(async (filePath: string, options: SourceImportOptions, command: Command) => {

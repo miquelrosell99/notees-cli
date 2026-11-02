@@ -8,6 +8,56 @@ history.
 
 ## 2026-11-02
 
+- **feat: `notees import zotero-rdf` writes the full Zotero-aligned field set
+  (vendor bump to main `d2c5d0f69`).** The full-alignment slice lands from the
+  main repo (31 new source pool properties, the complete 39-class
+  `SYSTEM_SOURCE_CLASS_BINDINGS` roster) and the CLI's fill now covers the
+  complete Zotero export vocabulary, reusing the vendored tables rather than
+  duplicating them.
+  - The parser (`src/zotero-rdf.ts`) mirrors the main repo's bulk-importer
+    vocab: `dc:rights`→rights, `prism:edition`→edition, `z:PMCID`→pmcid,
+    `z:numPages`→numPages, `z:libraryCatalog`→libraryCatalog,
+    `z:authority`→court, `z:code`→code, `z:codeNumber`→codeNumber,
+    `z:type`→workType, `z:session`→session, `z:url`→url,
+    `dcterms:dateSubmitted`→accessDate, plus the structural shapes —
+    `dc:identifier` now handles the nested `dcterms:URI`/`rdf:value` URL, a
+    bare `rdf:resource` URL, and plain-URL text; `dc:subject`/`dcterms:LCC`
+    is the callNumber (plain-text subjects stay counted, never mapped);
+    `dc:relation` carries a URL; `z:shortTitle` wins over
+    `dcterms:alternative`; `z:PMID` and the `pmid:` identifier prefix ride
+    the pmid property (no longer the Identifier schema); and
+    `dcterms:isPartOf` resolves the container title by the container
+    resource's tag (Journal→publicationTitle, Book→bookTitle,
+    ConferenceProceedings→proceedingsTitle, Series→series,
+    Website→websiteTitle, Blog→blogTitle), merging the container's scalar
+    fields and ISSN with the item's own values always winning.
+  - The fill (`zoteroExtraFills`) gates every candidate through the vendored
+    `SYSTEM_SOURCE_CLASS_BINDINGS` roster for the item's class plus the
+    source base family (derived from `SYSTEM_PROPERTY_SPECS` `bindTo:
+    "source"` without `bind: false`) — a field the class does not bind
+    (numPages on a journal article, z:code on a document) is parsed but
+    never filled.
+  - Match order gains the main repo's identifier adoption tiers:
+    citekey → doi → isbn → `@citekey` title → create. A doi/isbn hit adopts
+    the node (the Zotero citationKey rides into the citekey fill, the class
+    eligibility repair applies); the Notees-wins fill policy is unchanged —
+    a matched node keeps every value it already holds and a re-run plans
+    zero fills.
+  - accessDate is a datetime schema: an ISO `dcterms:dateSubmitted` value
+    resolves through the deterministic date chain at day precision (the
+    `today`/`date ensure` convention), falling back to the raw string.
+  - `--json` report shapes are unchanged (the fill list is per-entry data);
+    the command help text and README index row record the new match order
+    and the binding gate.
+  - Tests: `test/cli.test.ts` — the full-entry fixture's `pmid:…`
+    identifier now asserts the pmid property; a new alignment spec (rights/
+    pmid/pmcid/libraryCatalog/accessDate/callNumber/container merges landed,
+    numPages/edition gated out, the case itemType riding the document class
+    with court/workType, second-run idempotency) and a doi/isbn adoption
+    spec.
+  - **Verification**: `pnpm -r --filter "@notees/*" build` (after the vendor
+    bump) + `pnpm typecheck && pnpm test` — all green (187/187, 5 files).
+
 - **chore(deps): node 26 support — better-sqlite3 12 via a pnpm override.**
   The vendored `@notees/*` packages pin `better-sqlite3` ^11, whose native
   build fails on node 26 (V8 API removals — `PropertyCallbackInfo::This`,

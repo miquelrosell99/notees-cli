@@ -18,11 +18,20 @@
  *     join with "; "; an organization without a name is counted
  *     (`publisherNameMissing`), never address-guessed.
  *
- * Field mapping beyond the CSL core (dcterms:abstract, prism:volume,
- * prism:number, bib:pages, z:language, dcterms:alternative, dc:description,
- * z:PMID, unclassified dc:identifier prefixes) rides on {@link ZoteroItem} —
- * the CLI's fill step turns those into schema values. `dc:subject` (Zotero
- * tags) is counted but never mapped: class tags are a different semantics.
+ * The vocabulary is the full Zotero alignment slice (mirroring the main
+ * repo's bulk-importer parser, `scripts/zotero-rdf-parser.mts` in the
+ * vendored monorepo): the direct-scalar table {@link ZOTERO_VOCAB} maps
+ * Zotero's RDF terms to Notees pool property names, plus the structural
+ * shapes — `dc:identifier` (prefixed ISBN/DOI/ISSN/PMID, plain/nested URLs),
+ * `dc:subject`/`dcterms:LCC` (the call number), `dc:relation`, `z:shortTitle`
+ * winning over `dcterms:alternative`, and `dcterms:isPartOf` container
+ * resolution (the container resource's tag decides the title field; its
+ * scalar fields and ISSN merge in, the item's own values always winning).
+ * `dc:subject` plain-text tags stay counted-but-unmapped: class tags are a
+ * different semantics. The CLI's fill step gates every parsed field through
+ * the vendored per-class binding roster (SYSTEM_SOURCE_CLASS_BINDINGS) plus
+ * the source base family, so a field bound nowhere on the item's class never
+ * becomes a fill.
  *
  * sax matches prefixed tag names literally (no namespace resolution), decodes
  * entities, and may deliver character data in chunks — this module tracks the
@@ -31,7 +40,7 @@
 
 import sax from "sax";
 
-import { ZOTERO_ITEM_TYPE_TO_CLASS } from "@notees/domain";
+import { ZOTERO_ITEM_TYPE_TO_CLASS, type SystemPropertyName } from "@notees/domain";
 import {
   CLASS_NAME_TO_CSL_TYPE,
   type CslItem,
@@ -46,8 +55,28 @@ export interface ZoteroItem extends CslItem {
   language?: string;
   shortTitle?: string;
   extra?: string;
-  /** Unclassified dc:identifier values + z:PMID ("PMID: …") → the Identifier schema. */
+  /** Unclassified dc:identifier values → the Identifier schema. */
   identifiers?: string[];
+  /** The full-alignment vocabulary (pool property names match the schemas). */
+  rights?: string;
+  edition?: string;
+  pmid?: string;
+  pmcid?: string;
+  numPages?: string;
+  libraryCatalog?: string;
+  court?: string;
+  code?: string;
+  codeNumber?: string;
+  workType?: string;
+  session?: string;
+  accessDate?: string;
+  callNumber?: string;
+  /** dcterms:isPartOf: the pool property the container title fills, decided by the container resource's tag. */
+  containerTitleProperty?: SystemPropertyName;
+  /** dcterms:isPartOf: the container's ISSN (item-wins already applied). */
+  containerIssn?: string;
+  /** dcterms:isPartOf: container scalar fields merged item-wins, pool-keyed. */
+  poolFields?: Record<string, string>;
 }
 
 export interface ZoteroRdfParseResult {
@@ -70,17 +99,31 @@ type LeafField =
   | "itemType"
   | "title"
   | "date"
-  | "identifier"
   | "abstract"
   | "language"
   | "shortTitle"
+  | "altTitle"
   | "extra"
   | "uri"
   | "pmid"
+  | "pmcid"
+  | "rights"
+  | "edition"
+  | "numPages"
+  | "libraryCatalog"
+  | "court"
+  | "code"
+  | "codeNumber"
+  | "workType"
+  | "session"
+  | "accessDate"
+  | "identifierUrl"
+  | "lccValue"
+  | "containerField"
+  | "containerIdentifier"
   | "volume"
   | "issue"
   | "pages"
-  | "subject"
   | "publisherName"
   | "containerTitle"
   | "surname"
@@ -96,20 +139,42 @@ interface DraftEntry {
   isbn?: string;
   issn?: string;
   doi?: string;
+  pmid?: string;
+  pmcid?: string;
   identifiers: string[];
   abstract?: string;
   language?: string;
   shortTitle?: string;
+  /** dcterms:alternative — the shortTitle fallback when z:shortTitle is absent. */
+  altTitle?: string;
   extra?: string;
   uri?: string;
+  rights?: string;
+  edition?: string;
+  numPages?: string;
+  libraryCatalog?: string;
+  court?: string;
+  code?: string;
+  codeNumber?: string;
+  workType?: string;
+  session?: string;
+  accessDate?: string;
+  callNumber?: string;
   volume?: string;
   issue?: string;
   pages?: string;
+  /** The nested dcterms:URI/rdf:value captured inside an open dc:identifier. */
+  pendingUrl?: string;
+  /** The dcterms:LCC/rdf:value captured inside an open dc:subject. */
+  pendingLcc?: string;
   tags: number;
   publishers: string[];
   authors: CslName[];
   editors: CslName[];
+  containerTag?: string;
   containerTitle?: string;
+  containerFields: Record<string, string>;
+  containerIssn?: string;
 }
 
 /** Fallback when z:itemType is absent: the bib element name itself
@@ -122,6 +187,79 @@ const BIB_TAG_TO_CSL: Record<string, CslType> = {
   thesis: "thesis",
   dissertation: "thesis",
 };
+
+/**
+ * The full-alignment vocab: a Zotero-RDF direct-scalar term → the Notees pool
+ * property name (the vendored schemas — SYSTEM_PROPERTY_UUIDS keys). Mirrors
+ * the main repo's bulk-importer parser VOCAB; structural terms
+ * (dc:identifier, dc:publisher, dc:subject, dc:relation, the creator Seqs,
+ * dcterms:isPartOf, dcterms:alternative) are parsed by dedicated walkers.
+ */
+const ZOTERO_VOCAB: Record<string, SystemPropertyName> = {
+  "dcterms:abstract": "abstract",
+  "dc:description": "extra",
+  "dc:rights": "rights",
+  "prism:volume": "volume",
+  "prism:number": "issue",
+  "prism:edition": "edition",
+  "bib:pages": "pages",
+  "z:language": "language",
+  "z:PMCID": "pmcid",
+  "z:numPages": "numPages",
+  "z:shortTitle": "shortTitle",
+  "z:libraryCatalog": "libraryCatalog",
+  "z:authority": "court",
+  "z:code": "code",
+  "z:codeNumber": "codeNumber",
+  "z:type": "workType",
+  "z:session": "session",
+  "z:url": "url",
+  "dcterms:dateSubmitted": "accessDate",
+};
+
+/**
+ * dcterms:isPartOf container resolution: the nested resource's element name
+ * decides which pool property its dc:title fills (the main repo's
+ * PART_OF_TITLE_FIELD). Unrecognized containers keep the fill's class-based
+ * fallback (bookTitle for a book_section, publicationTitle otherwise).
+ */
+const PART_OF_TITLE_PROPERTY: Record<string, SystemPropertyName> = {
+  "bib:Journal": "publicationTitle",
+  "bib:Periodical": "publicationTitle",
+  "bib:Book": "bookTitle",
+  "bib:ConferenceProceedings": "proceedingsTitle",
+  "bib:Series": "series",
+  "bib:Website": "websiteTitle",
+  "bib:Blog": "blogTitle",
+};
+
+/** The draft slot holding the item's own value for a vocab pool key
+ * (the item always wins over a container repeat). */
+function itemPoolValue(draft: DraftEntry, key: SystemPropertyName): string | undefined {
+  switch (key) {
+    case "abstract": return draft.abstract;
+    case "extra": return draft.extra;
+    case "rights": return draft.rights;
+    case "volume": return draft.volume;
+    case "issue": return draft.issue;
+    case "edition": return draft.edition;
+    case "pages": return draft.pages;
+    case "language": return draft.language;
+    case "pmid": return draft.pmid;
+    case "pmcid": return draft.pmcid;
+    case "numPages": return draft.numPages;
+    case "shortTitle": return draft.shortTitle ?? draft.altTitle;
+    case "libraryCatalog": return draft.libraryCatalog;
+    case "court": return draft.court;
+    case "code": return draft.code;
+    case "codeNumber": return draft.codeNumber;
+    case "workType": return draft.workType;
+    case "session": return draft.session;
+    case "url": return draft.uri;
+    case "accessDate": return draft.accessDate;
+    default: return undefined;
+  }
+}
 
 /** z:itemType → CSL type via the vendored Zotero manifest (the item type maps
  *  to a source class, the class maps to its CSL type — magazineArticle lands
@@ -148,15 +286,15 @@ function yearOf(value: string | undefined): number | undefined {
 }
 
 /** Best-effort extraction from dc:identifier text ("ISBN 978…", "DOI: 10.…"). */
-function identifierOf(kind: "ISBN" | "ISSN" | "DOI", value: string | undefined): string | undefined {
+function identifierOf(kind: "ISBN" | "ISSN" | "DOI" | "PMID", value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const match = new RegExp(`${kind}\\s*[:#]?\\s*([^\\s;,]+)`, "i").exec(value);
   return match === null ? undefined : match[1];
 }
 
-/** dc:identifier classification by prefix: isbn:/issn:/doi: (or the textual
- *  "ISBN …" / "DOI …" forms) land on their schemas; pmid:/arxiv:/anything
- *  else lands on the Identifier schema verbatim. */
+/** dc:identifier classification by prefix: isbn:/issn:/doi:/pmid: (or the
+ *  textual "ISBN …" / "DOI …" forms) land on their schemas; a plain http(s)
+ *  URL lands on url; anything else lands on the Identifier schema verbatim. */
 function commitIdentifier(entry: DraftEntry, value: string): void {
   const lower = value.toLowerCase();
   if (lower.startsWith("isbn")) {
@@ -165,6 +303,10 @@ function commitIdentifier(entry: DraftEntry, value: string): void {
     entry.doi = identifierOf("DOI", value) ?? value;
   } else if (lower.startsWith("issn")) {
     entry.issn = identifierOf("ISSN", value) ?? value;
+  } else if (lower.startsWith("pmid")) {
+    entry.pmid = identifierOf("PMID", value) ?? value;
+  } else if (/^https?:\/\/\S+$/i.test(value)) {
+    entry.uri = value;
   } else {
     entry.identifiers.push(value);
   }
@@ -189,12 +331,42 @@ function entryToCsl(entryTag: string, draft: DraftEntry): ZoteroItem {
   if (draft.issue !== undefined) item.issue = draft.issue;
   if (draft.pages !== undefined) item.page = draft.pages;
   if (draft.publishers.length > 0) item.publisher = draft.publishers.join("; ");
-  if (draft.containerTitle !== undefined) item["container-title"] = draft.containerTitle;
   if (draft.abstract !== undefined) item.abstract = draft.abstract;
   if (draft.language !== undefined) item.language = draft.language;
-  if (draft.shortTitle !== undefined) item.shortTitle = draft.shortTitle;
+  // z:shortTitle wins over dcterms:alternative (the main repo's ruling).
+  const shortTitle = draft.shortTitle ?? draft.altTitle;
+  if (shortTitle !== undefined) item.shortTitle = shortTitle;
   if (draft.extra !== undefined) item.extra = draft.extra;
   if (draft.identifiers.length > 0) item.identifiers = draft.identifiers;
+  if (draft.pmid !== undefined) item.pmid = draft.pmid;
+  if (draft.pmcid !== undefined) item.pmcid = draft.pmcid;
+  if (draft.rights !== undefined) item.rights = draft.rights;
+  if (draft.edition !== undefined) item.edition = draft.edition;
+  if (draft.numPages !== undefined) item.numPages = draft.numPages;
+  if (draft.libraryCatalog !== undefined) item.libraryCatalog = draft.libraryCatalog;
+  if (draft.court !== undefined) item.court = draft.court;
+  if (draft.code !== undefined) item.code = draft.code;
+  if (draft.codeNumber !== undefined) item.codeNumber = draft.codeNumber;
+  if (draft.workType !== undefined) item.workType = draft.workType;
+  if (draft.session !== undefined) item.session = draft.session;
+  if (draft.accessDate !== undefined) item.accessDate = draft.accessDate;
+  if (draft.callNumber !== undefined) item.callNumber = draft.callNumber;
+  // dcterms:isPartOf resolution: the container title rides the CSL
+  // container-title slot (downstream exporters) plus the pool-property pick
+  // decided by the container resource's tag; the container's scalar fields
+  // and ISSN merge into poolFields only where the item carries no value.
+  if (draft.containerTitle !== undefined) item["container-title"] = draft.containerTitle;
+  if (draft.containerTag !== undefined && PART_OF_TITLE_PROPERTY[draft.containerTag] !== undefined) {
+    item.containerTitleProperty = PART_OF_TITLE_PROPERTY[draft.containerTag]!;
+  }
+  const poolFields: Record<string, string> = {};
+  for (const [key, value] of Object.entries(draft.containerFields)) {
+    if (itemPoolValue(draft, key as SystemPropertyName) === undefined) poolFields[key] = value;
+  }
+  if (draft.containerIssn !== undefined && draft.issn === undefined) {
+    item.containerIssn = draft.containerIssn;
+  }
+  if (Object.keys(poolFields).length > 0) item.poolFields = poolFields;
   return item;
 }
 
@@ -213,7 +385,8 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
   let entryTag: string | null = null;
   let entryDepth = -1;
   // Leaf accumulator: which field the arriving character data belongs to.
-  let textTarget: { tag: string; field: LeafField } | null = null;
+  // `poolKey` carries the vocab target for containerField commits.
+  let textTarget: { tag: string; field: LeafField; poolKey?: SystemPropertyName } | null = null;
   let textBuffer = "";
   // Author/editor list parsing state (Zotero exports use `bib:Authors` and the
   // lowercase `bib:authors`/`bib:editors`; entries are foaf:Person with
@@ -232,6 +405,24 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
   let publisherDepth = -1;
   let publisherOrgDepth = -1;
   let publisherOrgHasName = false;
+  // dc:identifier tracking: the element may be a plain-text leaf ("ISBN …")
+  // or nest <dcterms:URI><rdf:value>…</dcterms:URI>; a bare rdf:resource
+  // attribute is a URL. The direct text only counts when no child element
+  // opened (pretty-printed exports never mix).
+  let identifierDepth = -1;
+  let identifierHasChildren = false;
+  let identifierText = "";
+  let identifierResource = "";
+  let identifierUriDepth = -1;
+  // dc:subject tracking: a plain-text subject is a counted tag; the
+  // <dcterms:LCC><rdf:value> shape is the Library of Congress call number.
+  let subjectDepth = -1;
+  let subjectHasElement = false;
+  let subjectText = "";
+  let lccDepth = -1;
+  // dc:relation tracking: an rdf:resource attribute is a URL (plain-text
+  // relations carry no pool field).
+  let relationDepth = -1;
 
   const commitText = (): void => {
     if (textTarget === null) return;
@@ -250,9 +441,6 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
         case "date":
           entry.date = value;
           break;
-        case "identifier":
-          commitIdentifier(entry, value);
-          break;
         case "abstract":
           entry.abstract = value;
           break;
@@ -262,6 +450,9 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
         case "shortTitle":
           entry.shortTitle = value;
           break;
+        case "altTitle":
+          entry.altTitle = value;
+          break;
         case "extra":
           entry.extra = value;
           break;
@@ -269,8 +460,57 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
           entry.uri = value;
           break;
         case "pmid":
-          entry.identifiers.push(`PMID: ${value}`);
+          entry.pmid = value;
           break;
+        case "pmcid":
+          entry.pmcid = value;
+          break;
+        case "rights":
+          entry.rights = value;
+          break;
+        case "edition":
+          entry.edition = value;
+          break;
+        case "numPages":
+          entry.numPages = value;
+          break;
+        case "libraryCatalog":
+          entry.libraryCatalog = value;
+          break;
+        case "court":
+          entry.court = value;
+          break;
+        case "code":
+          entry.code = value;
+          break;
+        case "codeNumber":
+          entry.codeNumber = value;
+          break;
+        case "workType":
+          entry.workType = value;
+          break;
+        case "session":
+          entry.session = value;
+          break;
+        case "accessDate":
+          entry.accessDate = value;
+          break;
+        case "identifierUrl":
+          entry.pendingUrl = value;
+          break;
+        case "lccValue":
+          entry.pendingLcc = value;
+          break;
+        case "containerField":
+          if (textTarget.poolKey !== undefined) entry.containerFields[textTarget.poolKey] = value;
+          break;
+        case "containerIdentifier": {
+          // Only ISSN crosses over from a container — a journal's own DOI
+          // is not the item's (the main repo's ruling).
+          const match = /^ISSN\s+(\S+)/i.exec(value);
+          if (match !== null) entry.containerIssn = match[1]!;
+          break;
+        }
         case "volume":
           entry.volume = value;
           break;
@@ -279,9 +519,6 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
           break;
         case "pages":
           entry.pages = value;
-          break;
-        case "subject":
-          entry.tags += 1;
           break;
         case "publisherName":
           entry.publishers.push(value);
@@ -310,7 +547,7 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
     // Entry elements are DIRECT children of rdf:RDF and bib:*.
     if (parent === "rdf:RDF") {
       if (tag.startsWith("bib:")) {
-        entry = { aboutId: String(node.attributes["rdf:about"] ?? ""), authors: [], editors: [], identifiers: [], publishers: [], tags: 0 };
+        entry = { aboutId: String(node.attributes["rdf:about"] ?? ""), authors: [], editors: [], identifiers: [], publishers: [], tags: 0, containerFields: {} };
         entryTag = tag;
         entryDepth = tagStack.length; // index of the entry element once pushed
         tagStack.push(tag);
@@ -331,21 +568,56 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
         else if (tag === "z:itemType") textTarget = { tag, field: "itemType" };
         else if (tag === "dc:title") textTarget = { tag, field: "title" };
         else if (tag === "dc:date") textTarget = { tag, field: "date" };
-        else if (tag === "dc:identifier") textTarget = { tag, field: "identifier" };
-        else if (tag === "dcterms:abstract") textTarget = { tag, field: "abstract" };
-        else if (tag === "z:language") textTarget = { tag, field: "language" };
-        else if (tag === "dcterms:alternative") textTarget = { tag, field: "shortTitle" };
-        else if (tag === "dc:description") textTarget = { tag, field: "extra" };
+        else if (tag === "dc:identifier") {
+          identifierDepth = tagStack.length;
+          identifierHasChildren = false;
+          identifierText = "";
+          identifierResource = String(node.attributes["rdf:resource"] ?? "");
+        } else if (tag === "dcterms:alternative") textTarget = { tag, field: "altTitle" };
         else if (tag === "dcterms:URI") textTarget = { tag, field: "uri" };
         else if (tag === "z:PMID") textTarget = { tag, field: "pmid" };
-        else if (tag === "prism:volume") textTarget = { tag, field: "volume" };
-        else if (tag === "prism:number") textTarget = { tag, field: "issue" };
-        else if (tag === "bib:pages") textTarget = { tag, field: "pages" };
-        else if (tag === "dc:subject") textTarget = { tag, field: "subject" };
-        else if (tag === "bib:Authors" || tag === "bib:authors") authorsDepth = tagStack.length;
+        else if (tag === "dc:subject") {
+          subjectDepth = tagStack.length;
+          subjectHasElement = false;
+          subjectText = "";
+        } else if (tag === "dc:relation") {
+          relationDepth = tagStack.length;
+          const resource = String(node.attributes["rdf:resource"] ?? "");
+          if (/^https?:\/\//i.test(resource)) entry.uri = resource;
+        } else if (tag === "bib:Authors" || tag === "bib:authors") authorsDepth = tagStack.length;
         else if (tag === "bib:editors") editorsDepth = tagStack.length;
         else if (tag === "dcterms:isPartOf") partOfDepth = tagStack.length;
         else if (tag === "dc:publisher") publisherDepth = tagStack.length;
+        else {
+          // The full-alignment vocab: a direct-scalar Zotero term → its pool
+          // property (z:url rides the shared uri/url slot).
+          const poolKey = ZOTERO_VOCAB[tag];
+          if (poolKey !== undefined) {
+            textTarget = { tag, field: poolKey === "url" ? "uri" : (poolKey as LeafField), poolKey };
+          }
+        }
+      }
+      // Inside an open dc:identifier: any child element disqualifies the
+      // direct text; <dcterms:URI><rdf:value> is the nested URL shape.
+      if (identifierDepth !== -1 && tagStack.length > identifierDepth) {
+        identifierHasChildren = true;
+        if (tagStack.length === identifierDepth + 1 && tag === "dcterms:URI") {
+          identifierUriDepth = tagStack.length;
+        }
+        if (identifierUriDepth !== -1 && tagStack.length === identifierUriDepth + 1 && tag === "rdf:value") {
+          textTarget = { tag, field: "identifierUrl" };
+        }
+      }
+      // Inside an open dc:subject: the <dcterms:LCC><rdf:value> shape is the
+      // call number; any other child means the subject is not a plain tag.
+      if (subjectDepth !== -1 && tagStack.length > subjectDepth) {
+        subjectHasElement = true;
+        if (tagStack.length === subjectDepth + 1 && tag === "dcterms:LCC") {
+          lccDepth = tagStack.length;
+        }
+        if (lccDepth !== -1 && tagStack.length === lccDepth + 1 && tag === "rdf:value") {
+          textTarget = { tag, field: "lccValue" };
+        }
       }
       // Publisher organization: capture ONLY the foaf:name at the org's
       // direct-child depth; vcard:address and its locality never are.
@@ -357,12 +629,23 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
         textTarget = { tag, field: "publisherName" };
         publisherOrgHasName = true;
       }
-      // dcterms:isPartOf container: the nested bib:* (Journal/Book/…), then
-      // its dc:title one level down (the container-title fill). Container
-      // titles never sit at the entry's direct-child depth, so the depth
-      // checks keep the article's own title authoritative.
-      if (partOfDepth !== -1 && tag === "dc:title" && tagStack.length === partOfDepth + 2) {
-        textTarget = { tag, field: "containerTitle" };
+      // dcterms:isPartOf container: the nested bib:* (Journal/Book/…) — its
+      // tag decides the title field — then its scalar vocab fields and ISSN
+      // (the item's own values win at entry close). Container titles never
+      // sit at the entry's direct-child depth, so the depth checks keep the
+      // article's own title authoritative.
+      if (partOfDepth !== -1 && tagStack.length === partOfDepth + 1 && tag.startsWith("bib:")) {
+        entry.containerTag = tag;
+      }
+      if (partOfDepth !== -1 && tagStack.length === partOfDepth + 2) {
+        if (tag === "dc:title") {
+          textTarget = { tag, field: "containerTitle" };
+        } else if (tag === "dc:identifier") {
+          textTarget = { tag, field: "containerIdentifier" };
+        } else {
+          const poolKey = ZOTERO_VOCAB[tag];
+          if (poolKey !== undefined) textTarget = { tag, field: "containerField", poolKey };
+        }
       }
       // Author/editor list: bib:Authors|bib:editors → rdf:Seq → rdf:li → foaf:Person.
       if ((authorsDepth !== -1 || editorsDepth !== -1) && (tag === "foaf:Person" || tag === "foaf:Organization")) {
@@ -380,7 +663,14 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
   };
 
   parser.ontext = (raw) => {
-    if (textTarget !== null) textBuffer += typeof raw === "string" ? raw : String(raw);
+    const text = typeof raw === "string" ? raw : String(raw);
+    if (textTarget !== null) {
+      textBuffer += text;
+    } else if (identifierDepth !== -1 && !identifierHasChildren) {
+      identifierText += text;
+    } else if (subjectDepth !== -1 && !subjectHasElement) {
+      subjectText += text;
+    }
   };
 
   parser.oncdata = (raw) => {
@@ -406,6 +696,42 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
       publisherOrgDepth = -1;
     }
     if (publisherDepth !== -1 && tagStack.length - 1 === publisherDepth) publisherDepth = -1;
+    if (identifierUriDepth !== -1 && tagStack.length - 1 === identifierUriDepth) identifierUriDepth = -1;
+    if (identifierDepth !== -1 && tagStack.length - 1 === identifierDepth) {
+      // Resolve the identifier: the nested URI wins, then the direct text,
+      // then a bare rdf:resource URL; an empty identifier is skipped.
+      if (entry !== null) {
+        const { pendingUrl } = entry;
+        delete entry.pendingUrl;
+        if (pendingUrl !== undefined) {
+          entry.uri = pendingUrl;
+        } else if (!identifierHasChildren && identifierText.trim().length > 0) {
+          commitIdentifier(entry, identifierText.trim());
+        } else if (/^https?:\/\//i.test(identifierResource)) {
+          entry.uri = identifierResource;
+        }
+      }
+      identifierDepth = -1;
+      identifierHasChildren = false;
+      identifierText = "";
+      identifierResource = "";
+    }
+    if (lccDepth !== -1 && tagStack.length - 1 === lccDepth) lccDepth = -1;
+    if (subjectDepth !== -1 && tagStack.length - 1 === subjectDepth) {
+      if (entry !== null) {
+        const { pendingLcc } = entry;
+        delete entry.pendingLcc;
+        if (pendingLcc !== undefined) {
+          entry.callNumber = pendingLcc;
+        } else if (!subjectHasElement && subjectText.trim().length > 0) {
+          entry.tags += 1;
+        }
+      }
+      subjectDepth = -1;
+      subjectHasElement = false;
+      subjectText = "";
+    }
+    if (relationDepth !== -1 && tagStack.length - 1 === relationDepth) relationDepth = -1;
     if (entry !== null && tag === entryTag && tagStack.length - 1 === entryDepth) {
       // Entry closes: only keyed entries become items (journals etc. count
       // as skipped AND are listed — idempotency needs the stable key).
@@ -422,6 +748,9 @@ export function parseZoteroRdf(text: string): ZoteroRdfParseResult {
       authorsDepth = -1;
       editorsDepth = -1;
       partOfDepth = -1;
+      identifierDepth = -1;
+      subjectDepth = -1;
+      relationDepth = -1;
       person = null;
       personIsOrg = false;
     }

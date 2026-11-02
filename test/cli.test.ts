@@ -1423,6 +1423,88 @@ const ZOTERO_RDF_CLASH_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
   </bib:Article>
 </rdf:RDF>`;
 
+// The full-alignment fixture: the complete Zotero vocabulary slice — the new
+// scalar terms (rights/PMID/PMCID/numPages/edition/libraryCatalog/accessDate),
+// z:shortTitle winning over dcterms:alternative, the LCC call-number subject
+// shape, dc:relation + the nested dcterms:URI identifier URL shapes, and a
+// container journal merging ISSN + volume (item-wins). numPages/edition are
+// NOT bound on journal_article — the class-binding gate must drop them.
+const ZOTERO_RDF_ALIGNMENT_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:prism="http://prismstandard.org/namespaces/1.2/basic/">
+  <bib:Article rdf:about="#align_article">
+    <z:citationKey>rdf-align-1</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>The Alignment Article</dc:title>
+    <dc:rights>© 2021 The Aligners</dc:rights>
+    <z:PMID>23456789</z:PMID>
+    <z:PMCID>PMC1234567</z:PMCID>
+    <z:numPages>42</z:numPages>
+    <prism:edition>2</prism:edition>
+    <z:libraryCatalog>align-catalog</z:libraryCatalog>
+    <dcterms:dateSubmitted>2021-04-05</dcterms:dateSubmitted>
+    <z:shortTitle>Align Short</z:shortTitle>
+    <dcterms:alternative>Wrong Alternative</dcterms:alternative>
+    <dc:relation rdf:resource="https://example.org/related-page"/>
+    <dc:identifier>
+      <dcterms:URI>
+        <rdf:value>https://example.org/nested-identifier-uri</rdf:value>
+      </dcterms:URI>
+    </dc:identifier>
+    <dc:subject>
+      <dcterms:LCC>
+        <rdf:value>QA76.5.A55</rdf:value>
+      </dcterms:LCC>
+    </dc:subject>
+    <dc:subject>a-plain-tag</dc:subject>
+    <dcterms:isPartOf>
+      <bib:Journal>
+        <dc:title>The Align Journal</dc:title>
+        <dc:identifier>ISSN 9999-8888</dc:identifier>
+        <prism:volume>9</prism:volume>
+      </bib:Journal>
+    </dcterms:isPartOf>
+  </bib:Article>
+  <bib:Document rdf:about="#align_case">
+    <z:citationKey>rdf-align-case</z:citationKey>
+    <z:itemType>case</z:itemType>
+    <dc:title>The Alignment Case</dc:title>
+    <z:authority>Align High Court</z:authority>
+    <z:code>align-code</z:code>
+    <z:type>legalRule</z:type>
+  </bib:Document>
+</rdf:RDF>`;
+
+// The doi/isbn adoption fixture: entries whose citationKey matches nothing
+// but whose DOI / ISBN identifies a pre-existing source — the match adopts
+// the node and the Zotero citationKey rides into the citekey fill.
+const ZOTERO_RDF_ADOPT_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:z="http://www.zotero.org/namespaces/export#">
+  <bib:Article rdf:about="#adopt_doi">
+    <z:citationKey>rdf-adopt-doi</z:citationKey>
+    <z:itemType>journalArticle</z:itemType>
+    <dc:title>The Adopted DOI Article</dc:title>
+    <dc:identifier>doi:10.1111/adopt.me</dc:identifier>
+    <dcterms:abstract>Adopted via DOI.</dcterms:abstract>
+  </bib:Article>
+  <bib:Book rdf:about="#adopt_isbn">
+    <z:citationKey>rdf-adopt-isbn</z:citationKey>
+    <z:itemType>book</z:itemType>
+    <dc:title>The Adopted ISBN Book</dc:title>
+    <dc:identifier>ISBN 9781111111111</dc:identifier>
+  </bib:Book>
+</rdf:RDF>`;
+
 describe("import zotero-rdf", () => {
   it("imports keyed bib entries; the nested journal title never wins; unkeyed journals are skipped", async () => {
     const h = harness;
@@ -1530,7 +1612,7 @@ describe("import zotero-rdf", () => {
       issue: "2",
       pages: "101-115",
       issn: "1234-5678",
-      identifier: "pmid:12345678",
+      pmid: "12345678",
       language: "en",
       shortTitle: "Full Article Short",
       extra: "Handwritten extra note.",
@@ -1551,7 +1633,8 @@ describe("import zotero-rdf", () => {
     expect(byName("isbn")).toBe("9780000000002");
     expect(byName("doi")).toBe("10.5555/full.article");
     expect(byName("issn")).toBe("1234-5678");
-    expect(byName("identifier")).toBe("pmid:12345678");
+    expect(byName("pmid")).toBe("12345678");
+    expect(byName("identifier")).toBeUndefined();
     expect(byName("url")).toBe("https://example.org/full-article");
     expect(byName("language")).toBe("en");
     expect(byName("shortTitle")).toBe("Full Article Short");
@@ -1673,6 +1756,167 @@ describe("import zotero-rdf", () => {
     expect(byName("doi")).toBe("10.0000/hand-fixed"); // NOT clobbered by doi:10.9999/clash
     expect(byName("publisher")).toBe("Clash Publisher"); // the empty field filled
     expect(byName("abstract")).toBe("Clash abstract");
+  });
+
+  it("the full aligned vocabulary fills, gated by the class bindings; accessDate rides the day chain", async () => {
+    const h = harness;
+    const file = join(h.dataDir, "zotero-import-align.rdf");
+    writeFileSync(file, ZOTERO_RDF_ALIGNMENT_FIXTURE);
+
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      tagsSkipped: number;
+      entries: string[];
+      entryFills: Array<{ citekey: string; fills: Array<{ name: string; value: unknown }> }>;
+    };
+    expect(report.created).toBe(2);
+    // One plain-text tag; the LCC subject shape is mapped, never counted.
+    expect(report.tagsSkipped).toBe(1);
+
+    const fillsOf = (citekey: string) =>
+      Object.fromEntries(
+        report.entryFills.find((e) => e.citekey === citekey)!.fills.map((f) => [f.name, f.value]),
+      );
+    const articleFills = fillsOf("rdf-align-1");
+    expect(articleFills).toMatchObject({
+      rights: "© 2021 The Aligners",
+      pmid: "23456789",
+      pmcid: "PMC1234567",
+      libraryCatalog: "align-catalog",
+      accessDate: "2021-04-05",
+      shortTitle: "Align Short", // z:shortTitle wins over dcterms:alternative
+      callNumber: "QA76.5.A55",
+      issn: "9999-8888", // the container journal's ISSN merged (item held none)
+      volume: "9", // the container journal's volume merged
+      publicationTitle: "The Align Journal",
+      url: "https://example.org/nested-identifier-uri", // the nested URI beats the earlier dc:relation
+    });
+    // The class-binding gate: numPages/edition are not bound on journal_article.
+    const articleFillNames = Object.keys(articleFills);
+    expect(articleFillNames).not.toContain("numPages");
+    expect(articleFillNames).not.toContain("edition");
+
+    // The values landed on the node; accessDate is a day-precision chain ref.
+    const articleId = report.entries[report.entryFills.findIndex((e) => e.citekey === "rdf-align-1")]!;
+    await h.runCli("--json", "object", "get", articleId);
+    const props = (JSON.parse(h.io.stdoutText).object.properties ?? []) as Array<{
+      schemaId: string;
+      value: unknown;
+    }>;
+    const byName = (name: string) =>
+      props.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(byName("rights")).toBe("© 2021 The Aligners");
+    expect(byName("pmid")).toBe("23456789");
+    expect(byName("pmcid")).toBe("PMC1234567");
+    expect(byName("libraryCatalog")).toBe("align-catalog");
+    expect(byName("callNumber")).toBe("QA76.5.A55");
+    expect(byName("shortTitle")).toBe("Align Short");
+    expect(byName("issn")).toBe("9999-8888");
+    expect(byName("volume")).toBe("9");
+    expect(byName("publicationTitle")).toBe("The Align Journal");
+    expect(byName("url")).toBe("https://example.org/nested-identifier-uri");
+    expect(byName("numPages")).toBeUndefined();
+    expect(byName("edition")).toBeUndefined();
+    const accessRef = byName("accessDate") as { nodeId: string };
+    await h.runCli("--json", "object", "get", accessRef.nodeId);
+    // The day node is content-addressed; its display name is the canonical
+    // YYYY/MM/DD form.
+    expect(JSON.parse(h.io.stdoutText).object.name).toBe("2021/04/05");
+
+    // The case rides the document fallback class: court + workType fill,
+    // z:code is not bound on document — the gate drops it.
+    const caseFills = fillsOf("rdf-align-case");
+    expect(caseFills).toMatchObject({ court: "Align High Court", workType: "legalRule" });
+    expect(Object.keys(caseFills)).not.toContain("code");
+    const caseId = report.entries[report.entryFills.findIndex((e) => e.citekey === "rdf-align-case")]!;
+    await h.runCli("--json", "object", "get", caseId);
+    const caseObject = JSON.parse(h.io.stdoutText).object;
+    expect(caseObject.classIds).toContain(SYSTEM_CLASS_UUIDS.document);
+    const caseProps = caseObject.properties as Array<{ schemaId: string; value: unknown }>;
+    const caseByName = (name: string) =>
+      caseProps.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(caseByName("court")).toBe("Align High Court");
+    expect(caseByName("workType")).toBe("legalRule");
+    expect(caseByName("code")).toBeUndefined();
+
+    // Idempotent: a second run matches both and plans zero fills.
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const second = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      updated: number;
+      entryFills: Array<{ fills: Array<{ name: string }> }>;
+    };
+    expect(second).toMatchObject({ created: 0, updated: 2 });
+    expect(second.entryFills.flatMap((e) => e.fills)).toEqual([]);
+  });
+
+  it("adopts a source matched by doi, then isbn (citekey → doi → isbn → title → create)", async () => {
+    const h = harness;
+    // Pre-existing sources carrying the owner's identifier, no citekey yet.
+    const doiNode = await fetch(`${h.baseUrl}/api/objects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({
+        isEmbedded: false,
+        name: "Preexisting DOI Article",
+        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
+      }),
+    });
+    const doiNodeId = ((await doiNode.json()) as { id: string }).id;
+    const isbnNode = await fetch(`${h.baseUrl}/api/objects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({
+        isEmbedded: false,
+        name: "Preexisting ISBN Book",
+        classIds: [SYSTEM_CLASS_UUIDS.book],
+      }),
+    });
+    const isbnNodeId = ((await isbnNode.json()) as { id: string }).id;
+    for (const [nodeId, propertySchemaId, value] of [
+      [doiNodeId, SYSTEM_PROPERTY_UUIDS.doi, "10.1111/adopt.me"],
+      [isbnNodeId, SYSTEM_PROPERTY_UUIDS.isbn, "9781111111111"],
+    ] as const) {
+      await fetch(`${h.baseUrl}/api/objects/${nodeId}/properties`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": API_KEY },
+        body: JSON.stringify({ propertySchemaId, value }),
+      });
+    }
+
+    const file = join(h.dataDir, "zotero-import-adopt.rdf");
+    writeFileSync(file, ZOTERO_RDF_ADOPT_FIXTURE);
+    expect(await h.runCli("--json", "import", "zotero-rdf", file)).toBe(EXIT.ok);
+    const report = JSON.parse(h.io.stdoutText) as {
+      created: number;
+      adopted: number;
+      entries: string[];
+    };
+    expect(report).toMatchObject({ created: 0, adopted: 2 });
+    expect(report.entries).toEqual([doiNodeId, isbnNodeId]);
+
+    // The Zotero citationKey rode into the citekey fill; the matched
+    // identifiers and their nodes are untouched (Notees-wins).
+    await h.runCli("--json", "object", "get", doiNodeId);
+    const doiProps = (JSON.parse(h.io.stdoutText).object.properties ?? []) as Array<{
+      schemaId: string;
+      value: unknown;
+    }>;
+    const doiByName = (name: string) =>
+      doiProps.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(doiByName("citekey")).toBe("rdf-adopt-doi");
+    expect(doiByName("doi")).toBe("10.1111/adopt.me");
+    expect(doiByName("abstract")).toBe("Adopted via DOI.");
+    await h.runCli("--json", "object", "get", isbnNodeId);
+    const isbnProps = (JSON.parse(h.io.stdoutText).object.properties ?? []) as Array<{
+      schemaId: string;
+      value: unknown;
+    }>;
+    const isbnByName = (name: string) =>
+      isbnProps.find((p) => p.schemaId === (SYSTEM_PROPERTY_UUIDS as Record<string, string>)[name])?.value;
+    expect(isbnByName("citekey")).toBe("rdf-adopt-isbn");
+    expect(isbnByName("isbn")).toBe("9781111111111");
   });
 
   it("dry-run plans per-field fills; a second run writes nothing (idempotent)", async () => {
