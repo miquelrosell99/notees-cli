@@ -57,6 +57,15 @@ notees object property set <nodeId> Description '{"nodeId":"<carrierId>"}'
 notees object update <carrierId> --content '<existingAst + [{"type":"text","text":" "},{"type":"mention",...}]>'
 ```
 
+The mention exists to preserve provenance when the old tag is *lost*. On a
+**round-trip** (A → B, later B → A) it is noise — skip steps 2/3 entirely.
+If an earlier run left mention-only Descriptions behind, remove them:
+`object property delete <id> <schema>` + trash the emptied carrier block;
+carriers that mix the mention with real content get the mention token
+dropped from the contentAst (trim dangling separator text tokens; keep the
+rest verbatim as plain text — flattened mentions read better than
+single-token fragments).
+
 Key step most migrations miss: **fetch each node's current state first**
 (`object get --ids …`) and branch per node — already-converted nodes skip,
 nodes with pre-existing content get the append path. Re-runnable beats

@@ -69,6 +69,19 @@ history.
   - **Verification**: `pnpm -r --filter "@notees/*" build` (after the vendor
     bump) + `pnpm typecheck && pnpm test` — all green (187/187, 5 files).
 
+- **docs(agents): round-trip caveat in the manipulation skill's
+  class-migration recipe.** The recipe's Description-mention step (keep the
+  old tag visible) was unconditional; applied on a round-trip migration
+  (A → B, later B → A) it leaves a Description that is only a mention of the
+  class the node has again — noise that then needs a bulk cleanup. The skill
+  now states the mention preserves provenance only when the old tag is lost,
+  says to skip the mention steps on round-trips, and gives the cleanup path
+  (property delete + trash an emptied carrier; drop the mention token from
+  mixed-content carriers, trimming dangling separators and flattening the
+  rest to plain text).
+  Files: `.agents/skills/notees-cli-manipulation/SKILL.md`. Docs-only; no
+  code surface.
+
 - **chore(deps): node 26 support — better-sqlite3 12 via a pnpm override.**
   The vendored `@notees/*` packages pin `better-sqlite3` ^11, whose native
   build fails on node 26 (V8 API removals — `PropertyCallbackInfo::This`,
