@@ -1260,6 +1260,48 @@ async function classSetExtends(
 }
 
 /**
+ * `notees class render-as <class> <page|block>` — the first-class wrapper for
+ * the class-level `parentlessRole` render contract (the web class page's
+ * "Render as" control under Standalone instances): where the class's
+ * PARENTLESS members live. "page" (the wire default) = document chrome —
+ * Pages hub, page pickers, the graph; "block" = full Block-role citizenship —
+ * queries, collections, and the search "blocks" scope, out of the Pages hub
+ * and the graph. The demote is extends-aware and one-way server-side (a
+ * class under a flagged base inherits it; an inherited flag cannot be
+ * cleared per level). No REST surface projects the field — the class.update
+ * envelope rides the relay batch endpoint, the same write path as every
+ * other client; idempotent (LWW scalar, the color contract: presence writes,
+ * present-null clears — this command writes explicit values only).
+ */
+async function classRenderAs(ctx: CommandContext, classRef: string, roleRaw: string): Promise<void> {
+  if (roleRaw !== "page" && roleRaw !== "block") {
+    failUsage(`class render-as: unknown role "${roleRaw}" — known roles: page, block`);
+  }
+  const klass = await resolveClassRef(ctx, classRef);
+  const parentlessRole: "page" | "block" = roleRaw;
+  const clock = new Clock("notees-cli");
+  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const envelope = newEnvelope({
+    workspaceId,
+    actorId,
+    deviceId: "notees-cli",
+    client: "cli",
+    hlc: clock.now(),
+    affectedNodeIds: [klass.id],
+    opType: "class.update",
+    payload: { classId: klass.id, parentlessRole },
+  });
+  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  emit(
+    ctx,
+    `parentless members of "${klass.name}" render as ${parentlessRole === "block" ? "blocks" : "pages"} ` +
+      `(${parentlessRole === "block" ? "Block-role citizenship" : "the default"})\n`,
+    { class: { id: klass.id, name: klass.name }, parentlessRole },
+  );
+}
+
+/**
  * `notees object move <id> --parent <id>` — move a node under a new parent,
  * optionally anchored next to a sibling (--after/--before). Placement is
  * log-only state: the write rides the object.move op through the relay batch
@@ -1962,7 +2004,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "4.5.5";
+const CLI_VERSION = "4.5.6";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
@@ -4020,7 +4062,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   today: { flags: "--append" },
   date: { flags: "ensure <YYYY-MM-DD>" },
   journal: { flags: "--limit" },
-  class: { flags: "list --tree · remap --dry-run · set-extends" },
+  class: { flags: "list --tree · remap --dry-run · set-extends · render-as" },
   tag: { flags: "assign · unassign" },
   workflow: { flags: "list · enable <id> · disable <id>" },
   feature: { flags: "list · enable <feature> · disable <feature>" },
@@ -4442,6 +4484,16 @@ function buildProgram(): Command {
     .option("--yes", "confirm the replacement (the full parent set is replaced)", false)
     .action(async (classRef: string, parentRefs: string[], options: { yes?: boolean }, command: Command) => {
       await classSetExtends(ctxOf(command), classRef, parentRefs, options);
+    });
+  klass
+    .command("render-as <class> <role>")
+    .description(
+      "set the class's parentlessRole render contract — where its PARENTLESS members render (class: uuid or title; role: page|block; " +
+        'the web class page "Render as" control: page = document chrome (the default), block = Block-role citizenship — queries/collections/search ' +
+        "blocks scope, out of the Pages hub and the graph; extends-aware one-way demote; idempotent)",
+    )
+    .action(async (classRef: string, role: string, _options: object, command: Command) => {
+      await classRenderAs(ctxOf(command), classRef, role);
     });
   klass
     .command("remap <from> <to>")

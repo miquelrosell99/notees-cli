@@ -71,7 +71,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `today` | open today's daily note | `--append` |
 | `date` | the deterministic date chain | `ensure <YYYY-MM-DD>` |
 | `journal` | list daily notes, newest first | `--limit` |
-| `class` | class membership, extends, bulk remap | `list --tree`, `remap --dry-run` |
+| `class` | class membership, extends, bulk remap, the parentless render contract | `list --tree`, `remap --dry-run`, `render-as` |
 | `tag` | tag membership (a tag is any page) | `assign`, `unassign` |
 | `workflow` | workflow vocabulary — opt-in materialized class families (install state derives from one anchor-page probe, never a ledger) | `list`, `enable <id>`, `disable <id>` |
 | `feature` | workspace feature toggles (the core class families + the journal surfaces) | `list`, `enable <feature>`, `disable <feature>` |

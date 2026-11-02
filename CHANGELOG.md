@@ -8,6 +8,26 @@ history.
 
 ## 2026-11-02
 
+- **feat(class): `class render-as <class> <page|block>` — the class-level
+  parentlessRole render contract from the CLI.** The web class page's
+  "Render as" control (Standalone instances) had no CLI surface, and the
+  field is not projected by the class REST routes — so the command validates
+  the role client-side (usage exit 2 on anything but `page`/`block`) and
+  rides ONE `class.update` envelope through the relay batch endpoint (the
+  `class set-extends` write path). `page` (the wire default) keeps the
+  class's parentless members in document chrome — Pages hub, page pickers,
+  the graph; `block` makes them full Block-role citizens — queries,
+  collections, the search "blocks" scope, out of the Pages hub and the
+  graph. The demote is extends-aware and one-way server-side (a class under
+  a flagged base inherits it; an inherited flag cannot be cleared per
+  level). Human output names the written contract; `--json` answers
+  `{class, parentlessRole}`.
+  - Files: `src/cli.ts` (command + the `notees help` overview row),
+    `test/cli.test.ts` (the effect assertion reads the derived store's
+    `class.parentless_role` directly — the routes do not project the
+    field), `README.md`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (188 tests).
+
 - **fix(ci): build the root bundle before the test gate.** `pnpm-workspace.yaml`
   does not list the root project, so `pnpm -r build` compiled only the
   vendored packages and CI tested with no `dist/cli.js` — the

@@ -3212,6 +3212,43 @@ describe("class set-extends", () => {
   });
 });
 
+describe("class render-as", () => {
+  it("writes the parentlessRole render contract (client-side role validation; title + uuid refs; idempotent)", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "object", "create", "--isClass", "--name", "ra-probe")).toBe(EXIT.ok);
+
+    // Unknown role: usage error client-side, before any write.
+    expect(await h.runCli("class", "render-as", "ra-probe", "sideways")).toBe(EXIT.usage);
+    expect(h.io.stderrText).toContain("known roles: page, block");
+
+    // Happy path by title; the machine surface carries the written contract.
+    expect(await h.runCli("--json", "class", "render-as", "ra-probe", "block")).toBe(EXIT.ok);
+    const machine = JSON.parse(h.io.stdoutText) as { class: { id: string; name: string }; parentlessRole: string };
+    expect(machine.class.name).toBe("ra-probe");
+    expect(machine.parentlessRole).toBe("block");
+
+    // Idempotent re-issue converges to the same contract.
+    expect(await h.runCli("class", "render-as", "ra-probe", "block")).toBe(EXIT.ok);
+
+    // The class routes do not project the field — the effect assertion reads
+    // the derived store directly (store schema v32, class.parentless_role).
+    const roleOf = (): string | null => {
+      const db = new Database(join(h.dataDir, "derived", `${defaultWorkspaceId()}.db`));
+      const row = db.prepare("SELECT parentless_role AS role FROM class WHERE id = ?").get(machine.class.id) as
+        | { role: string | null }
+        | undefined;
+      db.close();
+      return row?.role ?? null;
+    };
+    expect(roleOf()).toBe("block");
+
+    // Uuid ref + the page role writes the explicit default.
+    expect(await h.runCli("--json", "class", "render-as", machine.class.id, "page")).toBe(EXIT.ok);
+    expect((JSON.parse(h.io.stdoutText) as { parentlessRole: string }).parentlessRole).toBe("page");
+    expect(roleOf()).toBe("page");
+  });
+});
+
 describe("object list --all", () => {
   it("follows the cursor to exhaustion", async () => {
     const h = harness;
