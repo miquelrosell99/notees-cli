@@ -1962,7 +1962,7 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
 }
 
 /** CLI release version — aligned with the server release train. */
-const CLI_VERSION = "4.5.4";
+const CLI_VERSION = "4.5.5";
 
 /** "3.0.0-m1" → [3, 0] (major, minor) for the drift comparison. */
 function versionMajorMinor(version: string): [number, number] {
