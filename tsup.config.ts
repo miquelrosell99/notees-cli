@@ -7,8 +7,9 @@ export default defineConfig({
   // The release bundle must run standalone — scripts/install.sh ships
   // dist/cli.js (as cli.mjs) with no node_modules beside it. tsup keeps
   // `dependencies` external by default; compile every runtime dependency
-  // in: the @notees/* workspace packages and commander.
-  noExternal: [/^@notees\//, "commander"],
+  // in: the @notees/* workspace packages, commander, and sax (the Zotero
+  // RDF import surface in src/zotero-rdf.ts).
+  noExternal: [/^@notees\//, "commander", "sax"],
   // commander ships its CommonJS entry to the bundler; the ESM bundle then
   // needs a real `require` for Node builtins. A global createRequire shim
   // (after the shebang — esbuild keeps the #! line first) replaces esbuild's

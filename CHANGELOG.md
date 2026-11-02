@@ -8,6 +8,19 @@ history.
 
 ## 2026-11-02
 
+- **fix(build): `sax` compiled into the release bundle — standalone installs
+  crashed at startup.** tsup keeps `dependencies` external by default, and
+  `noExternal` listed only the `@notees/*` workspace packages and `commander`;
+  `src/zotero-rdf.ts` (the Zotero RDF import surface) imports `sax`, so the
+  shipped `cli.mjs` carried a bare `from"sax"` and every install from the
+  release assets (`scripts/install.sh`, the pacman package) died at first run
+  with `ERR_MODULE_NOT_FOUND: Cannot find package 'sax'`. `sax` is now in
+  `noExternal`, and a new gate test (`test/release-bundle.test.ts`) fails the
+  suite if `dist/cli.js` contains a bare import outside node builtins — the
+  failure moves from the user's machine to gate time.
+  - Verification: `pnpm build` (bundle scan clean); `pnpm typecheck && pnpm
+    test` — all green (185 tests).
+
 - **docs(agents): gate economics + host memory discipline in the development
   skill.** Two-tier gate (mirroring the main repo's 2026-10-30 ruling):
   typecheck + the covering test files are the per-task loop; the full gate
