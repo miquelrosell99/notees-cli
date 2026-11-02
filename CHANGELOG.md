@@ -8,6 +8,21 @@ history.
 
 ## 2026-11-02
 
+- **chore(deps): node 26 support — better-sqlite3 12 via a pnpm override.**
+  The vendored `@notees/*` packages pin `better-sqlite3` ^11, whose native
+  build fails on node 26 (V8 API removals — `PropertyCallbackInfo::This`,
+  deprecated `External::Value`); on a node 26 host the dev loop died at
+  `pnpm install`. The root `package.json` now overrides the workspace to
+  `better-sqlite3` ^12.11.1 (supports node 20–26) without touching `vendor/`
+  (the lockstep boundary — the main repo moves to 12, then the override
+  drops). CI runs the build+test matrix on node 22 and 26; the release
+  workflow stays on 22, and the bundle's runtime floor is unchanged
+  (node ≥ 22). Docs and the development skill record the override and its
+  retirement condition.
+  - Verification: fresh `pnpm install`, vendored rebuild, `pnpm build`, and
+    `pnpm typecheck && pnpm test` green on node 26.13.0 and node 22.23.4
+    (185 tests each).
+
 - **fix(build): `sax` compiled into the release bundle — standalone installs
   crashed at startup.** tsup keeps `dependencies` external by default, and
   `noExternal` listed only the `@notees/*` workspace packages and `commander`;

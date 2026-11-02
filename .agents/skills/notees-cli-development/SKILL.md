@@ -5,7 +5,7 @@ description: Develop the Notees CLI (notees-cli) — the `notees` command-line c
 
 # Notees CLI development
 
-`notees-cli` is a standalone pnpm workspace (Node 22, pnpm 9, TypeScript,
+`notees-cli` is a standalone pnpm workspace (Node 22 or 26, pnpm 9, TypeScript,
 vitest). The `@notees/*` packages are **not** published anywhere: they are
 consumed from the pinned `vendor/notees` git submodule as pnpm workspace
 projects (`pnpm-workspace.yaml`), and the test suite boots a real

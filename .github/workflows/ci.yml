@@ -8,6 +8,12 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The dev loop and the test suite (better-sqlite3 native build) must
+        # stay green on both the LTS train and current node.
+        node-version: [22, 26]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -16,7 +22,7 @@ jobs:
           submodules: recursive
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@9.0.0 --activate
       - name: Install

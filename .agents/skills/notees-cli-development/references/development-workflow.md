@@ -2,7 +2,7 @@
 
 Canonical: `README.md` in this repo + the main repo's
 `docs/developers/development.md` (through the `vendor/notees` checkout).
-Commands assume the repo root, Node 22 + pnpm 9 (corepack).
+Commands assume the repo root, Node 22 or 26 + pnpm 9 (corepack).
 
 ## Commands
 
@@ -16,6 +16,12 @@ pnpm typecheck                              # tsc --noEmit
 pnpm test                                   # vitest run — the blocking gate
 pnpm dev -- --help                          # run the CLI from source via tsx
 ```
+
+**better-sqlite3 on node 26:** the vendored `@notees/*` packages pin
+`better-sqlite3` ^11, whose native build fails on node 26's V8 — and `vendor/`
+is never edited. The root `package.json` carries a `pnpm.overrides` forcing
+`^12.11.1` (node 20–26); when the main repo moves to 12, drop the override.
+Do not widen it to v13 without checking the store/server adapter API.
 
 CI-equivalent gate (run before claiming done on anything non-trivial):
 `pnpm typecheck && pnpm test`. CI itself (`.github/workflows/ci.yml`)

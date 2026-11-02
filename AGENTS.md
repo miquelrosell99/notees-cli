@@ -3,7 +3,7 @@
 Notees CLI — the `notees` command-line client for Notees: the
 object/property/search surface over the server's public API, plus markdown /
 JSON-archive export and a scripting REPL (`notees shell`). A standalone pnpm
-workspace (Node 22, pnpm 9, TypeScript, vitest) that consumes the main
+workspace (Node 22 or 26, pnpm 9, TypeScript, vitest) that consumes the main
 monorepo's TypeScript packages (`@notees/protocol`, `@notees/domain`,
 `@notees/query`, `@notees/export`; `@notees/server` for the test suite) from a
 **pinned git submodule at `vendor/notees`** — never edit anything under
