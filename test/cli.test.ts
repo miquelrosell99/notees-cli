@@ -4084,14 +4084,14 @@ describe("covers (one-gesture cover)", () => {
     // programmatically (a `coverAsset:` grammar production lands separately).
     const client = new ApiClient({ server: h.baseUrl, apiKey: API_KEY });
     const ast = {
-      version: 1,
+      version: 2,
       scope: { type: "entire_workspace" },
       root: {
         type: "group",
         logic: "and",
         children: [
-          { type: "class", classId: klassId },
-          { type: "coverAsset", op: "exists" },
+          { type: "member", family: "class", op: "in", target: { mode: "ids", ids: [klassId] } },
+          { type: "nodeField", field: "coverAsset", op: "exists" },
         ],
       },
     };

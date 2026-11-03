@@ -6,6 +6,35 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-03
+
+- **chore(vendor): bump `vendor/notees` to main `17ec1da49` — the query-AST v2
+  grammar.** The main repo replaced the query AST with its version-2 wire
+  shape (parameterized member/content/name/property/date/nodeField
+  conditions); the server's `POST /api/query` accepts only `version: 2`
+  ASTs, so CLI builds pinned to the old grammar had the `search`
+  command's query-language path rejected at the wire (`queryAstSchema`
+  fails loud on `version: 1`).
+  - The CLI's consumed surface is unchanged — `parseQueryLanguage` and the
+    `QueryAst` type keep their signatures and now emit/declare the
+    version-2 AST, so the command path needed no source change; the
+    query-language suite (DSL → AST → `POST /api/query` against a real
+    vendored server) passes unmodified.
+  - The one bump-caused fix: the coverAsset predicate test hand-built an
+    old-shape AST literal (`{type:"class"}` + `{type:"coverAsset"}`); it
+    now posts the version-2 shape (`member`/`in` over an ids target +
+    `nodeField`/`exists`).
+  - The rest of the delta (protocol E2EE crypto core and its
+    `@noble/hashes` dependency — lockfile refresh committed alongside;
+    store tags-as-links; server seeding/auth changes) does not touch the
+    public surface the CLI consumes; the vendored dists were rebuilt per
+    the dev-condition law.
+  - Files: `vendor/notees` (pin `d2c5d0f69` → `17ec1da49`),
+    `pnpm-lock.yaml` (`@noble/hashes`), `test/cli.test.ts` (version-2 AST
+    literal).
+  - Verification: `pnpm -r --filter "@notees/*" build && pnpm typecheck &&
+    pnpm test && pnpm build` — all green (188 tests).
+
 ## 2026-11-02
 
 - **feat(class): `class render-as <class> <page|block>` — the class-level
