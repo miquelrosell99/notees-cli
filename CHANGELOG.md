@@ -6,6 +6,19 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-04
+
+- **chore(skills): move the `notees-cli-manipulation` skill from this repo
+  to user scope.** The manipulation playbook (class migrations,
+  carrier-block Description values, bulk jobs, verification sweeps) is a
+  usage contract for any workspace, not CLI-repo development, so it now
+  lives host-global as the atomic `miquelrosell99/skill-notees-cli-manipulation`
+  repo (`~/.agents/skills/notees-cli-manipulation`); repo scope keeps the
+  development and operations skills. The `notees-import` skill's pointer
+  updates with it.
+  - Files: `.agents/skills/notees-cli-manipulation/` (removed), `AGENTS.md`.
+  Docs-only; no code, no command surface change.
+
 ## 2026-11-03
 
 - **chore(vendor): bump `vendor/notees` to main `17ec1da49` — the query-AST v2

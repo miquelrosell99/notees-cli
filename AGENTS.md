@@ -16,11 +16,14 @@ AGENTS.md
     │
     ├── notees-cli-development    (project skill — .agents/skills/notees-cli-development/)
     │      └── development workflow  → references/development-workflow.md
-    ├── notees-cli-operations     (project skill — .agents/skills/notees-cli-operations/)
-    │      └── releases & packaging → references/releases.md
-    └── notees-cli-manipulation   (project skill — .agents/skills/notees-cli-manipulation/)
-           └── graph-data edits via the CLI (class migrations, carrier blocks, bulk jobs)
+    └── notees-cli-operations     (project skill — .agents/skills/notees-cli-operations/)
+           └── releases & packaging → references/releases.md
 ```
+
+(The graph-data manipulation playbook — class migrations, carrier blocks,
+bulk jobs — lives in the **user-scope** `notees-cli-manipulation` skill,
+host-global at `~/.agents/skills/`; repo scope stays for development and
+operations.)
 
 - **Any code, test, or doc change → invoke the `notees-cli-development` skill
   first** and follow its laws (submodule lockstep, gate-before-done,
@@ -28,9 +31,10 @@ AGENTS.md
 - **Any release, versioning, or submodule-bump task → invoke the
   `notees-cli-operations` skill first.**
 - **Any task that edits graph data through the CLI (retagging, Description
-  links, batch node edits) → invoke the `notees-cli-manipulation` skill
-  first** (its model facts — carrier-block refs, the root-flatten invariant,
-  idempotent membership — decide whether a script is safe to re-run).
+  links, batch node edits) → the user-scope `notees-cli-manipulation`
+  skill** (host-global; its model facts — carrier-block refs, the
+  root-flatten invariant, idempotent membership — decide whether a script
+  is safe to re-run).
 - The skills summarize and enforce; their references point at the canonical
   homes (README.md here, and the main repo's `docs/developers/` runbooks
   through the vendor checkout). Content is referenced, not duplicated —
