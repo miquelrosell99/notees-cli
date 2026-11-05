@@ -16,6 +16,9 @@
     "@notees/export": "workspace:*",
     "@notees/protocol": "workspace:*",
     "@notees/query": "workspace:*",
+    "@notees/store": "workspace:*",
+    "@notees/sync": "workspace:*",
+    "better-sqlite3": "^12.11.1",
     "commander": "^12.1.0",
     "sax": "^1.6.1"
   },
@@ -25,7 +28,6 @@
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.13.0",
     "@types/sax": "^1.2.7",
-    "better-sqlite3": "^12.11.1",
     "transit-js": "^0.8.874",
     "tsup": "^8.3.0",
     "tsx": "^4.19.0",
