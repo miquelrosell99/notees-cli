@@ -79,7 +79,7 @@ import {
 import { buildJsonArchiveDocument } from "./json-export.js";
 import { runLogseqDbImport } from "./import-logseq-db.js";
 import { runShell } from "./shell.js";
-import { defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
+import { clearCachedMasterKey, defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
 import { parseZoteroRdf, type ZoteroItem, type ZoteroRdfParseResult } from "./zotero-rdf.js";
@@ -1957,6 +1957,8 @@ async function syncStatus(ctx: CommandContext): Promise<void> {
     apiKey: ctx.client.apiKey,
     workspaceId,
     storeDir: join(dirname(ctx.statePath), "stores"),
+    statePath: ctx.statePath,
+    stateKey: ctx.stateKey,
   });
   try {
     const stats = await session.serverStats();
@@ -1992,6 +1994,8 @@ async function syncOnce(ctx: CommandContext): Promise<void> {
     apiKey: ctx.client.apiKey,
     workspaceId,
     storeDir: join(dirname(ctx.statePath), "stores"),
+    statePath: ctx.statePath,
+    stateKey: ctx.stateKey,
     ...(json
       ? {}
       : { onSyncPhase: (_phase, message) => ctx.io.stderr.write(`${message}\n`) }),
@@ -3856,6 +3860,8 @@ function ctxOf(command: Command, options: { allowMissingKey?: boolean } = {}): C
             apiKey,
             workspaceId,
             storeDir: join(dirname(statePath), "stores"),
+            statePath,
+            stateKey,
           });
           return session;
         })();
@@ -3936,7 +3942,7 @@ async function authStore(ctx: CommandContext, options: { keyStdin?: boolean }): 
   if (token === undefined || token.length === 0) {
     failUsage("auth store requires a key: --key <credential> or --key-stdin");
   }
-  await new ApiClient({ server: ctx.client.server, apiKey: token }).getJson("/api/classes");
+  await new ApiClient({ server: ctx.client.server, apiKey: token }).getJson("/api/workspaces");
   const credential: StoredCredential = {
     kind: "apiKey",
     token,
@@ -3968,6 +3974,10 @@ async function authLogout(ctx: CommandContext): Promise<void> {
     delete next.credential;
     return next;
   });
+  // Session end reverts to the password: the cached master key (encrypted
+  // workspaces) is user custody, cleared with the credential — the web
+  // client's custody store does the same at sign-out.
+  clearCachedMasterKey(ctx.statePath, ctx.stateKey);
   emit(ctx, `logged out — stored credential removed (server key revoked)\n`, { revoked: stored.kind === "apiKey" });
 }
 
@@ -3989,7 +3999,7 @@ async function authStatus(ctx: CommandContext): Promise<void> {
   };
   let detail = "invalid or expired";
   try {
-    await new ApiClient({ server: ctx.client.server, apiKey: stored.token }).getJson("/api/classes");
+    await new ApiClient({ server: ctx.client.server, apiKey: stored.token }).getJson("/api/workspaces");
     machine.valid = true;
     detail = "valid";
   } catch (error) {
@@ -4000,6 +4010,52 @@ async function authStatus(ctx: CommandContext): Promise<void> {
     ctx,
     `logged in as ${stored.email ?? "(unknown)"} — ${stored.kind} stored ${stored.createdAt.slice(0, 10)}, ${detail}\n`,
     machine,
+  );
+}
+
+/**
+ * `notees auth unlock` — one-shot custody unlock for encrypted workspaces.
+ * Opening the local session runs the custody probe + sync; the envelope
+ * crypto resolves from the cached master key or, on first use, from
+ * NOTEES_EMAIL + NOTEES_PASSWORD (the master-key bytes are then cached in
+ * the state file, so later commands ride the cache until `auth lock`). A
+ * keyless workspace reports a no-op. The command also pre-warms the sync,
+ * so it doubles as a "make the local store fresh" gesture.
+ */
+async function authUnlock(ctx: CommandContext): Promise<void> {
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const session = await openLocalWorkspace({
+    server: ctx.client.server,
+    apiKey: ctx.client.apiKey,
+    workspaceId,
+    storeDir: join(dirname(ctx.statePath), "stores"),
+    statePath: ctx.statePath,
+    stateKey: ctx.stateKey,
+  });
+  try {
+    const machine = { workspaceId, encrypted: session.keySource !== null, keySource: session.keySource };
+    const human =
+      session.keySource === null
+        ? `workspace ${workspaceId} is not encrypted — nothing to unlock\n`
+        : session.keySource === "cache"
+          ? "already unlocked — the cached master key answered (no password needed)\n"
+          : "unlocked — the master key is cached in the state file; later commands need no " +
+            "password (`notees auth lock` reverts)\n";
+    emit(ctx, human, machine);
+  } finally {
+    session.close();
+  }
+}
+
+/** `notees auth lock` — drop the cached master key; the next keyed command needs the password again. */
+async function authLock(ctx: CommandContext): Promise<void> {
+  const cleared = clearCachedMasterKey(ctx.statePath, ctx.stateKey);
+  emit(
+    ctx,
+    cleared
+      ? "cached master key cleared — the next keyed command needs NOTEES_EMAIL / NOTEES_PASSWORD again\n"
+      : "no cached master key for this server+profile — nothing to clear\n",
+    { cleared },
   );
 }
 
@@ -4670,6 +4726,22 @@ function buildProgram(): Command {
     .description("is a stored credential present for this server, and does it still authenticate?")
     .action(async (_options: object, command: Command) => {
       await authStatus(ctxOf(command, { allowMissingKey: true }));
+    });
+  auth
+    .command("unlock")
+    .description(
+      "unlock an encrypted (E2EE) workspace once: derive the account master key from NOTEES_EMAIL + " +
+        "NOTEES_PASSWORD, unwrap the workspace key, and cache the master key in the state file — later " +
+        "commands need no password until `auth lock` (a no-op message on a keyless workspace)",
+    )
+    .action(async (_options: object, command: Command) => {
+      await authUnlock(ctxOf(command));
+    });
+  auth
+    .command("lock")
+    .description("clear the cached master key (the password is required again on the next keyed command)")
+    .action(async (_options: object, command: Command) => {
+      await authLock(ctxOf(command, { allowMissingKey: true }));
     });
 
   const config = program

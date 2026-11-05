@@ -11,11 +11,13 @@
  * log, so an interrupted run never loses a write.
  *
  * Keyed (E2EE) workspaces: the workspace key is user custody. With a user
- * credential (session token or user API key) and NOTEES_EMAIL +
- * NOTEES_PASSWORD set, the master key is re-derived via /auth/unlock and the
- * workspace key unwrapped — the engine then seals the wire like any other
- * client. An operator credential can never read a workspace key (403 by
- * design) and a keyed workspace is refused loudly; a keyless-workspace
+ * credential (session token or user API key) the wrapped key is fetched; the
+ * envelope crypto then resolves from the CACHED master key (state file, the
+ * web client's persisted-custody parity — no password needed) or, on first
+ * use, from NOTEES_EMAIL + NOTEES_PASSWORD (/auth/unlock re-derives the KDF
+ * record; the master key unwraps locally and its bytes are cached for later
+ * invocations). An operator credential can never read a workspace key (403
+ * by design) and a keyed workspace is refused loudly; a keyless-workspace
  * detection rides the relay's snapshot meta (`sealed`) plus the key
  * endpoint's 404.
  *
@@ -36,11 +38,14 @@ import {
 } from "@notees/domain";
 import {
   Clock,
+  b64uDecode,
+  b64uEncode,
   compareHlc,
+  importMasterKey,
   importWorkspaceKey,
   maxHlc,
   newEnvelope,
-  unwrapMasterKey,
+  unwrapMasterKeyWithBytes,
   unwrapWorkspaceKey,
   type ContentAst,
   type Envelope,
@@ -61,6 +66,7 @@ import { betterSqlite3Backend } from "@notees/store/better-sqlite3";
 import { HttpTransport, SyncEngine, SyncMeta, TransportError, keyCryptoProvider } from "@notees/sync";
 
 import { CliError, EXIT } from "./exit-codes.js";
+import { cachedMasterKey, storeCachedMasterKey } from "./state.js";
 import { deriveUuid, uuidv7 } from "./uuid.js";
 
 /** The device identity stamped on CLI-authored envelopes. */
@@ -78,6 +84,13 @@ export interface LocalWorkspaceOptions {
   fetchImpl?: typeof fetch;
   /** Sync-progress sink (the `notees sync` human output). */
   onSyncPhase?: (phase: string, message: string) => void;
+  /**
+   * CLI state seams for the master-key cache (keyed workspaces): when both
+   * are given, a successful password unlock persists the master key and
+   * later invocations resolve the envelope crypto from the cache alone.
+   */
+  statePath?: string;
+  stateKey?: string;
 }
 
 interface ApiObject {
@@ -170,9 +183,8 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
 
   const custody = await probeCustody(base, options.apiKey, options.workspaceId, fetchImpl);
   let crypto: ReturnType<typeof keyCryptoProvider> | undefined;
+  let keySource: KeySource = null;
   if (custody.keyed) {
-    const email = process.env.NOTEES_EMAIL;
-    const password = process.env.NOTEES_PASSWORD;
     if (custody.wrappedKey === undefined) {
       throw new CliError(
         EXIT.auth,
@@ -180,25 +192,18 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
           "(workspace keys are user custody — sign in with `notees auth login` so the CLI holds a user credential)",
       );
     }
-    if (email === undefined || email.length === 0 || password === undefined || password.length === 0) {
-      throw new CliError(
-        EXIT.auth,
-        `workspace ${options.workspaceId} is encrypted — set NOTEES_EMAIL and NOTEES_PASSWORD so the CLI can ` +
-          "re-derive the master key and unwrap the workspace key (or run against a keyless workspace)",
-      );
-    }
-    if (custody.kdfRecord === undefined) {
-      throw new CliError(
-        EXIT.auth,
-        "cannot re-derive the master key — check NOTEES_EMAIL / NOTEES_PASSWORD",
-      );
-    }
-    const masterKey = await unwrapMasterKey(password, custody.kdfRecord);
-    const workspaceKey = await unwrapWorkspaceKey(masterKey, custody.wrappedKey);
-    // CryptoKey stays opaque (skipLibCheck resolves the protocol's webcrypto
-    // types) — export to raw bytes for importWorkspaceKey inline.
-    const raw = new Uint8Array(await globalThis.crypto.subtle.exportKey("raw", workspaceKey as never));
-    crypto = keyCryptoProvider(await importWorkspaceKey(raw));
+    const resolved = await resolveKeyedCrypto({
+      base,
+      apiKey: options.apiKey,
+      workspaceId: options.workspaceId,
+      wrappedKey: custody.wrappedKey,
+      fetchImpl,
+      ...(options.statePath !== undefined && options.stateKey !== undefined
+        ? { statePath: options.statePath, stateKey: options.stateKey }
+        : {}),
+    });
+    crypto = resolved.provider;
+    keySource = resolved.source;
   }
 
   const store = Store.open(durableFileBackend(storePath));
@@ -210,6 +215,7 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
   });
   const clock = new Clock(CLI_DEVICE_ID);
   const session = new LocalWorkspace(options, store, transport, clock, crypto);
+  session.keySource = keySource;
   try {
     await session.bootstrap();
   } catch (error) {
@@ -217,6 +223,89 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
     throw mapSyncError(error, base);
   }
   return session;
+}
+
+/** How the envelope crypto for a keyed workspace was resolved (surfaced by `notees auth unlock`). */
+export type KeySource = "cache" | "password" | null;
+
+export interface ResolveKeyedCryptoOptions {
+  base: string;
+  apiKey: string;
+  workspaceId: string;
+  wrappedKey: string;
+  fetchImpl: typeof fetch;
+  /** Both seams enable the master-key cache (state file, mode 0600). */
+  statePath?: string;
+  stateKey?: string;
+}
+
+/**
+ * Resolve the envelope crypto for a keyed workspace. The CACHED master key
+ * is tried first — a hit needs neither the password nor an /auth/unlock
+ * round-trip; on miss the password path re-derives the master key
+ * (/auth/unlock answers the KDF record, the unwrap runs locally) and caches
+ * the raw bytes for later invocations — the web client's persisted-custody
+ * parity (IndexedDB there, the CLI state file here). A stale cache (rotated
+ * password, replaced key) fails the unwrap locally and falls through to the
+ * password path, which overwrites the cache on success.
+ */
+export async function resolveKeyedCrypto(
+  options: ResolveKeyedCryptoOptions,
+): Promise<{ provider: ReturnType<typeof keyCryptoProvider>; source: Exclude<KeySource, null> }> {
+  if (options.statePath !== undefined && options.stateKey !== undefined) {
+    const fromCache = await unlockFromCache(options.statePath, options.stateKey, options.wrappedKey);
+    if (fromCache !== undefined) return { provider: fromCache, source: "cache" };
+  }
+
+  const email = process.env.NOTEES_EMAIL;
+  const password = process.env.NOTEES_PASSWORD;
+  if (email === undefined || email.length === 0 || password === undefined || password.length === 0) {
+    throw new CliError(
+      EXIT.auth,
+      `workspace ${options.workspaceId} is encrypted — set NOTEES_EMAIL and NOTEES_PASSWORD so the CLI can ` +
+        "re-derive the master key and unwrap the workspace key " +
+        "(or unlock once with `notees auth unlock` to cache the master key; `notees auth lock` clears it)",
+    );
+  }
+  const kdfRecord = await fetchKdfRecord(options.base, options.apiKey, options.fetchImpl);
+  const { key, bytes } = await unwrapMasterKeyWithBytes(password, kdfRecord);
+  const provider = await workspaceCryptoFromMaster(key, options.wrappedKey);
+  if (options.statePath !== undefined && options.stateKey !== undefined) {
+    try {
+      storeCachedMasterKey(options.statePath, options.stateKey, b64uEncode(bytes));
+    } catch {
+      // Cache write is best-effort, same as the web client's custody store.
+    }
+  }
+  return { provider, source: "password" };
+}
+
+/** Cache hit → the envelope crypto, or undefined (no cache / stale bytes). */
+async function unlockFromCache(
+  statePath: string,
+  stateKey: string,
+  wrappedKey: string,
+): Promise<ReturnType<typeof keyCryptoProvider> | undefined> {
+  const cached = cachedMasterKey(statePath, stateKey);
+  if (cached === undefined) return undefined;
+  try {
+    const masterKey = await importMasterKey(b64uDecode(cached.bytes));
+    return await workspaceCryptoFromMaster(masterKey, wrappedKey);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Unwrap the workspace key with the master key and build the envelope crypto provider. */
+async function workspaceCryptoFromMaster(
+  masterKey: Parameters<typeof unwrapWorkspaceKey>[0],
+  wrappedKey: string,
+): Promise<ReturnType<typeof keyCryptoProvider>> {
+  const workspaceKey = await unwrapWorkspaceKey(masterKey, wrappedKey);
+  // CryptoKey stays opaque (skipLibCheck resolves the protocol's webcrypto
+  // types) — export to raw bytes for importWorkspaceKey inline.
+  const raw = new Uint8Array(await globalThis.crypto.subtle.exportKey("raw", workspaceKey as never));
+  return keyCryptoProvider(await importWorkspaceKey(raw));
 }
 
 /**
@@ -245,16 +334,16 @@ function mapSyncError(error: unknown, server: string): CliError {
 interface CustodyProbe {
   keyed: boolean;
   wrappedKey?: string;
-  kdfRecord?: KdfRecord;
 }
 
 /**
- * Keyed-vs-keyless detection. A user credential answers the key endpoint
- * 200 (wrapped key present) or 404 ("no workspace key stored" = keyless);
- * an operator credential gets 403 by design — the relay snapshot meta's
- * `sealed` flag is the fallback signal (a sealed checkpoint only exists
- * when a keyed client produced it). The kdf record is fetched eagerly on
- * the keyed path (the password oracle /auth/unlock).
+ * Keyed-vs-keyless detection, plus the wrapped key when this credential may
+ * read it. A user credential answers the key endpoint 200 (wrapped key
+ * present) or 404 ("no workspace key stored" = keyless); an operator
+ * credential gets 403 by design — the relay snapshot meta's `sealed` flag is
+ * the fallback signal (a sealed checkpoint only exists when a keyed client
+ * produced it). The KDF record is NOT fetched here: it only exists for the
+ * password path (an /auth/unlock round-trip wasted on every cache hit).
  */
 async function probeCustody(
   base: string,
@@ -268,8 +357,7 @@ async function probeCustody(
   }).catch(() => null);
   if (keyResponse !== null && keyResponse.ok) {
     const body = (await keyResponse.json()) as { wrappedKey: string };
-    const kdfRecord = await fetchKdfRecord(base, apiKey, fetchImpl);
-    return { keyed: true, wrappedKey: body.wrappedKey, kdfRecord };
+    return { keyed: true, wrappedKey: body.wrappedKey };
   }
   if (keyResponse !== null && keyResponse.status === 403) {
     // Operator (or anonymous) principal: keys are user custody. A sealed
@@ -316,6 +404,13 @@ async function fetchKdfRecord(base: string, apiKey: string, fetchImpl: typeof fe
 export class LocalWorkspace {
   /** Set when a best-effort push failed — callers surface it on stderr. */
   pushWarning: string | null = null;
+  /**
+   * How the envelope crypto was resolved for a keyed workspace ("cache" =
+   * the cached master key answered, "password" = NOTEES_EMAIL/PASSWORD
+   * re-derived it); null on a keyless workspace. `notees auth unlock`
+   * reports it so the operator sees whether the cache engaged.
+   */
+  keySource: KeySource = null;
   private cursorSeq = 0;
   private restoreEpoch = 0;
 

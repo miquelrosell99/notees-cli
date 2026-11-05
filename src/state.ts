@@ -19,6 +19,19 @@ export interface StoredCredential {
   createdAt: string;
 }
 
+/**
+ * Cached account master key for encrypted (E2EE) workspaces — the CLI-side
+ * parity of the web client's persisted custody record (IndexedDB): one
+ * password unlock must not be required on every invocation. Raw b64u bytes,
+ * same trust domain as the stored credential (the state file is mode 0600).
+ * Cleared by `notees auth lock` and `notees auth logout`.
+ */
+export interface CachedMasterKey {
+  /** b64u of the 32-byte master key. */
+  bytes: string;
+  updatedAt: string;
+}
+
 export interface ServerState {
   workspaceId?: string;
   cursorSeq?: number;
@@ -27,6 +40,8 @@ export interface ServerState {
   workspaces?: Record<string, string>;
   /** Credential for this server+profile (set by `notees auth login`). */
   credential?: StoredCredential;
+  /** Cached master key (encrypted workspaces; written on first unlock). */
+  masterKey?: CachedMasterKey;
 }
 
 /**
@@ -89,6 +104,32 @@ export function updateServerState(
   state.servers[server] = patch(state.servers[server] ?? {});
   saveState(path, state);
   return state;
+}
+
+/** The cached master key for this server+profile, or undefined (never cached / cleared). */
+export function cachedMasterKey(path: string, server: string): CachedMasterKey | undefined {
+  return loadState(path).servers[server]?.masterKey;
+}
+
+/** Cache the master key bytes (atomic, mode 0600). */
+export function storeCachedMasterKey(path: string, server: string, bytes: string): void {
+  updateServerState(path, server, (current) => ({
+    ...current,
+    masterKey: { bytes, updatedAt: new Date().toISOString() },
+  }));
+}
+
+/** Drop the cached master key (`notees auth lock` / logout). */
+export function clearCachedMasterKey(path: string, server: string): boolean {
+  const had = cachedMasterKey(path, server) !== undefined;
+  if (had) {
+    updateServerState(path, server, (current) => {
+      const next = { ...current };
+      delete next.masterKey;
+      return next;
+    });
+  }
+  return had;
 }
 
 export function profileDefaults(path: string, profile: string): ProfileDefaults {

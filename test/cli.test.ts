@@ -14,7 +14,16 @@ import Database from "better-sqlite3";
 // Generous timeouts kept as a bounded safety margin.
 vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
 
-import { Clock, newEnvelope, type Envelope } from "@notees/protocol";
+import {
+  Clock,
+  b64uDecode,
+  generateWorkspaceKey,
+  masterKeyFp,
+  newEnvelope,
+  unwrapMasterKeyWithBytes,
+  wrapWorkspaceKey,
+  type Envelope,
+} from "@notees/protocol";
 import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_UUIDS,
@@ -2899,7 +2908,7 @@ describe("auth store (existing API keys)", () => {
     const io = new Capture();
     const code = await run(["--server", h.baseUrl, "auth", "store", "--key", `nk_${"q".repeat(32)}`], io);
     expect(code).toBe(EXIT.auth);
-    expect(io.stderrText).toContain("invalid or missing credentials");
+    expect(io.stderrText).toContain("a valid session or API key is required");
     const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
       servers: Record<string, { credential?: unknown }>;
     };
@@ -4605,5 +4614,132 @@ describe("asset bulk add / attach / list", () => {
     expect(await h.runCli("--json", "asset", "list", "--limit", "1")).toBe(EXIT.ok);
     const limited = JSON.parse(h.io.stdoutText) as { assets: unknown[]; total: number };
     expect(limited.assets).toHaveLength(1);
+  });
+});
+
+describe("auth unlock/lock (E2EE master-key cache)", () => {
+  it("auth lock with no cached key is a clean no-op", async () => {
+    const h = harness;
+    expect(await h.runCli("auth", "lock")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("nothing to clear");
+  });
+
+  it("auth unlock on a keyless workspace reports a no-op", async () => {
+    const h = harness;
+    expect(await h.runCli("auth", "unlock")).toBe(EXIT.ok);
+    expect(h.io.stdoutText).toContain("not encrypted");
+    expect(h.io.stdoutText).toContain("nothing to unlock");
+  });
+
+  it("keyed workspace: unlock caches the master key, later commands ride the cache, lock reverts", async () => {
+    const h = harness;
+    // The account provisioned in the workspace-selection describe; under a
+    // -t filter that describe may not have run — provision it ourselves
+    // (/api/setup is first-account-only, so try the login first).
+    let login = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { "content-type": "application/json" },
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    if (login.statusCode === 401) {
+      login = await h.app.inject({
+        method: "POST",
+        url: "/api/setup",
+        headers: { "content-type": "application/json" },
+        payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+      });
+    }
+    expect([200, 201]).toContain(login.statusCode);
+    const session = login.json().token as string;
+    const authHeaders = { "x-api-key": session, "content-type": "application/json" };
+
+    const workspace = (
+      await h.app.inject({ method: "POST", url: "/api/workspaces", headers: authHeaders, payload: { name: "E2EE-CLI" } })
+    ).json();
+    const workspaceId = workspace.id as string;
+
+    // Client-side custody: re-derive the account master key (the same
+    // /auth/unlock round-trip the CLI rides), wrap a fresh workspace key
+    // with it, publish the wrapped key (first write wins server-side).
+    const unlock = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/unlock",
+      headers: authHeaders,
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    expect(unlock.statusCode).toBe(200);
+    const { key: masterKey, bytes: masterBytes } = await unwrapMasterKeyWithBytes(
+      "correct horse battery staple",
+      unlock.json().kdf,
+    );
+    const workspaceKey = await generateWorkspaceKey();
+    const wrappedKey = await wrapWorkspaceKey(masterKey, workspaceKey);
+    const putKey = await h.app.inject({
+      method: "PUT",
+      url: `/api/workspaces/${workspaceId}/key`,
+      headers: authHeaders,
+      payload: { wrappedKey },
+    });
+    expect(putKey.statusCode).toBe(204);
+
+    const userKey = (
+      await h.app.inject({ method: "POST", url: "/api/api-keys", headers: authHeaders, payload: { name: "e2ee-cli-test" } })
+    ).json().token as string;
+
+    const cli = async (...args: string[]): Promise<[number, Capture]> => {
+      const io = new Capture();
+      const code = await run(["--server", h.baseUrl, "--key", userKey, "--workspace", "E2EE-CLI", ...args], io);
+      return [code, io];
+    };
+
+    // 1. No password anywhere: refused loudly, pointing at the unlock path.
+    let [code, io] = await cli("object", "list");
+    expect(code).toBe(EXIT.auth);
+    expect(io.stderrText).toContain("NOTEES_EMAIL");
+
+    // 2. unlock with the password → the master key lands in the state file.
+    process.env.NOTEES_EMAIL = "cli-ws@example.test";
+    process.env.NOTEES_PASSWORD = "correct horse battery staple";
+    try {
+      [code, io] = await cli("--json", "auth", "unlock");
+      expect(code).toBe(EXIT.ok);
+      const unlocked = JSON.parse(io.stdoutText) as { encrypted: boolean; keySource: string };
+      expect(unlocked).toMatchObject({ encrypted: true, keySource: "password" });
+    } finally {
+      delete process.env.NOTEES_EMAIL;
+      delete process.env.NOTEES_PASSWORD;
+    }
+    const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { masterKey?: { bytes: string } }>;
+    };
+    const cached = state.servers[`default:${h.baseUrl}`]?.masterKey;
+    expect(cached).toBeDefined();
+    expect(masterKeyFp(b64uDecode(cached!.bytes))).toBe(masterKeyFp(masterBytes));
+
+    // 3. Later commands need NO password: the cached master key answers.
+    //    The write also exercises the sealed-wire round-trip (the relay
+    //    accepts sealed envelopes; the server's projection skips them until
+    //    payload-E2EE apply lands — the op log is the authority).
+    [code] = await cli("--json", "object", "create", "--name", "e2ee-sealed-write");
+    expect(code).toBe(EXIT.ok);
+    [code, io] = await cli("--json", "object", "list", "--q", "e2ee-sealed-write");
+    expect(code).toBe(EXIT.ok);
+    const listed = JSON.parse(io.stdoutText) as { objects: Array<{ name: string | null }> };
+    expect(listed.objects.map((o) => o.name)).toContain("e2ee-sealed-write");
+
+    // 4. lock drops the cache…
+    [code, io] = await cli("auth", "lock");
+    expect(code).toBe(EXIT.ok);
+    expect(io.stdoutText).toContain("cleared");
+    const afterLock = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { masterKey?: { bytes: string } }>;
+    };
+    expect(afterLock.servers[`default:${h.baseUrl}`]?.masterKey).toBeUndefined();
+
+    // 5. …and the next keyed command needs the password again.
+    [code, io] = await cli("object", "list");
+    expect(code).toBe(EXIT.auth);
+    expect(io.stderrText).toContain("NOTEES_EMAIL");
   });
 });

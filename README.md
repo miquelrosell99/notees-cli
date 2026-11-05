@@ -4,7 +4,7 @@ The `notees` command-line client for [Notees](https://github.com/miquelrosell99/
 
 The CLI is **local-first like the other clients**: it syncs a workspace through the relay wire protocol (the vendored `@notees/sync` engine) into a local derived SQLite store (the vendored `@notees/store`, better-sqlite3 backend, one file per workspace under `~/.notees/stores/`), and serves every content read — objects, children, backlinks, search/FTS, the query language — from that store. Writes author op envelopes (protocol v3), apply locally through the store appliers, and push through the engine's outbox; a write that can't push stays durable in the local op log and syncs on the next successful `notees sync`. The server retired its content REST API (plan 07), so no content command makes a server round-trip beyond the sync cycle itself. `notees help` prints the full command overview; `notees help <command> [subcommand]` prints the full help for one command — see Command reference below.
 
-Encrypted (keyed) workspaces: the CLI unwraps the workspace key like any other client — with a user credential (from `notees auth login`) plus `NOTEES_EMAIL` and `NOTEES_PASSWORD` set, the master key re-derives via `/auth/unlock` and the stored wrapped key unwraps. An operator credential can never read a workspace key (user custody by design), and a keyed workspace is refused loudly when no key is derivable.
+Encrypted (keyed) workspaces: the CLI unwraps the workspace key like any other client — with a user credential (from `notees auth login`) plus `NOTEES_EMAIL` and `NOTEES_PASSWORD` set, the master key re-derives via `/auth/unlock` and the stored wrapped key unwraps. The first successful unlock CACHES the master key in the CLI state file (mode 0600 — the web client's persisted-custody parity), so later commands need no password until `notees auth lock` (or `notees auth logout`) clears it; `notees auth unlock` runs the unlock explicitly and doubles as a sync warm-up. An operator credential can never read a workspace key (user custody by design), and a keyed workspace is refused loudly when no key is derivable.
 
 ## Layout
 
@@ -56,7 +56,8 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 
 - `notees auth login --email <email> --password-stdin` — email + password; mints a dedicated CLI API key (revocable from the app) and stores it.
 - `notees auth store --key <credential>` (or `--key-stdin`) — probe-verify an existing API key against the server, then store it as the standing credential. Stored keys are not CLI-minted, so `auth logout` clears them locally only — server-side revocation applies to login-minted keys.
-- `notees auth status` / `notees auth logout` — probe / clear the stored credential.
+- `notees auth status` / `notees auth logout` — probe / clear the stored credential (logout also clears the cached master key).
+- `notees auth unlock` / `notees auth lock` — encrypted workspaces: derive the master key from `NOTEES_EMAIL` + `NOTEES_PASSWORD` once and cache it in the state file (later keyed commands need no password) / drop the cache so the password is required again.
 
 `notees doctor` exercises the same resolution chain: it resolves server, workspace, and credential flag > env > stored (a stored credential counts, and the `authentication:` probe sends it), reports every check as ok/FAIL — failing checks report FAILs, not a bare usage error — and exits non-zero when any check fails.
 

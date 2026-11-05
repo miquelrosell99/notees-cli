@@ -8,6 +8,49 @@ history.
 
 ## 2026-11-05
 
+- **feat: encrypted workspaces stop asking for the password on every command
+  — the unlocked master key caches in the state file (the web client's
+  persisted-custody parity), with `notees auth unlock` / `notees auth
+  lock`.** The local-first rewrite made every content command open a keyed
+  workspace, and the only custody path was `NOTEES_EMAIL` + `NOTEES_PASSWORD`
+  on EVERY invocation — manipulation scripts against an encrypted workspace
+  were one env slip away from failing, and the password rode every shell.
+  Now the first successful unlock derives the master key via `/auth/unlock`,
+  unwraps the workspace key, and caches the raw master-key bytes in the CLI
+  state file (mode 0600, the credential's own trust domain — the exact
+  shape the web client persists in IndexedDB); every later command resolves
+  the envelope crypto from the cache alone — no password, no oracle
+  round-trip (the custody probe no longer pre-fetches the KDF record). A
+  stale cache (rotated password, replaced key) fails the unwrap locally and
+  falls through to the password path, overwriting the cache on success.
+  - `notees auth unlock` runs the unlock explicitly (reports whether the
+    cache or the password answered) and doubles as a sync warm-up;
+    `notees auth lock` drops the cache; `notees auth logout` clears it with
+    the credential (session end reverts to the password, as the web
+    client's custody store does at sign-out).
+  - **fix(auth): `auth store` / `auth status` verify against
+    `GET /api/workspaces` — the old `GET /api/classes` probe is a content
+    read the plan-07 server refuses on encrypted workspaces, so both
+    commands 404'd against exactly the workspaces they exist for.** The
+    workspaces listing answers for operator and user keys alike (and
+    carries the per-workspace `encrypted` flag).
+  - `vendor/notees` pin `7efe8abfa` → `83e6fa105` — carries the server fix
+    the new e2e pin surfaced: hydration never restores a SEALED snapshot
+    (restoring sealed bytes threw `SQLITE_NOTADB` and 500'd every ingest
+    for a keyed workspace once a sealed checkpoint was the latest — the
+    CLI's first keyed sync always produces one).
+  - Files: `src/state.ts` (the `masterKey` cache slot + helpers),
+    `src/local-workspace.ts` (`resolveKeyedCrypto`, the cache-first custody
+    path, `keySource` on the session), `src/cli.ts` (`auth unlock`/`lock`,
+    the probe fix, the state seams threaded into every
+    `openLocalWorkspace` call), `test/key-cache.test.ts` (new — the custody
+    seam: password path caches / cache hit skips the oracle / stale cache
+    falls back / wrong password surfaces the 401 / no-seams skips the
+    cache), `test/cli.test.ts` (+3 pins: keyless lock/unlock no-ops, and a
+    full keyed e2e — unlock caches → sealed write + cache-hit read → lock →
+    the password refusal returns), `README.md`, `vendor/notees`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (192 tests).
+
 - **feat: local-first rewrite — the CLI works against the post-plan-07
   server again.** The server retired its content API (object CRUD,
   /api/search, /api/query, backlinks, effective-properties, merge,
