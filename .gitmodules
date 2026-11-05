@@ -1,6 +1,6 @@
 [submodule "vendor/notees"]
 	path = vendor/notees
-	url = git@github.com:miquelrosell99/notees.git
+	url = git@github.com:miquelrosell99/notees-sync.git
 	branch = main
 [submodule "brand"]
 	path = brand
