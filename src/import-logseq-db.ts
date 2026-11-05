@@ -51,6 +51,7 @@ import {
 } from "@notees/export";
 
 import type { ApiClient } from "./client.js";
+import type { LocalWorkspace } from "./local-workspace.js";
 import type { CliIo } from "./cli.js";
 import { CliError, EXIT } from "./exit-codes.js";
 import { uuidv7 } from "./uuid.js";
@@ -82,6 +83,8 @@ export type TitleStrategy = "notees-wins" | "newer-wins";
 
 export interface LogseqDbImportOptions {
   client: ApiClient;
+  /** The local-first content session: target reads and every graph write. */
+  local: LocalWorkspace;
   io: CliIo;
   json: boolean;
   file: string;
@@ -385,7 +388,7 @@ function createChunks<T extends { id: string; parentId: string | null }>(creates
 // --- the command ------------------------------------------------------------------
 
 export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise<void> {
-  const { client, io, json, write, strategy, restoreDiffs } = options;
+  const { client, local, io, json, write, strategy, restoreDiffs } = options;
   const progress = (m: Record<string, unknown>): void => {
     io.stderr.write(`${JSON.stringify({ t: Date.now(), ...m })}\n`);
   };
@@ -408,15 +411,15 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
 
   // --- target workspace state ----------------------------------------------------
   progress({ op: "target.read", note: "listing target workspace" });
-  const targetObjects = await listAllObjects(client, false);
-  const inactiveObjects = await listAllObjects(client, true);
+  const targetObjects = await listAllObjects(local, false);
+  const inactiveObjects = await listAllObjects(local, true);
   // Active rows drive parent resolution, dangling-ref checks and title
   // comparisons; trashed rows only reserve their id (a create against one
   // would 409 — Notees wins on trashed).
   const targetById = new Map(targetObjects.map((o) => [o.id, o]));
   const inactiveIds = new Set(inactiveObjects.map((o) => o.id));
   const existingIds = new Set([...targetById.keys(), ...inactiveIds]);
-  const { classes } = await client.getJson<{ classes: TargetClassRow[] }>("/api/classes");
+  const { classes } = (await local.listClasses()) as { classes: TargetClassRow[] };
   const classByName = new Map(classes.map((c) => [c.name.trim().toLowerCase(), c.id]));
   const { propertySchemas } = await client.getJson<{ propertySchemas: TargetSchemaRow[] }>(
     "/api/property-schemas",
@@ -534,12 +537,11 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
     await Promise.all(
       Array.from({ length: Math.min(8, Math.max(1, queue.length)) }, async () => {
         for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
-          const body = await client.getJson<{
-            object: { id: string; classIds: string[]; properties?: HolderProperty[] };
-          }>(`/api/objects/${encodeURIComponent(id)}`);
+          const body = await local.getObject(id);
+          const object = body.object as { id: string; classIds: string[]; properties?: HolderProperty[] };
           holderState.set(id, {
-            classIds: body.object.classIds ?? [],
-            properties: body.object.properties ?? [],
+            classIds: object.classIds ?? [],
+            properties: object.properties ?? [],
           });
         }
       }),
@@ -897,13 +899,16 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
           for (const c of group) {
             if (createdIds.has(c.id)) continue;
             try {
-              const res = await client.postJson<{ id: string }>("/api/objects", {
-                id: c.id,
-                parentId: c.parentId ?? undefined,
-                isEmbedded: c.parentId !== null && c.isEmbedded,
-                contentAst: c.contentAst,
-                classIds: c.classIds,
-              });
+              const res = await local.createObject(
+                {
+                  id: c.id,
+                  ...(c.parentId !== null ? { parentId: c.parentId } : {}),
+                  isEmbedded: c.parentId !== null && c.isEmbedded,
+                  contentAst: c.contentAst,
+                  classIds: c.classIds,
+                },
+                { push: false },
+              );
               createdIds.add(res.id);
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -930,7 +935,7 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
       continue;
     }
     try {
-      await client.patchJson(`/api/objects/${encodeURIComponent(u.id)}`, { contentAst: u.contentAst });
+      await local.updateObject(u.id, { contentAst: u.contentAst });
       applied.titles += 1;
       progress({ op: "title.update", done: applied.titles, total: titleUpdates.length, id: u.id });
     } catch (error) {
@@ -966,11 +971,15 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
           }
           try {
             for (let i = 0; i < op.values.length; i++) {
-              await client.postJson(`/api/objects/${encodeURIComponent(op.nodeId)}/properties`, {
-                propertySchemaId: schemaId,
-                value: op.values[i],
-                idx: schemaMulti.get(op.schemaName) === true ? i : 0,
-              });
+              await local.setProperty(
+                op.nodeId,
+                {
+                  propertySchemaId: schemaId,
+                  value: op.values[i],
+                  idx: schemaMulti.get(op.schemaName) === true ? i : 0,
+                },
+                { push: false },
+              );
             }
             done += 1;
             if (kind === "fill") applied.fills += 1;
@@ -989,6 +998,7 @@ export async function runLogseqDbImport(options: LogseqDbImportOptions): Promise
   };
   await applyPropOps(propFills, "fill");
   if (restoreDiffs) await applyPropOps(propRestores, "restore");
+  await local.push();
 
   report.executionFailures = executionFailures;
   const appliedSummary = `applied: ${applied.schemas} schemas, ${applied.chains} chain nodes, ${applied.creates} nodes, ${applied.titles} titles, ${applied.fills} fills, ${applied.restores} restores; ${executionFailures.length} failures`;
@@ -1010,17 +1020,16 @@ function isoDay(day: string): string {
   return `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}`;
 }
 
-async function listAllObjects(client: ApiClient, trashed: boolean): Promise<TargetObjectRow[]> {
+async function listAllObjects(local: LocalWorkspace, trashed: boolean): Promise<TargetObjectRow[]> {
   const objects: TargetObjectRow[] = [];
   let cursor: string | undefined;
   do {
-    const query = new URLSearchParams({ limit: "500" });
-    if (trashed) query.set("trashed", "true");
-    if (cursor !== undefined) query.set("cursor", cursor);
-    const body = await client.getJson<{ objects: TargetObjectRow[]; nextCursor?: string | null }>(
-      `/api/objects?${query.toString()}`,
-    );
-    objects.push(...body.objects);
+    const body = await local.listObjects({
+      limit: 500,
+      ...(trashed ? { trashed: true as const } : {}),
+      ...(cursor !== undefined ? { cursor } : {}),
+    });
+    objects.push(...(body.objects as unknown as TargetObjectRow[]));
     cursor = body.nextCursor ?? undefined;
   } while (cursor !== undefined);
   return objects;

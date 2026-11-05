@@ -10,6 +10,12 @@ import { describe, expect, it } from "vitest";
 // ERR_MODULE_NOT_FOUND — this test fails at gate time instead.
 // (Regression: sax was external in the v4.5.3 bundle and crashed every
 // install.sh / pacman install at startup.)
+//
+// ONE deliberate exception: better-sqlite3. The local-first rewrite makes it
+// a runtime dependency (the per-workspace derived store) and a native module
+// cannot be bundled — install.sh provisions it into a node_modules beside
+// the bundle instead (NOTEES_SKIP_SQLITE=1 opts out). The whitelist below is
+// the gate for that contract: anything ELSE bare fails here.
 
 const BUNDLE_URL = new URL("../dist/cli.js", import.meta.url);
 
@@ -45,6 +51,6 @@ describe("release bundle", () => {
       throw new Error("dist/cli.js missing — run `pnpm build` before the test gate");
     }
     const external = bareSpecifiers(source).filter((s) => !isBuiltin(s));
-    expect(external).toEqual([]);
+    expect(external.filter((s) => s !== "better-sqlite3")).toEqual([]);
   });
 });

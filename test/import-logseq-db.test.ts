@@ -22,6 +22,9 @@ import { buildServer } from "@notees/server";
 import { run, type CliIo } from "../src/cli.js";
 import { ApiClient } from "../src/client.js";
 import { EXIT } from "../src/exit-codes.js";
+import { LocalWorkspace, openLocalWorkspace } from "../src/local-workspace.js";
+import { defaultStatePath } from "../src/state.js";
+import { dirname, join as joinPath } from "node:path";
 import { buildFixtureFile, FIXTURE_DAY_ISO, U } from "./logseq-fixture.js";
 
 vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
@@ -55,8 +58,11 @@ interface Harness {
   io: Capture;
   fixtureFile: string;
   runCli(workspace: string, ...args: string[]): Promise<number>;
-  /** Direct client against a workspace (seeding verbs the CLI lacks, reads). */
+  runCliWithStdin(workspace: string, stdin: string, ...args: string[]): Promise<number>;
+  /** Direct client against a workspace (seeding verbs the CLI lacks). */
   clientFor(workspace: string): ApiClient;
+  /** Local-first read session against a workspace (the content reads the retired API used to serve). */
+  localFor(workspace: string): Promise<LocalWorkspace>;
 }
 
 let wsCounter = 0;
@@ -101,10 +107,33 @@ async function boot(): Promise<Harness> {
       io.stderrText = "";
       return run(["--server", baseUrl, "--key", API_KEY, "--workspace", workspace, ...args], io);
     },
+    async runCliWithStdin(workspace, stdin, ...args) {
+      io.stdoutText = "";
+      io.stderrText = "";
+      const { Readable } = await import("node:stream");
+      io.stdin = Readable.from([stdin]);
+      const code = await run(["--server", baseUrl, "--key", API_KEY, "--workspace", workspace, ...args], io);
+      io.stdin = undefined;
+      return code;
+    },
     clientFor(workspace) {
       return new ApiClient({ server: baseUrl, apiKey: API_KEY, workspace });
     },
+    localFor(workspace) {
+      // NOTEES_STATE_FILE is the file-level harness state; the read session's
+      // store lives beside it and syncs against the live server.
+      return openLocalWorkspace({
+        server: baseUrl,
+        apiKey: API_KEY,
+        workspaceId: workspace,
+        storeDir: joinPath(dirname(stateFilePath()), "stores"),
+      });
+    },
   };
+}
+
+function stateFilePath(): string {
+  return process.env.NOTEES_STATE_FILE ?? defaultStatePath();
 }
 
 /** Seeds a workspace with the target-side graph: classes (Obra extends
@@ -157,14 +186,20 @@ async function seedTarget(h: Harness, ws: string): Promise<{
   );
   const sexoMujerOptionId = sexoDetail.propertySchema.options.find((o) => o.label === "Mujer")?.id as string;
 
-  // Matched nodes (fixture uuids), preserving the Logseq ids.
+  // Matched nodes (fixture uuids), preserving the Logseq ids — the CLI create
+  // path accepts a caller-supplied id on the stdin body.
   const createWithId = async (id: string, name: string, classId: string): Promise<void> => {
-    await client.postJson("/api/objects", {
-      id,
-      isEmbedded: false,
-      contentAst: [{ type: "text", text: name }],
-      classIds: [classId],
-    });
+    const code = await h.runCliWithStdin(
+      ws,
+      JSON.stringify({
+        id,
+        isEmbedded: false,
+        contentAst: [{ type: "text", text: name }],
+        classIds: [classId],
+      }),
+      "object", "create", "--stdin",
+    );
+    if (code !== EXIT.ok) throw new Error(`seed createWithId ${id} failed (${code}): ${h.io.stderrText}`);
   };
   await createWithId(U.page1, "Página uno", libroId);
   await createWithId(U.newerTitle, "Título Notees", libroId);
@@ -174,6 +209,44 @@ async function seedTarget(h: Harness, ws: string): Promise<{
   await cli("object", "delete", U.orphan, "--yes");
 
   return { libroId, personaId, obraId, sexoMujerOptionId };
+}
+
+type TargetObject = {
+  id: string;
+  name: string | null;
+  parentId: string | null;
+  properties?: Array<{ schemaName: string; value: unknown }>;
+};
+
+/** Read one object through the local derived store (the retired GET /objects/:id). */
+async function localGet(ws: string, id: string): Promise<TargetObject> {
+  const session = await h.localFor(ws);
+  try {
+    return (await session.getObject(id)).object as unknown as TargetObject;
+  } finally {
+    session.close();
+  }
+}
+
+/** Read direct children through the local derived store. */
+async function localChildren(ws: string, id: string): Promise<Array<{ id: string; name: string | null }>> {
+  const session = await h.localFor(ws);
+  try {
+    return (await session.getChildren(id)).children as unknown as Array<{ id: string; name: string | null }>;
+  } finally {
+    session.close();
+  }
+}
+
+/** List active/trashed ids through the local derived store. */
+async function localIds(ws: string, trashed: boolean): Promise<string[]> {
+  const session = await h.localFor(ws);
+  try {
+    const body = await session.listObjects({ limit: 500, ...(trashed ? { trashed: true as const } : {}) });
+    return (body.objects as Array<{ id: string }>).map((row) => row.id);
+  } finally {
+    session.close();
+  }
 }
 
 interface ImportReport {
@@ -212,11 +285,15 @@ let h: Harness;
 
 beforeAll(async () => {
   h = await boot();
+  // The CLI keeps its derived stores beside the state file — keep both in the
+  // harness temp dir (never the operator's real ~/.notees).
+  process.env.NOTEES_STATE_FILE = join(h.dataDir, "cli-state.json");
 });
 
 afterAll(async () => {
   await h.app.close();
   rmSync(h.dataDir, { recursive: true, force: true });
+  delete process.env.NOTEES_STATE_FILE;
 });
 
 describe("import logseq-db", () => {
@@ -241,12 +318,8 @@ describe("import logseq-db", () => {
     expect(h.io.stderrText).toContain("target.read");
 
     // Nothing was written: no fixture id exists on either side of the trash.
-    const active = await h.clientFor(ws).getJson<{ objects: Array<{ id: string }> }>("/api/objects?limit=500");
-    expect(active.objects.some((o) => o.id === U.page1)).toBe(false);
-    const trashed = await h.clientFor(ws).getJson<{ objects: Array<{ id: string }> }>(
-      "/api/objects?limit=500&trashed=true",
-    );
-    expect(trashed.objects.some((o) => o.id === U.page1)).toBe(false);
+    expect((await localIds(ws, false)).some((id) => id === U.page1)).toBe(false);
+    expect((await localIds(ws, true)).some((id) => id === U.page1)).toBe(false);
   });
 
   it("fails loud on a missing file and a non-Logseq sqlite", async () => {
@@ -285,21 +358,15 @@ describe("import logseq-db", () => {
     expect(report.plan.titleKeepNotees).toBe(2);
     expect(report.executionFailures ?? []).toEqual([]);
 
-    const client = h.clientFor(ws);
-    const get = async (id: string) =>
-      client.getJson<{ object: { id: string; name: string | null; parentId: string | null; properties?: Array<{ schemaName: string; value: unknown }> } }>(
-        `/api/objects/${id}`,
-      ).then((b) => b.object);
+    const get = (id: string) => localGet(ws, id);
 
     // Creates preserve the Logseq uuids; the persona and both blocks exist.
     const ada = await get(U.ada);
     expect(ada.name).toBe("Ada Lovelace");
 
     // Sibling order follows the Logseq fractional order (a0 before a1).
-    const children = await client.getJson<{ children: Array<{ id: string; name: string | null }> }>(
-      `/api/objects/${U.page1}/children`,
-    );
-    expect(children.children.map((c) => c.id)).toEqual([U.block1, U.block2]);
+    const children = await localChildren(ws, U.page1);
+    expect(children.map((c) => c.id)).toEqual([U.block1, U.block2]);
 
     // The daily note lands under the deterministic day node of the date chain.
     const daily = await get(U.daily);
@@ -319,12 +386,8 @@ describe("import logseq-db", () => {
     expect((await get(U.olderTitle)).name).toBe("Título Notees viejo");
 
     // Trashed: still trashed, not recreated.
-    const inactive = await client.getJson<{ objects: Array<{ id: string }> }>(
-      `/api/objects?limit=500&trashed=true`,
-    );
-    expect(inactive.objects.some((o) => o.id === U.orphan)).toBe(true);
-    const active = await client.getJson<{ objects: Array<{ id: string }> }>("/api/objects?limit=500");
-    expect(active.objects.some((o) => o.id === U.orphan)).toBe(false);
+    expect((await localIds(ws, true)).some((id) => id === U.orphan)).toBe(true);
+    expect((await localIds(ws, false)).some((id) => id === U.orphan)).toBe(false);
   });
 
   it("applies extends-aware scope eligibility both directions", async () => {
@@ -345,12 +408,9 @@ describe("import logseq-db", () => {
       (f) => f.nodeId === U.obraNode && f.schemaName === "Fecha",
     );
     expect(obraFill).toBeDefined();
-    const client = h.clientFor(ws);
-    const obraNode = await client.getJson<{
-      object: { properties?: Array<{ schemaName: string; value: unknown }> };
-    }>(`/api/objects/${U.obraNode}`);
+    const obraNode = await localGet(ws, U.obraNode);
     expect(
-      obraNode.object.properties?.find((p) => p.schemaName === "Fecha")?.value,
+      obraNode.properties?.find((p) => p.schemaName === "Fecha")?.value,
     ).toEqual({ nodeId: chainNodeIds(FIXTURE_DAY_ISO).day });
   });
 
@@ -383,9 +443,8 @@ describe("import logseq-db", () => {
     expect(report.plan.titleUpdates).toBe(1);
     expect(report.plan.titleKeepNotees).toBe(1);
 
-    const client = h.clientFor(ws);
     const nameOf = async (id: string): Promise<string | null> =>
-      client.getJson<{ object: { name: string | null } }>(`/api/objects/${id}`).then((b) => b.object.name);
+      (await localGet(ws, id)).name;
     // Strictly newer → the Logseq title lands.
     expect(await nameOf(U.newerTitle)).toBe("Título Logseq");
     // Older → Notees keeps its title.
@@ -396,28 +455,18 @@ describe("import logseq-db", () => {
     // Workspace A (default): a differing value is reported as a restore but NOT applied.
     const wsA = freshWorkspace();
     await seedTarget(h, wsA);
-    await h.clientFor(wsA).postJson(`/api/objects/${U.page1}/properties`, {
-      propertySchemaId: await schemaId(wsA, "NIF"),
-      value: "OLDVALUE",
-      idx: 0,
-    });
+    await h.runCli(wsA, "object", "property", "set", U.page1, await schemaId(wsA, "NIF"), "OLDVALUE", "--idx", "0");
     expect(await h.runCli(wsA, "--json", "import", "logseq-db", h.fixtureFile, "--write")).toBe(EXIT.ok);
     let report = JSON.parse(h.io.stdoutText) as ImportReport;
     expect(report.plan.propRestores).toBe(1);
     const nifOf = async (ws: string): Promise<unknown> =>
-      h.clientFor(ws).getJson<{ object: { properties?: Array<{ schemaName: string; value: unknown }> } }>(
-        `/api/objects/${U.page1}`,
-      ).then((b) => b.object.properties?.find((p) => p.schemaName === "NIF")?.value);
+      (await localGet(ws, U.page1)).properties?.find((p) => p.schemaName === "NIF")?.value;
     expect(await nifOf(wsA)).toBe("OLDVALUE");
 
     // Workspace B (--restore-diffs): the differing value is clobbered from Logseq.
     const wsB = freshWorkspace();
     await seedTarget(h, wsB);
-    await h.clientFor(wsB).postJson(`/api/objects/${U.page1}/properties`, {
-      propertySchemaId: await schemaId(wsB, "NIF"),
-      value: "OLDVALUE",
-      idx: 0,
-    });
+    await h.runCli(wsB, "object", "property", "set", U.page1, await schemaId(wsB, "NIF"), "OLDVALUE", "--idx", "0");
     expect(
       await h.runCli(wsB, "--json", "import", "logseq-db", h.fixtureFile, "--write", "--restore-diffs"),
     ).toBe(EXIT.ok);

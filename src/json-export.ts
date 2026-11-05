@@ -13,14 +13,14 @@ import {
   type JsonArchive,
 } from "@notees/export";
 
-import type { ApiClient } from "./client.js";
 import { CliError, EXIT } from "./exit-codes.js";
+import type { LocalWorkspace } from "./local-workspace.js";
 import {
   collectClosure,
-  fetchSchemaIndex,
   makeObjectResolver,
   toExportNode,
   type ExportApiObject,
+  type SchemaIndex,
 } from "./markdown-export.js";
 
 export interface JsonArchiveSelection {
@@ -39,12 +39,12 @@ export interface JsonArchiveSelection {
  * children fetch archives with an empty `children` list.
  */
 export async function buildJsonArchiveDocument(
-  client: ApiClient,
+  local: LocalWorkspace,
+  schemaIndex: SchemaIndex,
   selection: JsonArchiveSelection,
 ): Promise<JsonArchive> {
-  const schemaIndex = await fetchSchemaIndex(client);
-  const resolver = makeObjectResolver(client, schemaIndex);
-  const included = await collectClosure(client, resolver, {
+  const resolver = makeObjectResolver(local, schemaIndex);
+  const included = await collectClosure(local, resolver, {
     ids: selection.ids,
     linkedTo: selection.linkedTo,
     depth: selection.depth,
@@ -53,13 +53,11 @@ export async function buildJsonArchiveDocument(
   const childrenRows = new Map<string, ExportApiObject[]>();
   for (const id of included.keys()) {
     try {
-      const body = await client.getJson<{ children: ExportApiObject[] }>(
-        `/api/objects/${encodeURIComponent(id)}/children`,
-      );
+      const body = await local.getChildren(id);
       // Only the ids enter the archive — the row payloads are mapped so the
       // builder can read them, no matter whether the child itself is in the
       // exported slice (a slice cut above a child still records the id).
-      childrenRows.set(id, body.children);
+      childrenRows.set(id, body.children as unknown as ExportApiObject[]);
     } catch (error) {
       if (error instanceof CliError && error.exitCode === EXIT.domain) continue;
       throw error;

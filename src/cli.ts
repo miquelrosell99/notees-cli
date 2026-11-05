@@ -15,7 +15,7 @@
 
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { Command, CommanderError, Option } from "commander";
@@ -57,7 +57,7 @@ import {
   yearFromDate,
   type CslItem,
 } from "@notees/export";
-import { OP_CATALOG, WORKSPACE_FEATURES, describeOp, newEnvelope, Clock, type ContentAst, type WorkspaceFeature } from "@notees/protocol";
+import { OP_CATALOG, WORKSPACE_FEATURES, describeOp, type ContentAst, type WorkspaceFeature } from "@notees/protocol";
 import {
   looksLikeQueryLanguage,
   parseQueryLanguage,
@@ -68,9 +68,11 @@ import { ApiClient } from "./client.js";
 import { expandAssetInputs, uploadAssetFile, assertObjectExists } from "./assets-lib.js";
 import { parseCslJson } from "./csl-json.js";
 import { CliError, EXIT } from "./exit-codes.js";
+import { openLocalWorkspace, type LocalWorkspace } from "./local-workspace.js";
 import {
   buildMarkdownBundle,
   collectClosure,
+  fetchSchemaIndex,
   isRecord,
   makeObjectResolver,
 } from "./markdown-export.js";
@@ -78,7 +80,7 @@ import { buildJsonArchiveDocument } from "./json-export.js";
 import { runLogseqDbImport } from "./import-logseq-db.js";
 import { runShell } from "./shell.js";
 import { defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
-import { formatTable, queryString, readStdin } from "./util.js";
+import { formatTable, readStdin } from "./util.js";
 import { DEFAULT_WORKSPACE_ID, deriveUuid, uuidv7 } from "./uuid.js";
 import { parseZoteroRdf, type ZoteroItem, type ZoteroRdfParseResult } from "./zotero-rdf.js";
 
@@ -110,6 +112,39 @@ interface CommandContext {
   statePath: string;
   /** `${profile}:${server}` — the state-file key for this invocation. */
   stateKey: string;
+  /**
+   * The local-first content session (derived store + sync engine), opened
+   * lazily on first content access — coordination-only commands (auth,
+   * config, assets, property-schema CRUD, features, workflows) never pay
+   * for a sync cycle.
+   */
+  local(): Promise<LocalWorkspace>;
+}
+
+/** Surface a failed best-effort push without failing the (locally durable) write. */
+async function warnIfPushPending(ctx: CommandContext, local: LocalWorkspace): Promise<void> {
+  if (local.pushWarning !== null) {
+    ctx.io.stderr.write(`warning: ${local.pushWarning} — the write is saved locally and will sync on the next successful \`notees sync\`\n`);
+  }
+}
+
+/**
+ * The local-first write seam for op-producing commands: one envelope
+ * (protocol v3, stamped notees-cli) applied to the local store and pushed
+ * through the engine's outbox — replacing the old "build an envelope and
+ * POST it to /api/relay/v2/batch" blocks, with the same fail-loud applier
+ * guards. `options.push: false` batches the push to the caller.
+ */
+async function submitEnvelope(
+  ctx: CommandContext,
+  opType: string,
+  payload: Record<string, unknown>,
+  affectedNodeIds: string[],
+  options: { push?: boolean } = {},
+): Promise<void> {
+  const local = await ctx.local();
+  await local.submit(opType, payload, affectedNodeIds, options);
+  if (options.push !== false) await warnIfPushPending(ctx, local);
 }
 
 function emit(ctx: CommandContext, human: string, machine: unknown): void {
@@ -178,7 +213,7 @@ function resolveKey(
 // --- command handlers --------------------------------------------------------
 
 async function objectGet(ctx: CommandContext, id: string): Promise<void> {
-  const body = await ctx.client.getJson<{ object: Record<string, unknown> }>(`/api/objects/${encodeURIComponent(id)}`);
+  const body = await (await ctx.local()).getObject(id);
   emit(ctx, `${objectMembershipLines(body.object)}\n\n${JSON.stringify(body.object, null, 2)}\n`, body);
 }
 
@@ -216,7 +251,7 @@ async function objectGetMany(ctx: CommandContext, ids: string[]): Promise<void> 
   const missing: string[] = [];
   for (const id of ids) {
     try {
-      const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+      const body = await (await ctx.local()).getObject(id);
       objects.push(body.object);
     } catch (error) {
       const absent =
@@ -304,21 +339,22 @@ async function objectCreate(ctx: CommandContext, options: {
   if (contentAst !== undefined && options.name !== undefined) {
     failUsage("--name and --content are mutually exclusive (--name becomes one text token; --content carries the whole contentAst)");
   }
-  const created = await ctx.client.postJson<{ id: string; object: unknown }>(
-    "/api/objects",
+  const local = await ctx.local();
+  const created = await local.createObject(
     { ...body, ...buildCreateBody(options), ...(contentAst !== undefined ? { contentAst } : {}) },
   );
-  // icon/color ride a follow-up patch — the object.create op payload carries
+  // icon/color ride a follow-up update — the object.create op payload carries
   // no appearance fields (object.update does).
   if (options.icon !== undefined || options.color !== undefined) {
-    await ctx.client.patchJson(`/api/objects/${encodeURIComponent(created.id)}`, {
+    const refreshed = await local.updateObject(created.id, {
       ...(options.icon !== undefined ? { icon: options.icon } : {}),
       ...(options.color !== undefined ? { color: options.color } : {}),
     });
-    const refreshed = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(created.id)}`);
+    await warnIfPushPending(ctx, local);
     emit(ctx, `${created.id}\n`, { id: created.id, object: refreshed.object });
     return;
   }
+  await warnIfPushPending(ctx, local);
   // Non-json prints the new id only (script-friendly).
   emit(ctx, `${created.id}\n`, created);
 }
@@ -369,6 +405,7 @@ async function objectCreateBatch(ctx: CommandContext, options: {
   let stopped = false;
   const queue = [...groups.values()];
   let done = 0;
+  const local = await ctx.local();
 
   await Promise.all(
     Array.from({ length: Math.min(jobs, queue.length) }, async () => {
@@ -379,7 +416,7 @@ async function objectCreateBatch(ctx: CommandContext, options: {
             continue;
           }
           try {
-            const res = await ctx.client.postJson<{ id: string }>("/api/objects", body);
+            const res = await local.createObject(body, { push: false });
             created.push({ index, id: res.id });
           } catch (error) {
             failures.push({ index, error: error instanceof Error ? error.message : String(error) });
@@ -393,6 +430,7 @@ async function objectCreateBatch(ctx: CommandContext, options: {
       }
     }),
   );
+  await local.push();
 
   const ids = [...created].sort((a, b) => a.index - b.index).map((entry) => entry.id);
   const machine = {
@@ -430,9 +468,7 @@ async function objectChildren(ctx: CommandContext, id: string, options: {
   count?: boolean;
   fields?: string;
 }): Promise<void> {
-  const body = await ctx.client.getJson<{ children: Array<Record<string, unknown>> }>(
-    `/api/objects/${encodeURIComponent(id)}/children`,
-  );
+  const body = await (await ctx.local()).getChildren(id);
   const all = body.children;
   if (options.count === true) {
     emit(ctx, `${all.length}\n`, { id, count: all.length });
@@ -500,13 +536,12 @@ async function objectChildren(ctx: CommandContext, id: string, options: {
 async function objectRestore(ctx: CommandContext, ids: string[]): Promise<void> {
   if (ids.length === 0) failUsage("object restore requires at least one id");
   const restored: Array<Record<string, unknown>> = [];
+  const local = await ctx.local();
   for (const id of ids) {
-    const body = await ctx.client.postJson<{ object: Record<string, unknown> }>(
-      `/api/objects/${encodeURIComponent(id)}/restore`,
-      {},
-    );
-    restored.push(body.object);
+    const body = await local.restoreObject(id);
+    restored.push(body.object as Record<string, unknown>);
   }
+  await warnIfPushPending(ctx, local);
   emit(
     ctx,
     restored.map((object) => `${String(object.id)}\n`).join(""),
@@ -560,21 +595,20 @@ async function objectMerge(
   // No client-side guard for source === target: the server's merge planner
   // owns the guards (self-merge, descendant target, class/trashed roles) and
   // answers them as 422 → exit 1 (domain) with its message.
+  const local = await ctx.local();
   const named = async (ref: string): Promise<{ id: string; name: string }> => {
-    const body = await ctx.client.getJson<{ object: { id: string; name?: string | null } }>(
-      `/api/objects/${encodeURIComponent(ref)}`,
-    );
-    return { id: body.object.id, name: body.object.name ?? body.object.id };
+    const body = await local.getObject(ref);
+    const object = body.object as { id: string; name?: string | null };
+    return { id: object.id, name: object.name ?? object.id };
   };
   const source = await named(sourceRef);
   const target = await named(targetRef);
   const plan = { source, target };
   const preview = `merge "${source.name}" into "${target.name}" — children move, references retarget, the source trashes`;
   if (options.dryRun === true) {
-    const res = await ctx.client.postJson<{ dryRun: boolean; summary: MergeSummary }>(
-      `/api/objects/${encodeURIComponent(source.id)}/merge?dryRun=true`,
-      { targetId: target.id },
-    );
+    const res = (await local.mergeObjects(source.id, target.id, {
+      dryRun: true,
+    })) as { dryRun: boolean; summary: MergeSummary };
     const human =
       `dry run: ${preview}\n` + renderMergeSummaryLines(res.summary).map((line) => `  ${line}`).join("\n") + "\n";
     emit(ctx, human, {
@@ -588,10 +622,10 @@ async function objectMerge(
     ctx.io.stderr.write(`Refusing to merge: ${preview}.\nRe-run with --yes to proceed (or --dry-run to inspect).\n`);
     throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
   }
-  const res = await ctx.client.postJson<{ merged: boolean; targetId: string; summary: MergeSummary }>(
-    `/api/objects/${encodeURIComponent(source.id)}/merge`,
-    { targetId: target.id },
-  );
+  const res = (await local.mergeObjects(source.id, target.id, {
+    dryRun: false,
+  })) as { merged: boolean; targetId: string; summary: MergeSummary };
+  await warnIfPushPending(ctx, local);
   const human =
     renderMergeSummaryLines(res.summary).map((line) => `  ${line}`).join("\n") +
     `\nMerged "${source.name}" into "${target.name}"\n`;
@@ -620,14 +654,13 @@ async function objectUpsert(ctx: CommandContext, options: {
   const wanted = name.trim().toLowerCase();
   if (wanted.length === 0) failUsage("object upsert requires a non-empty --name");
   const classIds = options.class ?? [];
-  // Title lookup rides the object listing (exact-name filter client-side);
-  // a single-class scope narrows the server query.
-  const query = queryString({
+  // Title lookup rides the local object listing (exact-name filter
+  // client-side); a single-class scope narrows the query.
+  const body = await (await ctx.local()).listObjects({
     q: name,
     ...(classIds.length === 1 ? { class: classIds[0] } : {}),
     limit: 500,
   });
-  const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>> }>(`/api/objects${query}`);
   const matches = body.objects.filter((object) => {
     if (typeof object.name !== "string" || object.name.trim().toLowerCase() !== wanted) return false;
     const classes = Array.isArray(object.classIds) ? object.classIds : [];
@@ -656,7 +689,9 @@ async function objectUpsert(ctx: CommandContext, options: {
     ...(options.parent !== undefined ? { parent: options.parent } : {}),
     ...(options.isEmbedded !== undefined ? { isEmbedded: options.isEmbedded } : {}),
   });
-  const created = await ctx.client.postJson<{ id: string; object: unknown }>("/api/objects", createBody);
+  const local = await ctx.local();
+  const created = await local.createObject(createBody);
+  await warnIfPushPending(ctx, local);
   emit(ctx, `${created.id}\n`, { ...created, created: true });
 }
 
@@ -688,10 +723,9 @@ async function objectUpdate(ctx: CommandContext, id: string, options: {
   if (Object.keys(body).length === 0) {
     failUsage("object update requires at least one of --name, --content, --isEmbedded, --icon, --color");
   }
-  const updated = await ctx.client.patchJson<{ object: unknown }>(
-    `/api/objects/${encodeURIComponent(id)}`,
-    body,
-  );
+  const local = await ctx.local();
+  const updated = await local.updateObject(id, body);
+  await warnIfPushPending(ctx, local);
   emit(ctx, `${JSON.stringify(updated.object, null, 2)}\n`, updated);
 }
 
@@ -742,16 +776,18 @@ function mentionTargetIds(ast: unknown): string[] {
  * unreadable target degrades to "no prose", never a failed listing).
  */
 async function fetchObjectNames(ctx: CommandContext, ids: readonly string[]): Promise<Map<string, string>> {
+  const local = await ctx.local();
   const names = new Map<string, string>();
   const queue = [...ids];
   await Promise.all(
     Array.from({ length: Math.min(8, queue.length) }, async () => {
       for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
         try {
-          const body = await ctx.client.getJson<{ object: { name?: string | null } }>(
-            `/api/objects/${encodeURIComponent(id)}`,
-          );
-          if (typeof body.object.name === "string" && body.object.name.length > 0) names.set(id, body.object.name);
+          const body = await local.getObject(id);
+          if (typeof (body.object as { name?: string | null }).name === "string") {
+            const name = (body.object as { name?: string | null }).name!;
+            if (name.length > 0) names.set(id, name);
+          }
         } catch {
           // unresolvable target → the mention contributes nothing
         }
@@ -772,6 +808,7 @@ async function resolveNamelessDisplayNames(
   ctx: CommandContext,
   rows: Array<Record<string, unknown>>,
 ): Promise<Map<string, string>> {
+  const local = await ctx.local();
   const nameless = rows.filter((row) => typeof row.name !== "string" || row.name.length === 0);
   const targets = new Set<string>();
   const needsAst = new Map<string, Record<string, unknown>>();
@@ -784,11 +821,9 @@ async function resolveNamelessDisplayNames(
     Array.from({ length: Math.min(8, astQueue.length) }, async () => {
       for (let id = astQueue.pop(); id !== undefined; id = astQueue.pop()) {
         try {
-          const body = await ctx.client.getJson<{ object: Record<string, unknown> }>(
-            `/api/objects/${encodeURIComponent(id)}`,
-          );
+          const body = await local.getObject(id);
           const row = needsAst.get(id)!;
-          row.contentAst = body.object.contentAst ?? null;
+          row.contentAst = (body.object as Record<string, unknown>).contentAst ?? null;
           for (const target of mentionTargetIds(row.contentAst)) targets.add(target);
         } catch {
           // unresolvable row stays name-less
@@ -821,10 +856,8 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
     // Blast-radius preview — never prompt when --json or non-tty.
     let preview: { name?: string | null; isClass?: boolean; isEmbedded?: boolean } = {};
     try {
-      const fetched = await ctx.client.getJson<{ object: { name?: string | null; isClass?: boolean; isEmbedded?: boolean } }>(
-        `/api/objects/${encodeURIComponent(id)}`,
-      );
-      preview = fetched.object;
+      const fetched = await (await ctx.local()).getObject(id);
+      preview = fetched.object as { name?: string | null; isClass?: boolean; isEmbedded?: boolean };
     } catch (error) {
       if (error instanceof CliError && error.exitCode === EXIT.domain) throw error;
       throw error;
@@ -837,10 +870,9 @@ async function objectDelete(ctx: CommandContext, id: string, options: { permanen
     );
     throw new CliError(EXIT.usage, "destructive command requires --yes", { preview });
   }
-  const query = permanent ? `?permanent=true&confirm=${encodeURIComponent(id)}` : "";
-  const result = await ctx.client.deleteJson<{ id: string; deleted: boolean; permanent: boolean }>(
-    `/api/objects/${encodeURIComponent(id)}${query}`,
-  );
+  const local = await ctx.local();
+  const result = await local.deleteObject(id, { permanent });
+  await warnIfPushPending(ctx, local);
   emit(ctx, `deleted ${result.id}${result.permanent ? " (permanent)" : ""}\n`, result);
 }
 
@@ -876,24 +908,22 @@ async function objectList(ctx: CommandContext, options: {
         ? 500
         : undefined;
   const pageParams = {
-    isClass: options.isClass,
-    isEmbedded,
-    ...(classes.length === 1 ? { class: classes[0] } : {}),
+    ...(options.isClass !== undefined ? { isClass: options.isClass } : {}),
+    ...(isEmbedded !== undefined ? { isEmbedded } : {}),
+    ...(classes.length === 1 ? { class: classes[0]! } : {}),
     ...(options.parent !== undefined ? { parent: options.parent } : {}),
-    ...(trashed !== undefined ? { trashed: "true" } : {}),
-    q: options.q,
-    property: options.property,
-    limit,
+    ...(trashed !== undefined ? { trashed: true as const } : {}),
+    ...(options.q !== undefined ? { q: options.q } : {}),
+    ...(options.property !== undefined ? { property: options.property } : {}),
+    ...(limit !== undefined ? { limit } : {}),
   };
   const objects: Array<Record<string, unknown>> = [];
   let cursor = options.cursor;
   let nextCursor: string | null | undefined;
+  const local = await ctx.local();
   do {
-    const query = queryString({ ...pageParams, cursor });
-    const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>>; nextCursor?: string | null }>(
-      `/api/objects${query}`,
-    );
-    objects.push(...body.objects);
+    const body = await local.listObjects({ ...pageParams, ...(cursor !== undefined ? { cursor } : {}) });
+    objects.push(...(body.objects as unknown as Array<Record<string, unknown>>));
     nextCursor = body.nextCursor ?? null;
     cursor = body.nextCursor ?? undefined;
   } while (options.all === true && cursor !== undefined);
@@ -914,14 +944,18 @@ async function search(ctx: CommandContext, queryText: string, options: { isClass
   // QueryAST here and executed through POST /api/query. DSL parse errors
   // fail loud (exit 2) with the parser's message — never silently degraded
   // to a text search.
+  const local = await ctx.local();
   if (!looksLikeQueryLanguage(queryText)) {
-    const query = queryString({ q: queryText, isClass: options.isClass, isEmbedded: options.isEmbedded });
-    const body = await ctx.client.getJson<unknown>(`/api/search${query}`);
+    const body = await local.searchObjects({
+      q: queryText,
+      ...(options.isClass !== undefined ? { isClass: options.isClass } : {}),
+      ...(options.isEmbedded !== undefined ? { isEmbedded: options.isEmbedded } : {}),
+    });
     emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
     return;
   }
-  const ast = await compileQueryLanguage(ctx, queryText);
-  const body = await ctx.client.postJson<{ ids: string[]; rows: SearchRow[] }>("/api/query", { ast });
+  const ast = await compileQueryLanguage(ctx, queryText, local);
+  const body = (await local.runQueryAst(ast)) as { ids: string[]; rows: SearchRow[] };
   const rows = body.rows ?? [];
   const human = rows.length === 0
     ? "no results\n"
@@ -946,9 +980,10 @@ interface SearchRow {
  * uuids through verbatim (name-or-uuid refs, like the object's own --class
  * filter), so scripts can query by id without knowing display names.
  */
-async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<QueryAst> {
+async function compileQueryLanguage(ctx: CommandContext, text: string, local?: LocalWorkspace): Promise<QueryAst> {
+  const session = local ?? (await ctx.local());
   const [{ classes }, { propertySchemas }] = await Promise.all([
-    ctx.client.getJson<{ classes: { id: string; name: string }[] }>("/api/classes"),
+    session.listClasses() as unknown as Promise<{ classes: { id: string; name: string }[] }>,
     ctx.client.getJson<{ propertySchemas: { id: string; name: string }[] }>("/api/property-schemas"),
   ]);
   const classIds = new Map(classes.map((klass) => [klass.name.toLowerCase(), klass.id]));
@@ -961,10 +996,11 @@ async function compileQueryLanguage(ctx: CommandContext, text: string): Promise<
   for (const name of extractLinkedNames(text)) {
     const wanted = name.toLowerCase();
     if (nodeIds.has(wanted) || CLASS_UUID_PATTERN.test(name)) continue;
-    const body = await ctx.client.getJson<{ id: string } | { error: string }>(
-      `/api/resolve${queryString({ name })}`,
-    );
-    if ("id" in body) nodeIds.set(wanted, body.id);
+    try {
+      nodeIds.set(wanted, session.resolveName(name).id);
+    } catch {
+      // unresolved linked: name stays unresolvable — the parser reports it
+    }
   }
 
   try {
@@ -1066,7 +1102,7 @@ function buildClassTree(classes: ApiClassRow[]): { roots: ClassTreeNode[]; lines
 }
 
 async function classList(ctx: CommandContext, options: { tree?: boolean }): Promise<void> {
-  const body = await ctx.client.getJson<{ classes: ApiClassRow[] }>("/api/classes");
+  const body = (await (await ctx.local()).listClasses()) as { classes: ApiClassRow[] };
   if (options.tree === true) {
     const { roots, lines } = buildClassTree(body.classes);
     emit(ctx, `${lines.join("\n")}\n`, { ...body, tree: roots });
@@ -1088,19 +1124,16 @@ async function classList(ctx: CommandContext, options: { tree?: boolean }): Prom
  * projection (present OR-Set rows, active nodes).
  */
 async function classMembers(ctx: CommandContext, classId: string, parentId?: string): Promise<Array<{ id: string }>> {
+  const local = await ctx.local();
   if (parentId === undefined) {
-    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
-      `/api/classes/${encodeURIComponent(classId)}`,
-    );
+    const detail = (await local.getClass(classId)) as { members: Array<{ id: string }> };
     return detail.members;
   }
   const members: Array<{ id: string }> = [];
   let cursor: string | undefined;
   do {
-    const page = await ctx.client.getJson<{ objects: Array<{ id: string }>; nextCursor?: string | null }>(
-      `/api/objects${queryString({ class: classId, parent: parentId, limit: 500, cursor })}`,
-    );
-    members.push(...page.objects);
+    const page = await local.listObjects({ class: classId, parent: parentId, limit: 500, ...(cursor !== undefined ? { cursor } : {}) });
+    members.push(...(page.objects as Array<{ id: string }>));
     cursor = page.nextCursor ?? undefined;
   } while (cursor !== undefined);
   return members;
@@ -1129,9 +1162,9 @@ async function classRemap(
   const jobs = Number.parseInt(options.jobs ?? "8", 10);
   if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32) failUsage("--jobs must be an integer between 1 and 32");
   const members = await classMembers(ctx, from.id, options.parent);
-  const { classes } = await ctx.client.getJson<{
+  const { classes } = (await (await ctx.local()).listClasses()) as {
     classes: Array<{ id: string; parentClassIds: string[] }>;
-  }>("/api/classes");
+  };
   // An extender equal to the target is skipped: remap cannot make TO extend itself.
   const extenders = classes.filter((c) => (c.parentClassIds ?? []).includes(from.id) && c.id !== to.id);
   const plan = {
@@ -1154,14 +1187,13 @@ async function classRemap(
   let moved = 0;
   const failures: Array<{ id: string; error: string }> = [];
   const queue = members.map((member) => member.id);
+  const local = await ctx.local();
   await Promise.all(
     Array.from({ length: Math.min(jobs, queue.length) }, async () => {
       for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
         try {
-          await ctx.client.putJson(`/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(to.id)}`);
-          await ctx.client.deleteJson(
-            `/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(from.id)}`,
-          );
+          await local.assignClass(id, to.id);
+          await local.unassignClass(id, from.id);
           moved += 1;
         } catch (error) {
           failures.push({ id, error: error instanceof Error ? error.message : String(error) });
@@ -1169,32 +1201,19 @@ async function classRemap(
       }
     }),
   );
-  // Extends remap rides the op log — there is deliberately no REST surface
-  // for setExtends (configuration write; scripts use the same envelope path
-  // as every other client).
+  // Extends remap rides the op log — the envelope path every client uses.
   let extendsRemapped = 0;
   if (extenders.length > 0) {
-    const clock = new Clock("notees-cli");
-    const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-    const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-    const envelopes = extenders.map((extender) =>
-      newEnvelope({
-        workspaceId,
-        actorId,
-        deviceId: "notees-cli",
-        client: "cli",
-        hlc: clock.now(),
-        affectedNodeIds: [extender.id],
-        opType: "class.setExtends",
-        payload: {
-          classId: extender.id,
-          parentClassIds: [...new Set(extender.parentClassIds.map((p) => (p === from.id ? to.id : p)))],
-        },
-      }),
-    );
-    const res = await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
-    extendsRemapped = res.savedCount;
+    for (const extender of extenders) {
+      await submitEnvelope(ctx, "class.setExtends", {
+        classId: extender.id,
+        parentClassIds: [...new Set(extender.parentClassIds.map((p) => (p === from.id ? to.id : p)))],
+      }, [extender.id], { push: false });
+    }
+    extendsRemapped = extenders.length;
+    await local.push();
   }
+  await warnIfPushPending(ctx, local);
   emit(
     ctx,
     `remapped ${moved}/${plan.members} members (${failures.length} failures), ${extendsRemapped}/${plan.extenders} extends\n`,
@@ -1236,22 +1255,9 @@ async function classSetExtends(
     ctx.io.stderr.write(`Refusing to ${preview}.\nRe-run with --yes to proceed.\n`);
     throw new CliError(EXIT.usage, "destructive command requires --yes", { plan });
   }
-  // No REST surface for setExtends (configuration write) — the envelope rides
-  // the relay batch endpoint, the same write path as every other client.
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelope = newEnvelope({
-    workspaceId,
-    actorId,
-    deviceId: "notees-cli",
-    client: "cli",
-    hlc: clock.now(),
-    affectedNodeIds: [klass.id],
-    opType: "class.setExtends",
-    payload: { classId: klass.id, parentClassIds },
-  });
-  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  // The envelope rides the local-first write seam, the same op-log path as
+  // every other client.
+  await submitEnvelope(ctx, "class.setExtends", { classId: klass.id, parentClassIds }, [klass.id]);
   emit(
     ctx,
     `extends of "${klass.name}" set to ${parents.length > 0 ? parentClassIds.join(", ") : "(none)"}\n`,
@@ -1279,20 +1285,7 @@ async function classRenderAs(ctx: CommandContext, classRef: string, roleRaw: str
   }
   const klass = await resolveClassRef(ctx, classRef);
   const parentlessRole: "page" | "block" = roleRaw;
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelope = newEnvelope({
-    workspaceId,
-    actorId,
-    deviceId: "notees-cli",
-    client: "cli",
-    hlc: clock.now(),
-    affectedNodeIds: [klass.id],
-    opType: "class.update",
-    payload: { classId: klass.id, parentlessRole },
-  });
-  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  await submitEnvelope(ctx, "class.update", { classId: klass.id, parentlessRole }, [klass.id]);
   emit(
     ctx,
     `parentless members of "${klass.name}" render as ${parentlessRole === "block" ? "blocks" : "pages"} ` +
@@ -1318,29 +1311,21 @@ async function objectMove(ctx: CommandContext, id: string, options: {
   if (options.after !== undefined && options.before !== undefined) {
     failUsage("--after and --before are mutually exclusive");
   }
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelope = newEnvelope({
-    workspaceId,
-    actorId,
-    deviceId: "notees-cli",
-    client: "cli",
-    hlc: clock.now(),
-    affectedNodeIds: [id, options.parent],
-    opType: "object.move",
-    payload: {
+  const local = await ctx.local();
+  await local.submit(
+    "object.move",
+    {
       objectId: id,
       parentId: options.parent,
       ...(options.after !== undefined ? { afterId: options.after } : {}),
       ...(options.before !== undefined ? { beforeId: options.before } : {}),
     },
-  });
-  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
-  const body = await ctx.client.getJson<{
-    object: { id: string; parentId: string | null; name?: string | null };
-  }>(`/api/objects/${encodeURIComponent(id)}`);
-  emit(ctx, `${body.object.id}\n`, { moved: body.object.id, parent: body.object.parentId, object: body.object });
+    [id, options.parent],
+  );
+  await warnIfPushPending(ctx, local);
+  const body = await local.getObject(id);
+  const object = body.object as { id: string; parentId: string | null; name?: string | null };
+  emit(ctx, `${object.id}\n`, { moved: object.id, parent: object.parentId, object });
 }
 
 /**
@@ -1377,7 +1362,9 @@ const CLASS_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
  */
 async function resolveClassRef(ctx: CommandContext, ref: string): Promise<{ id: string; name: string }> {
   if (CLASS_UUID_PATTERN.test(ref)) return { id: ref, name: ref };
-  const body = await ctx.client.getJson<{ classes: { id: string; name: string }[] }>("/api/classes");
+  const body = (await (await ctx.local()).listClasses()) as {
+    classes: { id: string; name: string }[];
+  };
   const wanted = ref.trim().toLowerCase();
   const matches = body.classes.filter((klass) => klass.name.toLowerCase() === wanted);
   if (matches.length === 0) {
@@ -1396,14 +1383,16 @@ async function classMembership(
   action: "assign" | "unassign",
 ): Promise<void> {
   const klass = await resolveClassRef(ctx, classRef);
-  const url = `/api/objects/${encodeURIComponent(objectId)}/classes/${encodeURIComponent(klass.id)}`;
+  const local = await ctx.local();
   // Both ops are idempotent: assign re-adds (OR-Set add-wins), unassign
   // tombstones (a no-op when the membership is already absent).
   const body =
     action === "assign"
-      ? await ctx.client.putJson<{ object: { classIds: string[] } }>(url)
-      : await ctx.client.deleteJson<{ object: { classIds: string[] } }>(url);
-  const machine = { objectId, classId: klass.id, className: klass.name, classIds: body.object.classIds };
+      ? await local.assignClass(objectId, klass.id)
+      : await local.unassignClass(objectId, klass.id);
+  await warnIfPushPending(ctx, local);
+  const object = body.object as { classIds: string[] };
+  const machine = { objectId, classId: klass.id, className: klass.name, classIds: object.classIds };
   emit(ctx, `${action}ed ${objectId} — classes now: ${machine.classIds.join(", ") || "(none)"}\n`, machine);
 }
 
@@ -1417,9 +1406,7 @@ async function classMembership(
  */
 async function resolveTagRef(ctx: CommandContext, ref: string): Promise<{ id: string; name: string }> {
   if (CLASS_UUID_PATTERN.test(ref)) return { id: ref, name: ref };
-  const body = await ctx.client.getJson<{ objects: Array<Record<string, unknown>> }>(
-    `/api/objects${queryString({ q: ref, limit: 500 })}`,
-  );
+  const body = await (await ctx.local()).listObjects({ q: ref, limit: 500 });
   const wanted = ref.trim().toLowerCase();
   const matches = body.objects.filter(
     (object) =>
@@ -1445,14 +1432,17 @@ async function tagMembership(
   action: "assign" | "unassign",
 ): Promise<void> {
   const tag = await resolveTagRef(ctx, tagRef);
-  const url = `/api/objects/${encodeURIComponent(objectId)}/tags/${encodeURIComponent(tag.id)}`;
+  const local = await ctx.local();
   // Both ops are idempotent: assign re-adds (OR-Set add-wins), unassign
   // tombstones (a no-op when the tag is already absent).
   const body =
     action === "assign"
-      ? await ctx.client.putJson<{ object: { tagIds?: string[] } }>(url)
-      : await ctx.client.deleteJson<{ object: { tagIds?: string[] } }>(url);
-  const tagIds = Array.isArray(body.object.tagIds) ? body.object.tagIds : [];
+      ? await local.assignTag(objectId, tag.id)
+      : await local.unassignTag(objectId, tag.id);
+  await warnIfPushPending(ctx, local);
+  const tagIds = Array.isArray((body.object as { tagIds?: string[] }).tagIds)
+    ? (body.object as { tagIds?: string[] }).tagIds!
+    : [];
   const machine = { objectId, tagId: tag.id, tagName: tag.name, tagIds };
   emit(ctx, `${action}ed ${objectId} — tags now: ${tagIds.join(", ") || "(none)"}\n`, machine);
 }
@@ -1482,8 +1472,8 @@ interface ProbeNode {
  */
 async function probeObject(ctx: CommandContext, id: string): Promise<ProbeNode | undefined> {
   try {
-    const body = await ctx.client.getJson<{ object: ProbeNode }>(`/api/objects/${encodeURIComponent(id)}`);
-    return body.object;
+    const body = await (await ctx.local()).getObject(id);
+    return body.object as unknown as ProbeNode;
   } catch (error) {
     const status = error instanceof CliError ? (error.details as { status?: number } | undefined)?.status : undefined;
     if (status === 404) return undefined;
@@ -1543,11 +1533,15 @@ function workflowEffectiveRows(
 ): Promise<Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>> {
   let hit = caches.effective.get(objectId);
   if (hit === undefined) {
-    hit = ctx.client
-      .getJson<{
-        properties: Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>;
-      }>(`/api/objects/${encodeURIComponent(objectId)}/effective-properties`)
-      .then((body) => body.properties);
+    hit = (async () => {
+      const body = await (await ctx.local()).effectiveProperties(objectId);
+      return body.properties as Array<{
+        schemaId: string;
+        elementId: string | null;
+        value: unknown;
+        source: string;
+      }>;
+    })();
     caches.effective.set(objectId, hit);
   }
   return hit;
@@ -1639,27 +1633,20 @@ async function workflowToggle(ctx: CommandContext, wfIdRaw: string, target: "ena
     if (write === null) skipped += 1;
     else pending.push(write);
   }
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelopes = pending.map((step) => {
-    const objectId = step.payload.objectId ?? step.payload.classId;
-    return newEnvelope({
-      workspaceId,
-      actorId,
-      deviceId: "notees-cli",
-      client: "cli",
-      hlc: clock.now(),
-      affectedNodeIds: typeof objectId === "string" ? [objectId] : [],
-      opType: step.opType,
-      payload: step.payload,
-    });
-  });
+  const local = await ctx.local();
   let applied = 0;
-  if (envelopes.length > 0) {
-    const res = await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes });
-    applied = res.savedCount;
+  for (const step of pending) {
+    const objectId = step.payload.objectId ?? step.payload.classId;
+    await local.submit(
+      step.opType,
+      step.payload as Record<string, unknown>,
+      typeof objectId === "string" ? [objectId] : [],
+      { push: false },
+    );
+    applied += 1;
   }
+  if (applied > 0) await local.push();
+  await warnIfPushPending(ctx, local);
   const state: WorkflowState = target === "enabled" ? "installed" : "disabled";
   emit(ctx, `${wfId}: ${state} (${applied} ops applied, ${skipped} already converged)\n`, {
     workflow: wfId,
@@ -1724,20 +1711,12 @@ async function featureToggle(ctx: CommandContext, featureRaw: string, enabled: b
     "/api/features",
   );
   const settings = body.features.find((row) => row.feature === feature)?.settings ?? null;
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelope = newEnvelope({
-    workspaceId,
-    actorId,
-    deviceId: "notees-cli",
-    client: "cli",
-    hlc: clock.now(),
-    affectedNodeIds: [],
-    opType: "workspace.feature.set",
-    payload: settings !== null ? { feature, enabled, settings } : { feature, enabled },
-  });
-  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+  await submitEnvelope(
+    ctx,
+    "workspace.feature.set",
+    settings !== null ? { feature, enabled, settings } : { feature, enabled },
+    [],
+  );
   emit(ctx, `${feature}: ${String(enabled)}\n`, { feature, label: featureSpec(feature).label, enabled, settings });
 }
 
@@ -1777,20 +1756,21 @@ async function classBulkMembers(
   }
   let done = 0;
   const failures: Array<{ id: string; error: string }> = [];
+  const local = await ctx.local();
   for (const member of members) {
     try {
       if (action === "unassign") {
-        await ctx.client.deleteJson(
-          `/api/objects/${encodeURIComponent(member.id)}/classes/${encodeURIComponent(klass.id)}`,
-        );
+        await local.unassignClass(member.id, klass.id);
       } else {
-        await ctx.client.deleteJson(`/api/objects/${encodeURIComponent(member.id)}`);
+        await local.deleteObject(member.id, {});
       }
       done += 1;
     } catch (error) {
       failures.push({ id: member.id, error: error instanceof Error ? error.message : String(error) });
     }
   }
+  await local.push();
+  await warnIfPushPending(ctx, local);
   const verb = action === "unassign" ? "unassigned" : "trashed";
   emit(ctx, `${verb} ${done}/${plan.members} members of "${klass.name}" (${failures.length} failures)\n`, {
     ...plan,
@@ -1800,7 +1780,7 @@ async function classBulkMembers(
 }
 
 async function backlinks(ctx: CommandContext, id: string): Promise<void> {
-  const body = await ctx.client.getJson<unknown>(`/api/objects/${encodeURIComponent(id)}/backlinks`);
+  const body = await (await ctx.local()).backlinks(id);
   emit(ctx, `${JSON.stringify(body, null, 2)}\n`, body);
 }
 
@@ -1836,7 +1816,7 @@ async function assetAdd(ctx: CommandContext, inputs: string[], options: {
   // The multipart attach is dangling-id-tolerant server-side (the asset.attach
   // applier upserts node_asset rows without validating the node), so verify
   // the target up front instead of uploading bytes that attach to nothing.
-  if (objectId !== undefined) await assertObjectExists(ctx.client, objectId);
+  if (objectId !== undefined) await assertObjectExists(await ctx.local(), objectId);
   const uploaded: { index: number; file: string; assetId: string }[] = [];
   let stopped = false;
   const queue = files.map((file, index) => ({ file, index }));
@@ -1899,7 +1879,7 @@ async function assetAttach(ctx: CommandContext, assetId: string, options: { obje
   // fail here) and the node (the asset.attach applier upserts node_asset
   // rows without validating it — an attach to a dangling node id would
   // otherwise silently succeed and leave an orphan row).
-  await assertObjectExists(ctx.client, options.object);
+  await assertObjectExists(await ctx.local(), options.object!);
   const info = await ctx.client.getJson<{
     assetId: string;
     hash: string;
@@ -1907,18 +1887,10 @@ async function assetAttach(ctx: CommandContext, assetId: string, options: { obje
     size: number;
     originalName: string;
   }>(`/api/assets/${encodeURIComponent(assetId)}/info`);
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${ctx.client.apiKey}`);
-  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const envelope = newEnvelope({
-    workspaceId,
-    actorId,
-    deviceId: "notees-cli",
-    client: "cli",
-    hlc: clock.now(),
-    affectedNodeIds: [options.object, info.assetId],
-    opType: "asset.attach",
-    payload: {
+  await submitEnvelope(
+    ctx,
+    "asset.attach",
+    {
       objectId: options.object,
       assetId: info.assetId,
       hash: info.hash,
@@ -1926,8 +1898,8 @@ async function assetAttach(ctx: CommandContext, assetId: string, options: { obje
       size: info.size,
       originalName: info.originalName,
     },
-  });
-  await ctx.client.postJson<{ savedCount: number }>("/api/relay/v2/batch", { envelopes: [envelope] });
+    [options.object, info.assetId],
+  );
   emit(ctx, `attached ${info.assetId} to ${options.object}\n`, {
     assetId: info.assetId,
     objectId: options.object,
@@ -1977,30 +1949,75 @@ async function assetGet(ctx: CommandContext, id: string, options: { output?: str
 }
 
 async function syncStatus(ctx: CommandContext): Promise<void> {
-  // --workspace names resolve through the account's listing; without one the
-  // relay stats address the same server default the object API would.
+  // `sync status` never runs a cycle — it reports the last cycle's
+  // watermarks: the relay stats against the local store's persisted cursor.
   const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
-  const stats = await ctx.client.getJson<{ envelopeCount: number; restoreEpoch: number; maxHlc: { physical: number; logical: number } }>(
-    `/api/relay/v2/stats?workspaceId=${workspaceId}`,
-  );
-  const stateKey = `${ctx.opts.profile ?? "default"}:${ctx.client.server}`;
-  const local = serverState(ctx.statePath, stateKey);
-  const cursorSeq = local.cursorSeq ?? 0;
-  const machine = {
+  const session = await openLocalWorkspace({
     server: ctx.client.server,
+    apiKey: ctx.client.apiKey,
     workspaceId,
-    envelopeCount: stats.envelopeCount,
-    restoreEpoch: stats.restoreEpoch,
-    maxHlc: stats.maxHlc,
-    localCursorSeq: cursorSeq,
-    behind: Math.max(0, stats.envelopeCount - cursorSeq),
-  };
-  emit(
-    ctx,
-    `server ${machine.server}: ${machine.envelopeCount} envelopes (restoreEpoch ${machine.restoreEpoch})\n` +
-      `local cursor: seq ${machine.localCursorSeq} — ${machine.behind} behind\n`,
-    machine,
-  );
+    storeDir: join(dirname(ctx.statePath), "stores"),
+  });
+  try {
+    const stats = await session.serverStats();
+    const { cursorSeq } = session.localCursor();
+    const unpushed = session.unpushedCount();
+    const machine = {
+      server: ctx.client.server,
+      workspaceId,
+      envelopeCount: stats.envelopeCount,
+      restoreEpoch: stats.restoreEpoch,
+      localCursorSeq: cursorSeq,
+      behind: Math.max(0, stats.envelopeCount - cursorSeq),
+      unpushed,
+    };
+    emit(
+      ctx,
+      `server ${machine.server}: ${machine.envelopeCount} envelopes (restoreEpoch ${machine.restoreEpoch})\n` +
+        `local cursor: seq ${machine.localCursorSeq} — ${machine.behind} behind, ${unpushed} unpushed\n`,
+      machine,
+    );
+  } finally {
+    session.close();
+  }
+}
+
+/** `notees sync` — one manual sync cycle: push the durable unpushed backlog,
+ * pull catch-up (snapshot shortcut when newer), report the watermarks. */
+async function syncOnce(ctx: CommandContext): Promise<void> {
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const json = ctx.opts.json === true;
+  const session = await openLocalWorkspace({
+    server: ctx.client.server,
+    apiKey: ctx.client.apiKey,
+    workspaceId,
+    storeDir: join(dirname(ctx.statePath), "stores"),
+    ...(json
+      ? {}
+      : { onSyncPhase: (_phase, message) => ctx.io.stderr.write(`${message}\n`) }),
+  });
+  try {
+    await session.sync();
+    const stats = await session.serverStats();
+    const { cursorSeq } = session.localCursor();
+    const machine = {
+      server: ctx.client.server,
+      workspaceId,
+      envelopeCount: stats.envelopeCount,
+      restoreEpoch: stats.restoreEpoch,
+      localCursorSeq: cursorSeq,
+      behind: Math.max(0, stats.envelopeCount - cursorSeq),
+      unpushed: session.unpushedCount(),
+    };
+    emit(
+      ctx,
+      `synced ${machine.server} (workspace ${workspaceId}): cursor seq ${machine.localCursorSeq}/` +
+        `${machine.envelopeCount}, ${machine.unpushed} unpushed\n`,
+      machine,
+    );
+  } finally {
+    session.close();
+  }
 }
 
 /** CLI release version — aligned with the server release train. */
@@ -2090,7 +2107,7 @@ async function doctor(command: Command): Promise<void> {
 
   if (client !== undefined) {
     try {
-      const version = await client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/version");
+      const version = await client.getJson<{ name: string; version: string; protocolVersion: number }>("/api/server-info");
       push("server reachable", true, `${version.name} ${version.version} (protocol v${version.protocolVersion})`, EXIT.ok);
       push(
         "cli/server version drift",
@@ -2166,9 +2183,7 @@ async function exportMarkdown(ctx: CommandContext, options: {
   let seeds = ids;
   if (options.classRef !== undefined) {
     const klass = await resolveClassRef(ctx, options.classRef);
-    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
-      `/api/classes/${encodeURIComponent(klass.id)}`,
-    );
+    const detail = (await (await ctx.local()).getClass(klass.id)) as { members: Array<{ id: string }> };
     seeds = detail.members.map((member) => member.id);
   }
   if (options.outputDir !== undefined && options.stdout === true) {
@@ -2180,7 +2195,9 @@ async function exportMarkdown(ctx: CommandContext, options: {
   const depth = parseDepth(options);
   // Seeds + closure + children + reference names live in markdown-export.ts,
   // shared with the shell's export(ids) helper.
-  const bundle = await buildMarkdownBundle(ctx.client, { ids: seeds, linkedTo: options.linkedTo, depth });
+  const local = await ctx.local();
+  const schemaIndex = await fetchSchemaIndex(ctx.client);
+  const bundle = await buildMarkdownBundle(local, schemaIndex, { ids: seeds, linkedTo: options.linkedTo, depth });
   const machine = { files: bundle.files.length, nodes: bundle.manifest.nodes };
   if (options.stdout === true) {
     const text = concatBundleMarkdown(bundle);
@@ -2209,13 +2226,13 @@ async function exportJson(ctx: CommandContext, options: {
   let seeds = ids;
   if (options.classRef !== undefined) {
     const klass = await resolveClassRef(ctx, options.classRef);
-    const detail = await ctx.client.getJson<{ members: Array<{ id: string }> }>(
-      `/api/classes/${encodeURIComponent(klass.id)}`,
-    );
+    const detail = (await (await ctx.local()).getClass(klass.id)) as { members: Array<{ id: string }> };
     seeds = detail.members.map((member) => member.id);
   }
   const depth = parseDepth(options);
-  const archive = await buildJsonArchiveDocument(ctx.client, {
+  const local = await ctx.local();
+  const schemaIndex = await fetchSchemaIndex(ctx.client);
+  const archive = await buildJsonArchiveDocument(local, schemaIndex, {
     ids: seeds,
     linkedTo: options.linkedTo,
     depth,
@@ -2252,10 +2269,8 @@ function fullPropertiesOf(object: unknown): FullApiProperty[] {
 }
 
 async function getFullObject(ctx: CommandContext, id: string): Promise<FullApiObject> {
-  const body = await ctx.client.getJson<{ object: FullApiObject }>(
-    `/api/objects/${encodeURIComponent(id)}`,
-  );
-  return body.object;
+  const body = await (await ctx.local()).getObject(id);
+  return body.object as unknown as FullApiObject;
 }
 
 async function setProperty(
@@ -2265,11 +2280,9 @@ async function setProperty(
   value: unknown,
   idx = 0,
 ): Promise<void> {
-  await ctx.client.postJson(`/api/objects/${encodeURIComponent(objectId)}/properties`, {
-    propertySchemaId,
-    value,
-    idx,
-  });
+  const local = await ctx.local();
+  await local.setProperty(objectId, { propertySchemaId, value, idx });
+  await warnIfPushPending(ctx, local);
 }
 
 const PROPERTY_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2310,7 +2323,7 @@ async function objectPropertySet(
     // Plain string value — the common case for text-ish schemas.
   }
   await setProperty(ctx, id, schema.id, parsed, idx);
-  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+  const body = await (await ctx.local()).getObject(id);
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
 }
 
@@ -2420,7 +2433,7 @@ async function objectPropertyDelete(
   const idx = Number.parseInt(options.idx ?? "0", 10);
   if (!Number.isInteger(idx) || idx < 0) failUsage("--idx must be a non-negative integer");
   await deleteProperty(ctx, id, schema.id, idx);
-  const body = await ctx.client.getJson<{ object: unknown }>(`/api/objects/${encodeURIComponent(id)}`);
+  const body = await (await ctx.local()).getObject(id);
   emit(ctx, `${JSON.stringify(body.object, null, 2)}\n`, { objectId: id, schemaId: schema.id, schemaName: schema.name, idx, object: body.object });
 }
 
@@ -2449,8 +2462,8 @@ interface FullObject {
 }
 
 async function getObject(ctx: CommandContext, id: string): Promise<FullObject> {
-  const body = await ctx.client.getJson<{ object: FullObject }>(`/api/objects/${encodeURIComponent(id)}`);
-  return body.object;
+  const body = await (await ctx.local()).getObject(id);
+  return body.object as FullObject;
 }
 
 /** The cover's asset node id on a node (null = no cover). */
@@ -2459,7 +2472,9 @@ function coverAssetOf(object: FullObject): string | null {
 }
 
 async function coverSetField(ctx: CommandContext, nodeId: string, coverAssetId: string | null): Promise<void> {
-  await ctx.client.patchJson(`/api/objects/${encodeURIComponent(nodeId)}`, { coverAssetId });
+  const local = await ctx.local();
+  await local.updateObject(nodeId, { coverAssetId });
+  await warnIfPushPending(ctx, local);
 }
 
 /**
@@ -2492,15 +2507,16 @@ async function coverSet(
   }
 
   let assetId: string;
+  const local = await ctx.local();
   if (fromAsset) {
     assetId = options.asset!;
     const assetNode = await getObject(ctx, assetId);
     const classes = assetNode.classIds ?? [];
     if (!classes.includes(ASSET_CLASS_ID)) {
-      await ctx.client.putJson(`/api/objects/${encodeURIComponent(assetId)}/classes/${encodeURIComponent(ASSET_CLASS_ID)}`);
+      await local.assignClass(assetId, ASSET_CLASS_ID);
     }
   } else {
-    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
+    const created = await local.createObject({
       name: basename(file!),
       isEmbedded: false,
       classIds: [ASSET_CLASS_ID],
@@ -2546,9 +2562,9 @@ async function deleteProperty(
   propertySchemaId: string,
   idx = 0,
 ): Promise<void> {
-  await ctx.client.deleteJson(
-    `/api/objects/${encodeURIComponent(objectId)}/properties/${encodeURIComponent(propertySchemaId)}?idx=${idx}`,
-  );
+  const local = await ctx.local();
+  await local.unsetProperty(objectId, propertySchemaId, idx);
+  await warnIfPushPending(ctx, local);
 }
 
 // --- property schema verbs -----------------------------------------------------
@@ -2588,7 +2604,9 @@ async function propertyList(ctx: CommandContext): Promise<void> {
   const scopedIds = [...new Set(body.propertySchemas.flatMap((schema) => schema.scopeClassIds ?? []))];
   const classNames = new Map<string, string>();
   if (scopedIds.length > 0) {
-    const listing = await ctx.client.getJson<{ classes: Array<{ id: string; name: string }> }>("/api/classes");
+    const listing = (await (await ctx.local()).listClasses()) as {
+      classes: Array<{ id: string; name: string }>;
+    };
     for (const klass of listing.classes) classNames.set(klass.id, klass.name);
   }
   const rows = body.propertySchemas.map((schema) => [
@@ -2630,7 +2648,7 @@ async function resolveEligibleClasses(
 ): Promise<Array<{ id: string; name: string; via: string[] }> | null> {
   if (schema.scopeClassIds === null) return null;
   const scoped = new Set(schema.scopeClassIds);
-  const { classes } = await ctx.client.getJson<{ classes: ApiClassRow[] }>("/api/classes");
+  const { classes } = (await (await ctx.local()).listClasses()) as { classes: ApiClassRow[] };
   const byId = new Map(classes.map((klass) => [klass.id, klass]));
   const eligible: Array<{ id: string; name: string; via: string[] }> = [];
   for (const klass of classes) {
@@ -3111,6 +3129,7 @@ async function importLogseqDb(
   }
   await runLogseqDbImport({
     client: ctx.client,
+    local: await ctx.local(),
     io: ctx.io,
     json: ctx.opts.json === true,
     file: filePath,
@@ -3373,7 +3392,8 @@ async function runSourceImport(
  * the exact filter is the authority.
  */
 async function findSourcesByTitle(ctx: CommandContext, citekey: string): Promise<FullApiObject[]> {
-  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(`/api/objects${queryString({ q: citekey })}`);
+  const body = await (await ctx.local()).listObjects({ q: citekey });
+  body.objects as FullApiObject[];
   const seen = new Set<string>();
   const matches: FullApiObject[] = [];
   for (const object of body.objects) {
@@ -3396,9 +3416,10 @@ async function upsertSource(
   fillOnlyEmpty: boolean,
   fills: SourceFieldFill[],
 ): Promise<string> {
+  const local = await ctx.local();
   let id: string;
   if (action === "create") {
-    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
+    const created = await local.createObject({
       isEmbedded: false,
       name: spec.title,
       classIds: [SYSTEM_CLASS_UUIDS[spec.className]],
@@ -3413,14 +3434,14 @@ async function upsertSource(
       // scope — assign the spec's source class first (the write would fail
       // loud otherwise).
       if (needsClassAssign) {
-        await ctx.client.putJson(`/api/objects/${encodeURIComponent(id)}/classes/${encodeURIComponent(SYSTEM_CLASS_UUIDS[spec.className])}`);
+        await local.assignClass(id, SYSTEM_CLASS_UUIDS[spec.className]);
       }
     } else {
       counts.updated += 1;
     }
     if (matched!.name !== spec.title) {
       // Title-is-content: the title update rewrites the node's text content.
-      await ctx.client.patchJson(`/api/objects/${encodeURIComponent(id)}`, {
+      await local.updateObject(id, {
         contentAst: [{ type: "text", text: spec.title }],
       });
     }
@@ -3549,14 +3570,10 @@ async function ensureChainNode(
   classId: string,
   parentId: string | null,
 ): Promise<void> {
+  const local = await ctx.local();
+  if (local.store.getNode(id) !== undefined) return;
   try {
-    await ctx.client.getJson(`/api/objects/${encodeURIComponent(id)}`);
-    return;
-  } catch {
-    // Missing — create below.
-  }
-  try {
-    await ctx.client.postJson("/api/objects", {
+    await local.createObject({
       id,
       isEmbedded: false,
       ...(parentId !== null ? { parentId } : {}),
@@ -3564,7 +3581,7 @@ async function ensureChainNode(
       name: label,
     });
   } catch {
-    // 409: another writer created it — the chain node exists either way.
+    // Conflict: another writer created it — the chain node exists either way.
   }
 }
 
@@ -3620,7 +3637,8 @@ async function today(ctx: CommandContext, options: { append?: string }): Promise
   await ensureChainNode(ctx, ids.day, dateNodeLabel(parts, "day"), SYSTEM_CLASS_UUIDS.day, ids.month);
   let appendedBlock: { id: string } | undefined;
   if (options.append !== undefined && options.append.trim() !== "") {
-    const created = await ctx.client.postJson<{ id: string }>("/api/objects", {
+    const local = await ctx.local();
+    const created = await local.createObject({
       parentId: ids.day,
       contentAst: [{ type: "text", text: options.append }],
     });
@@ -3663,10 +3681,8 @@ async function dateEnsure(ctx: CommandContext, isoDate: string): Promise<void> {
 /** `notees journal`: daily notes, newest first. */
 async function journal(ctx: CommandContext, options: { limit: string }): Promise<void> {
   const limit = Number.parseInt(options.limit, 10);
-  const body = await ctx.client.getJson<{ objects: FullApiObject[] }>(
-    `/api/objects?class=${SYSTEM_CLASS_UUIDS.day}&limit=500`,
-  );
-  const days = body.objects
+  const body = await (await ctx.local()).listObjects({ class: SYSTEM_CLASS_UUIDS.day, limit: 500 });
+  const days = (body.objects as unknown as FullApiObject[])
     .map((object) => ({ object, parsed: parseDateNodeId(object.id) }))
     .filter((entry): entry is { object: FullApiObject; parsed: NonNullable<typeof entry.parsed> } => entry.parsed !== null)
     .sort((a, b) => (a.parsed.year - b.parsed.year) || (a.parsed.month - b.parsed.month) || (a.parsed.day - b.parsed.day))
@@ -3685,8 +3701,9 @@ async function findSourceByCitekey(
   ctx: CommandContext,
   citekey: string,
 ): Promise<FullApiObject | undefined> {
-  const query = queryString({ property: `${SYSTEM_PROPERTY_UUIDS.citekey}:${citekey}` });
-  const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/objects${query}`);
+  const body = await (await ctx.local()).listObjects({
+    property: `${SYSTEM_PROPERTY_UUIDS.citekey}:${citekey}`,
+  });
   const first = body.objects[0];
   if (first === undefined) return undefined;
   return getFullObject(ctx, first.id);
@@ -3702,8 +3719,9 @@ async function findSourceByIdentifier(
   prop: "doi" | "isbn",
   value: string,
 ): Promise<FullApiObject | undefined> {
-  const query = queryString({ property: `${SYSTEM_PROPERTY_UUIDS[prop]}:${value}` });
-  const body = await ctx.client.getJson<{ objects: { id: string }[] }>(`/api/objects${query}`);
+  const body = await (await ctx.local()).listObjects({
+    property: `${SYSTEM_PROPERTY_UUIDS[prop]}:${value}`,
+  });
   const first = body.objects[0];
   if (first === undefined) return undefined;
   return getFullObject(ctx, first.id);
@@ -3718,8 +3736,10 @@ async function exportBibtex(ctx: CommandContext, options: {
 }): Promise<void> {
   const ids = requireExportSelectors("export bibtex", options);
   const depth = parseDepth(options);
-  const resolver = makeObjectResolver(ctx.client);
-  const included = await collectClosure(ctx.client, resolver, { ids, linkedTo: options.linkedTo, depth });
+  const local = await ctx.local();
+  const schemaIndex = await fetchSchemaIndex(ctx.client);
+  const resolver = makeObjectResolver(local, schemaIndex);
+  const included = await collectClosure(local, resolver, { ids, linkedTo: options.linkedTo, depth });
 
   // Only source-class nodes render as entries; the rest of the closure is
   // context (skipped, counted for the report).
@@ -3808,19 +3828,40 @@ function ctxOf(command: Command, options: { allowMissingKey?: boolean } = {}): C
   const { server, workspace } = requireServer(opts, statePath);
   const stateKey = `${opts.profile ?? "default"}:${server}`;
   const { apiKey } = resolveKey(opts, statePath, stateKey, options.allowMissingKey === true);
+  const client = new ApiClient({
+    server,
+    apiKey,
+    // exactOptionalPropertyTypes: omit rather than assign undefined.
+    ...(workspace !== undefined ? { workspace } : {}),
+    statePath,
+    stateKey,
+  });
+  let localPromise: Promise<LocalWorkspace> | null = null;
   return {
     io: (root.getOptionValue("__io") as CliIo | undefined) ?? defaultIo,
     opts,
-    client: new ApiClient({
-      server,
-      apiKey,
-      // exactOptionalPropertyTypes: omit rather than assign undefined.
-      ...(workspace !== undefined ? { workspace } : {}),
-      statePath,
-      stateKey,
-    }),
+    client,
     statePath,
     stateKey,
+    local(): Promise<LocalWorkspace> {
+      // One session per invocation: the resolved workspace id addresses the
+      // store file (<state-dir>/stores/<workspaceId>.db); the open runs the
+      // custody probe + a full sync cycle, so reads are fresh and the
+      // durable unpushed backlog replays before anything else.
+      if (localPromise === null) {
+        localPromise = (async () => {
+          const workspaceId = (await client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+          const session = await openLocalWorkspace({
+            server,
+            apiKey,
+            workspaceId,
+            storeDir: join(dirname(statePath), "stores"),
+          });
+          return session;
+        })();
+      }
+      return localPromise;
+    },
   };
 }
 
@@ -4701,13 +4742,16 @@ function buildProgram(): Command {
       await assetGet(ctxOf(command), id, options);
     });
 
-  const sync = program.command("sync").description("sync operations");
+  const sync = program.command("sync").description("sync the local store with the relay (push the unpushed backlog, pull catch-up)");
   sync
-    .command("status")
-    .description("server stats + local cursor")
+    .command("status", { isDefault: false })
+    .description("server stats + local cursor watermarks (no sync cycle)")
     .action(async (_options: object, command: Command) => {
       await syncStatus(ctxOf(command));
     });
+  sync.action(async (_options: object, command: Command) => {
+    await syncOnce(ctxOf(command));
+  });
 
   program
     .command("doctor")
@@ -4720,11 +4764,12 @@ function buildProgram(): Command {
 
   program
     .command("shell [script]")
-    .description("interactive object-API shell (Node REPL with helpers; a script file argument or piped stdin runs as a one-shot script)")
+    .description("interactive object-graph shell (Node REPL with helpers; a script file argument or piped stdin runs as a one-shot script)")
     .action(async (script: string | undefined, _options: object, command: Command) => {
       const ctx = ctxOf(command);
       await runShell({
         client: ctx.client,
+        openLocal: () => ctx.local(),
         io: ctx.io,
         json: ctx.opts.json === true,
         stdin: ctx.io.stdin,

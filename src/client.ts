@@ -101,11 +101,14 @@ export class ApiClient {
       }
       throw new CliError(EXIT.auth, `workspace resolution failed (HTTP ${response.status})`);
     }
-    const body = (await response.json()) as { workspaces?: { id: string; name: string }[] };
+    const body = (await response.json()) as { workspaces?: { id: string; name: string | null }[] };
     const available = Array.isArray(body.workspaces) ? body.workspaces : [];
-    const hit = available.find((entry) => entry.name.toLowerCase() === cacheKey);
+    // Nameless rows (imported/migrated workspaces carry no name) can never
+    // match a name lookup — they list as "(unnamed)" in the error, never a
+    // null-deref.
+    const hit = available.find((entry) => entry.name?.toLowerCase() === cacheKey);
     if (hit === undefined) {
-      const names = available.map((entry) => entry.name).join(", ") || "(none)";
+      const names = available.map((entry) => entry.name ?? "(unnamed)").join(", ") || "(none)";
       throw new CliError(EXIT.usage, `workspace "${workspace}" not found — available: ${names}`);
     }
     updateServerState(statePath, stateKey, (current) => ({

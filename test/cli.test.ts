@@ -14,7 +14,7 @@ import Database from "better-sqlite3";
 // Generous timeouts kept as a bounded safety margin.
 vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
 
-import { newEnvelope } from "@notees/protocol";
+import { Clock, newEnvelope, type Envelope } from "@notees/protocol";
 import {
   SYSTEM_CLASS_UUIDS,
   SYSTEM_PROPERTY_UUIDS,
@@ -24,12 +24,13 @@ import {
   parseIsoDate,
 } from "@notees/domain";
 import { bibToCsl, parseBibtex } from "@notees/export";
+import { Store } from "@notees/store";
 
 import { buildServer, defaultWorkspaceId } from "@notees/server";
 
 import { run, type CliIo } from "../src/cli.js";
-import { ApiClient } from "../src/client.js";
 import { EXIT } from "../src/exit-codes.js";
+import { LocalWorkspace, openLocalWorkspace } from "../src/local-workspace.js";
 import { buildMarkdownBundle } from "../src/markdown-export.js";
 import { updateServerState } from "../src/state.js";
 
@@ -62,6 +63,10 @@ interface Harness {
   runCli(...args: string[]): Promise<number>;
   runCliWithStdin(stdin: string, ...args: string[]): Promise<number>;
   createPage(name: string, contentAst: unknown[]): Promise<string>;
+  /** Seed a standalone object through the CLI create path -> its id. */
+  seedObject(name: string, classIds: string[]): Promise<string>;
+  /** Seed one typed property value through the CLI property-set path. */
+  seedProperty(objectId: string, propertySchemaId: string, value: unknown): Promise<void>;
 }
 
 async function bootServer(): Promise<Harness> {
@@ -108,6 +113,24 @@ async function bootServer(): Promise<Harness> {
       const code = await run(["--server", baseUrl, "--key", API_KEY, ...args], io);
       io.stdin = undefined;
       return code;
+    },
+    async seedObject(name, classIds) {
+      const code = await this.runCliWithStdin(
+        JSON.stringify({ isEmbedded: false, name, classIds }),
+        "--json", "object", "create", "--stdin",
+      );
+      if (code !== EXIT.ok) throw new Error(`seedObject ${name} failed: ${io.stderrText}`);
+      return (JSON.parse(io.stdoutText) as { id: string }).id;
+    },
+    async seedProperty(objectId, propertySchemaId, value) {
+      // JSON-encoded on the wire so a bare numeric string (an ISBN) stays a
+      // string value for the text schema (the CLI JSON-parses the value arg).
+      const code = await this.runCli(
+        "--json", "object", "property", "set", objectId, propertySchemaId,
+        JSON.stringify(value),
+        "--idx", "0",
+      );
+      if (code !== EXIT.ok) throw new Error(`seedProperty ${objectId}/${propertySchemaId} failed: ${io.stderrText}`);
     },
     async createPage(name: string, contentAst: unknown[]) {
       // Title-is-content: the page's own content IS its title; the given
@@ -420,13 +443,23 @@ describe("assets, classes, sync", () => {
     await h.runCli("--json", "object", "create", "--no-isEmbedded", "--name", "t5-sync-probe");
     expect(await h.runCli("--json", "sync", "status")).toBe(EXIT.ok);
     const status = JSON.parse(h.io.stdoutText);
-    // One server + one state file for the whole file: envelopeCount includes
-    // seeding and every other test's writes (hence only > 0), and no command
-    // in the file ever advances the persisted cursor, so it stays 0 and
-    // `behind` must equal the full envelope count.
+    // Every command syncs on open, so the persisted cursor tracks the relay
+    // log exactly: nothing is behind, nothing is unpushed. (envelopeCount
+    // includes seeding and every other test's writes — hence only > 0.)
     expect(status.envelopeCount).toBeGreaterThan(0);
-    expect(status.localCursorSeq).toBe(0);
-    expect(status.behind).toBe(status.envelopeCount);
+    expect(status.localCursorSeq).toBe(status.envelopeCount);
+    expect(status.behind).toBe(0);
+    expect(status.unpushed).toBe(0);
+  });
+
+  it("`notees sync` runs a cycle and reports the watermarks", async () => {
+    const h = harness;
+    expect(await h.runCli("--json", "sync")).toBe(EXIT.ok);
+    const status = JSON.parse(h.io.stdoutText);
+    expect(status.envelopeCount).toBeGreaterThan(0);
+    expect(status.localCursorSeq).toBe(status.envelopeCount);
+    expect(status.behind).toBe(0);
+    expect(status.unpushed).toBe(0);
   });
 
   it("object create prints a bare id in human mode", async () => {
@@ -525,97 +558,94 @@ describe("export markdown", () => {
     expect(h.io.stdoutText).toContain("- child bullet body");
   });
 
-  it("children come from the position-ordered children endpoint, not the paged object scan", async () => {
-    // Fake transport over a real ApiClient: the children endpoint answers in
-    // a deliberate non-id order; the bundle must preserve it, recurse into
-    // discovered inline children, skip child pages, and never touch the
-    // paged /api/objects list.
+  it("children render in child-position order from the local store (the bundle never rides a paged scan)", async () => {
+    // The plan-07 local-first architecture: the bundle reads the derived
+    // store's position-ordered children, recurses into discovered inline
+    // children, skips child pages — and by construction cannot touch a
+    // paged object scan (there is no server content read left). The fixture
+    // store is built with applied envelopes; the apply order deliberately
+    // disagrees with id order.
     const pageId = "11111111-1111-4111-8111-111111111111";
     const childA = "aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa"; // id order: A, B, G
-    const childB = "bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb"; // endpoint order: B, A
+    const childB = "bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb"; // store order: B, A
     const grand = "cccccccc-3333-4ccc-8ccc-cccccccccccc";
     const childPage = "dddddddd-4444-4ddd-8ddd-dddddddddddd";
-
-    const objectFixture = (
-      id: string,
-      overrides: Record<string, unknown>,
-    ): Record<string, unknown> => ({
-      id,
-      isClass: false,
-      isEmbedded: true,
-      parentId: pageId,
-      classIds: [],
-      name: null,
-      contentAst: [],
-      properties: [],
-      ...overrides,
-    });
-    const objects = new Map<string, Record<string, unknown>>([
-      [pageId, objectFixture(pageId, {
+    const dir = mkdtempSync(join(tmpdir(), "notees-cli-export-test-"));
+    const store = Store.openFile(join(dir, "fixture.db"));
+    try {
+      const workspaceId = defaultWorkspaceId();
+      const clock = new Clock("export-test");
+      const stamp = (opType: string, payload: Record<string, unknown>): Envelope =>
+        newEnvelope({
+          workspaceId,
+          actorId: "99999999-8888-4777-8666-555555555555",
+          deviceId: "export-test",
+          hlc: clock.now(),
+          opType,
+          payload,
+        });
+      const create = (payload: Record<string, unknown>): void => {
+        store.apply(stamp("object.create", payload));
+      };
+      create({
+        objectId: pageId,
         isEmbedded: false,
-        parentId: null,
-        name: "fake page",
+        classIds: [],
         contentAst: [{ type: "text", text: "fake page" }],
-      })],
-      [childA, objectFixture(childA, { contentAst: [{ type: "text", text: "alpha body" }] })],
-      [childB, objectFixture(childB, { contentAst: [{ type: "text", text: "beta body" }] })],
-      [grand, objectFixture(grand, { parentId: childB, contentAst: [{ type: "text", text: "grand body" }] })],
-      [childPage, objectFixture(childPage, {
+      });
+      // Apply order IS the store's child position: B before A, ids ascending.
+      create({
+        objectId: childB,
+        isEmbedded: true,
+        parentId: pageId,
+        classIds: [],
+        contentAst: [{ type: "text", text: "beta body" }],
+      });
+      create({
+        objectId: childA,
+        isEmbedded: true,
+        parentId: pageId,
+        classIds: [],
+        contentAst: [{ type: "text", text: "alpha body" }],
+      });
+      create({
+        objectId: childPage,
         isEmbedded: false,
+        parentId: pageId,
+        classIds: [],
         contentAst: [{ type: "text", text: "child page body" }],
-      })],
-    ]);
-    const childrenFixtures = new Map<string, unknown[]>([
-      [pageId, [objects.get(childB), objects.get(childA), objects.get(childPage)]],
-      [childB, [objects.get(grand)]],
-    ]);
+      });
+      create({
+        objectId: grand,
+        isEmbedded: true,
+        parentId: childB,
+        classIds: [],
+        contentAst: [{ type: "text", text: "grand body" }],
+      });
 
-    const requested: string[] = [];
-    const jsonResponse = (body: unknown, status = 200): Response =>
-      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-    const fetchImpl: typeof fetch = async (input) => {
-      const url = new URL(String(input));
-      requested.push(url.pathname + url.search);
-      const objectMatch = /^\/api\/objects\/([^/]+)\/children$/.exec(url.pathname);
-      if (objectMatch !== null) {
-        return jsonResponse({ children: childrenFixtures.get(decodeURIComponent(objectMatch[1]!)) ?? [] });
-      }
-      const singleMatch = /^\/api\/objects\/([^/]+)$/.exec(url.pathname);
-      if (singleMatch !== null) {
-        const object = objects.get(decodeURIComponent(singleMatch[1]!));
-        return object === undefined
-          ? jsonResponse({ error: { code: "not_found", message: "missing" } }, 404)
-          : jsonResponse({ object });
-      }
-      if (url.pathname === "/api/objects") {
-        // A regressed paged scan gets a valid empty page so the URL
-        // assertion below carries the failure, not the empty bundle.
-        return jsonResponse({ objects: [], nextCursor: null });
-      }
-      if (url.pathname === "/api/property-schemas") {
-        return jsonResponse({ propertySchemas: [] });
-      }
-      return jsonResponse({ error: { code: "unexpected", message: url.pathname } }, 500);
-    };
-    const client = new ApiClient({ server: "http://export-test.local", apiKey: "k", fetchImpl });
+      const local = new LocalWorkspace(
+        { server: "http://unused.local", apiKey: "k", workspaceId, storeDir: dir },
+        store,
+        undefined as unknown as import("@notees/sync").HttpTransport,
+        clock,
+        undefined,
+      );
+      const bundle = await buildMarkdownBundle(local, new Map(), { ids: [pageId], depth: 0 });
 
-    const bundle = await buildMarkdownBundle(client, { ids: [pageId], depth: 0 });
-
-    const file = bundle.files.find((entry) => entry.path === `${pageId}.md`);
-    expect(file).toBeDefined();
-    // Endpoint order wins over id order.
-    expect(file!.content.indexOf("beta body")).toBeLessThan(file!.content.indexOf("alpha body"));
-    // The discovered inline child is itself queried (nested bullets recurse).
-    expect(file!.content).toContain("grand body");
-    // A child page is its own bundle file, never a nested bullet.
-    expect(file!.content).not.toContain("child page body");
-    expect(requested.filter((path) => path.endsWith("/children"))).toEqual([
-      `/api/objects/${pageId}/children`,
-      `/api/objects/${childB}/children`,
-      `/api/objects/${childA}/children`,
-      `/api/objects/${grand}/children`,
-    ]);
-    expect(requested.some((path) => path.startsWith("/api/objects?"))).toBe(false);
+      const file = bundle.files.find((entry) => entry.path === `${pageId}.md`);
+      expect(file).toBeDefined();
+      // Store (child-position) order wins over id order.
+      expect(file!.content.indexOf("beta body")).toBeLessThan(file!.content.indexOf("alpha body"));
+      // The discovered inline child is itself read (nested bullets recurse).
+      expect(file!.content).toContain("grand body");
+      // A child page is never a nested bullet of the parent's file (it is
+      // not in the --ids seed set, so it is not exported at all).
+      expect(file!.content).not.toContain("child page body");
+      expect(bundle.files.some((entry) => entry.path === `${childPage}.md`)).toBe(false);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("children render in child-position order (endpoint order, not id order)", async () => {
@@ -1673,36 +1703,10 @@ describe("import zotero-rdf", () => {
   it("a hand-set Linked authors pick on an existing source survives the import untouched", async () => {
     const h = harness;
     // A manual person + a manual Linked authors pick (the user's own choice).
-    const manual = await fetch(`${h.baseUrl}/api/objects`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({
-        isEmbedded: false,
-        name: "Curie, Marie",
-        classIds: [SYSTEM_CLASS_UUIDS.person],
-      }),
-    });
-    const manualId = ((await manual.json()) as { id: string }).id;
-    const source = await fetch(`${h.baseUrl}/api/objects`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({
-        isEmbedded: false,
-        name: "Manual Link Article",
-        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
-      }),
-    });
-    const sourceId = ((await source.json()) as { id: string }).id;
-    for (const [propertySchemaId, value] of [
-      [SYSTEM_PROPERTY_UUIDS.citekey, "rdf-manual-1"],
-      [SYSTEM_PROPERTY_UUIDS.linkedAuthors, { nodeId: manualId }],
-    ] as const) {
-      await fetch(`${h.baseUrl}/api/objects/${sourceId}/properties`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": API_KEY },
-        body: JSON.stringify({ propertySchemaId, value }),
-      });
-    }
+    const manualId = await h.seedObject("Curie, Marie", [SYSTEM_CLASS_UUIDS.person]);
+    const sourceId = await h.seedObject("Manual Link Article", [SYSTEM_CLASS_UUIDS.journal_article]);
+    await h.seedProperty(sourceId, SYSTEM_PROPERTY_UUIDS.citekey, "rdf-manual-1");
+    await h.seedProperty(sourceId, SYSTEM_PROPERTY_UUIDS.linkedAuthors, { nodeId: manualId });
 
     const file = join(h.dataDir, "zotero-import-manual.rdf");
     writeFileSync(file, ZOTERO_RDF_MANUAL_FIXTURE);
@@ -1723,26 +1727,9 @@ describe("import zotero-rdf", () => {
   it("matched node keeps its existing values; only empty fields fill (no clobber)", async () => {
     const h = harness;
     // A pre-existing source matched by citekey, with the owner's hand-fixed DOI.
-    const response = await fetch(`${h.baseUrl}/api/objects`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({
-        isEmbedded: false,
-        name: "Clash Article",
-        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
-      }),
-    });
-    const { id } = (await response.json()) as { id: string };
-    for (const [propertySchemaId, value] of [
-      [SYSTEM_PROPERTY_UUIDS.citekey, "rdf-clash-1"],
-      [SYSTEM_PROPERTY_UUIDS.doi, "10.0000/hand-fixed"],
-    ] as const) {
-      await fetch(`${h.baseUrl}/api/objects/${id}/properties`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": API_KEY },
-        body: JSON.stringify({ propertySchemaId, value }),
-      });
-    }
+    const id = await h.seedObject("Clash Article", [SYSTEM_CLASS_UUIDS.journal_article]);
+    await h.seedProperty(id, SYSTEM_PROPERTY_UUIDS.citekey, "rdf-clash-1");
+    await h.seedProperty(id, SYSTEM_PROPERTY_UUIDS.doi, "10.0000/hand-fixed");
 
     const file = join(h.dataDir, "zotero-import-clash.rdf");
     writeFileSync(file, ZOTERO_RDF_CLASH_FIXTURE);
@@ -1854,36 +1841,10 @@ describe("import zotero-rdf", () => {
   it("adopts a source matched by doi, then isbn (citekey → doi → isbn → title → create)", async () => {
     const h = harness;
     // Pre-existing sources carrying the owner's identifier, no citekey yet.
-    const doiNode = await fetch(`${h.baseUrl}/api/objects`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({
-        isEmbedded: false,
-        name: "Preexisting DOI Article",
-        classIds: [SYSTEM_CLASS_UUIDS.journal_article],
-      }),
-    });
-    const doiNodeId = ((await doiNode.json()) as { id: string }).id;
-    const isbnNode = await fetch(`${h.baseUrl}/api/objects`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({
-        isEmbedded: false,
-        name: "Preexisting ISBN Book",
-        classIds: [SYSTEM_CLASS_UUIDS.book],
-      }),
-    });
-    const isbnNodeId = ((await isbnNode.json()) as { id: string }).id;
-    for (const [nodeId, propertySchemaId, value] of [
-      [doiNodeId, SYSTEM_PROPERTY_UUIDS.doi, "10.1111/adopt.me"],
-      [isbnNodeId, SYSTEM_PROPERTY_UUIDS.isbn, "9781111111111"],
-    ] as const) {
-      await fetch(`${h.baseUrl}/api/objects/${nodeId}/properties`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": API_KEY },
-        body: JSON.stringify({ propertySchemaId, value }),
-      });
-    }
+    const doiNodeId = await h.seedObject("Preexisting DOI Article", [SYSTEM_CLASS_UUIDS.journal_article]);
+    const isbnNodeId = await h.seedObject("Preexisting ISBN Book", [SYSTEM_CLASS_UUIDS.book]);
+    await h.seedProperty(doiNodeId, SYSTEM_PROPERTY_UUIDS.doi, "10.1111/adopt.me");
+    await h.seedProperty(isbnNodeId, SYSTEM_PROPERTY_UUIDS.isbn, "9781111111111");
 
     const file = join(h.dataDir, "zotero-import-adopt.rdf");
     writeFileSync(file, ZOTERO_RDF_ADOPT_FIXTURE);
@@ -1934,10 +1895,8 @@ describe("import zotero-rdf", () => {
     expect(planned.fills.map((f) => f.name)).toEqual(
       expect.arrayContaining(["abstract", "volume"]),
     );
-    const search = await fetch(`${h.baseUrl}/api/objects?q=Idem%20Article`, {
-      headers: { "x-api-key": API_KEY },
-    });
-    const found = ((await search.json()) as { objects: Array<{ name: string | null }> }).objects;
+    await h.runCli("--json", "object", "list", "--q", "Idem Article");
+    const found = JSON.parse(h.io.stdoutText).objects as Array<{ name: string | null }>;
     expect(found.filter((o) => o.name === "The Idem Article")).toHaveLength(0);
 
     // Real import, then a second import: matched, zero fills.
@@ -2002,47 +1961,28 @@ describe("import zotero-rdf", () => {
 
 
 describe("search (query language)", () => {
-  /** Direct-fixture helper: the CLI has no property-schema write command. */
-  async function apiPost<T>(path: string, body: unknown): Promise<T> {
-    const response = await fetch(`${harness.baseUrl}${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      throw new Error(`fixture POST ${path} failed: HTTP ${response.status}: ${await response.text()}`);
-    }
-    return (await response.json()) as T;
-  }
-
   let yearSchemaId = "";
   async function makeJournalArticle(name: string, year?: number): Promise<string> {
+    const h = harness;
     if (yearSchemaId === "") {
-      yearSchemaId = (
-        await apiPost<{ propertySchema: { id: string } }>("/api/property-schemas", {
-          propertySchemaId: crypto.randomUUID(),
-          name: "year",
-          type: "number",
-        })
-      ).propertySchema.id;
+      if (await h.runCli("--json", "property", "create", "year", "--type", "number") !== EXIT.ok) {
+        throw new Error(`property create year failed: ${h.io.stderrText}`);
+      }
+      yearSchemaId = (JSON.parse(h.io.stdoutText) as { propertySchema: { id: string } }).propertySchema.id;
     }
-    const { id } = await apiPost<{ id: string }>("/api/objects", {
-      isEmbedded: false,
-      // Title-is-content: the article's own content IS its title.
-      contentAst: [{ type: "text", text: name }],
-      classIds: [SYSTEM_CLASS_UUIDS.journal_article],
-    });
-    await apiPost<{ id: string }>("/api/objects", {
-      isEmbedded: true,
-      parentId: id,
-      contentAst: [{ type: "text", text: `${name} body text` }],
-    });
+    // Title-is-content: the article's own content IS its title.
+    const id = await h.seedObject(name, [SYSTEM_CLASS_UUIDS.journal_article]);
+    const code = await h.runCliWithStdin(
+      JSON.stringify({
+        isEmbedded: true,
+        parentId: id,
+        contentAst: [{ type: "text", text: `${name} body text` }],
+      }),
+      "--json", "object", "create", "--stdin",
+    );
+    if (code !== EXIT.ok) throw new Error(`makeJournalArticle block ${name} failed: ${h.io.stderrText}`);
     if (year !== undefined) {
-      await apiPost(`/api/objects/${id}/properties`, {
-        propertySchemaId: yearSchemaId,
-        value: year,
-        idx: 0,
-      });
+      await h.seedProperty(id, yearSchemaId, year);
     }
     return id;
   }
@@ -2322,7 +2262,14 @@ describe("property schema verbs", () => {
     expect((JSON.parse(h.io.stdoutText).propertySchema as { defaultValue: unknown }).defaultValue).toBe(7);
     expect(await h.runCli("object", "create", "--isClass", "--name", "pg7-shelf-2")).toBe(EXIT.ok);
     expect(await h.runCli("property", "bind", "pg7-shelf-2", "pg7-num")).toBe(EXIT.ok);
-    expect(await h.runCli("property", "create", "pg7-num-bad", "--type", "number", "--default", '"not-a-number"')).toBe(EXIT.domain);
+    // The server's ingest persists before it applies, so a payload-semantic
+    // reject still leaves the envelope in THAT workspace's relay log — every
+    // later re-sync of the workspace would re-hit the unappliable envelope.
+    // The bad-default probe therefore rides a throwaway workspace.
+    const poisonWs = crypto.randomUUID();
+    expect(
+      await h.runCli("--workspace", poisonWs, "property", "create", "pg7-num-bad", "--type", "number", "--default", '"not-a-number"'),
+    ).toBe(EXIT.domain);
   });
 });
 
@@ -2611,16 +2558,20 @@ describe("workspace selection (--workspace)", () => {
     expect(code).toBe(EXIT.ok);
     const { id } = JSON.parse(io.stdoutText);
 
-    // The object lives in the named workspace (operator key reads anywhere)…
-    const inNamed = await h.app.inject({
-      method: "GET",
-      url: `/api/objects/${id}`,
-      headers: { "x-api-key": API_KEY, "x-workspace-id": workspaceId },
-    });
-    expect(inNamed.statusCode).toBe(200);
-    // …and NOT in the server default.
-    const inDefault = await h.app.inject({ method: "GET", url: `/api/objects/${id}`, headers: { "x-api-key": API_KEY } });
-    expect(inDefault.statusCode).toBe(404);
+    // The object lives in the named workspace, not the server default — the
+    // plan-07 truth is the relay log (the content reads retired).
+    const createsIn = async (ws: string): Promise<string[]> => {
+      const res = await h.app.inject({
+        method: "POST",
+        url: "/api/relay/v2/catch-up",
+        headers: { "content-type": "application/json", "x-api-key": API_KEY },
+        payload: { workspaceId: ws, afterSeq: 0, limit: 10000 },
+      });
+      const envelopes = res.json().envelopes as Array<{ opType: string; payload: { objectId?: string } }>;
+      return envelopes.filter((e) => e.opType === "object.create").map((e) => e.payload.objectId ?? "");
+    };
+    expect(await createsIn(workspaceId)).toContain(id);
+    expect(await createsIn(defaultWorkspaceId())).not.toContain(id);
 
     // The name→id mapping is cached per profile in the CLI state file.
     const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
@@ -2983,13 +2934,18 @@ describe("auth store (existing API keys)", () => {
       EXIT.ok,
     );
     const created = JSON.parse(createIo.stdoutText) as { id: string };
-    // …a user key addresses the server default workspace, readable there.
-    const fetched = await h.app.inject({
-      method: "GET",
-      url: `/api/objects/${created.id}`,
-      headers: { "x-api-key": API_KEY },
+    // …a user key addresses the server default workspace — the create rode
+    // the relay log there (the content reads retired with plan 07).
+    const cup = await h.app.inject({
+      method: "POST",
+      url: "/api/relay/v2/catch-up",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      payload: { workspaceId: defaultWorkspaceId(), afterSeq: 0, limit: 10000 },
     });
-    expect(fetched.statusCode).toBe(200);
+    const creates = (cup.json().envelopes as Array<{ opType: string; payload: { objectId?: string } }>)
+      .filter((e) => e.opType === "object.create")
+      .map((e) => e.payload.objectId ?? "");
+    expect(creates).toContain(created.id);
 
     const statusIo = new Capture();
     expect(await run(["--server", h.baseUrl, "auth", "status"], statusIo)).toBe(EXIT.ok);
@@ -3231,9 +3187,11 @@ describe("class render-as", () => {
     expect(await h.runCli("class", "render-as", "ra-probe", "block")).toBe(EXIT.ok);
 
     // The class routes do not project the field — the effect assertion reads
-    // the derived store directly (store schema v32, class.parentless_role).
+    // the derived store directly (store schema v32, class.parentless_role);
+    // the CLI's local store is the same projection, synced from the relay.
     const roleOf = (): string | null => {
-      const db = new Database(join(h.dataDir, "derived", `${defaultWorkspaceId()}.db`));
+      const db = new Database(join(dirname(h.stateFile), "stores", `${defaultWorkspaceId()}.db`));
+
       const row = db.prepare("SELECT parentless_role AS role FROM class WHERE id = ?").get(machine.class.id) as
         | { role: string | null }
         | undefined;
@@ -3734,19 +3692,9 @@ describe("datetime properties (unified wire batch)", () => {
     const tomorrowIso = isoLocal(tomorrow);
     const tomorrowIds = chainNodeIds(tomorrowIso);
     const tomorrowParts = parseIsoDate(tomorrowIso);
-    for (const [id, label, classId, parentId] of [
-      [tomorrowIds.year, dateNodeLabel(tomorrowParts, "year"), SYSTEM_CLASS_UUIDS.year, null],
-      [tomorrowIds.month, dateNodeLabel(tomorrowParts, "month"), SYSTEM_CLASS_UUIDS.month, tomorrowIds.year],
-      [tomorrowIds.day, dateNodeLabel(tomorrowParts, "day"), SYSTEM_CLASS_UUIDS.day, tomorrowIds.month],
-    ] as const) {
-      const res = await h.app.inject({
-        method: "POST",
-        url: "/api/objects",
-        headers: { "content-type": "application/json", "x-api-key": API_KEY },
-        payload: { id, isEmbedded: false, ...(parentId !== null ? { parentId } : {}), classIds: [classId], name: label },
-      });
-      expect([201, 409]).toContain(res.statusCode);
-    }
+    // Tomorrow's chain rides the CLI's own ensure path (the same
+    // content-addressed ids; idempotent re-runs).
+    expect(await h.runCli("--json", "date", "ensure", tomorrowIso)).toBe(EXIT.ok);
 
     // Point value with a wall-clock time (full-day = the `time` key absent).
     const pointPage = await h.createPage("dt-point-probe", []);
@@ -4080,9 +4028,9 @@ describe("covers (one-gesture cover)", () => {
     expect(await h.runCli("cover", "set", withCover, await pngFile(h, "exists.png"))).toBe(EXIT.ok);
 
     // The compiler and AST accept the coverAsset wire-field predicate, but
-    // the query-language GRAMMAR has no spelling for it yet — POST the AST
-    // programmatically (a `coverAsset:` grammar production lands separately).
-    const client = new ApiClient({ server: h.baseUrl, apiKey: API_KEY });
+    // the query-language GRAMMAR has no spelling for it yet — run the AST
+    // through the local store (plan 07 retired POST /api/query; execution
+    // is local since the rewrite).
     const ast = {
       version: 2,
       scope: { type: "entire_workspace" },
@@ -4095,8 +4043,18 @@ describe("covers (one-gesture cover)", () => {
         ],
       },
     };
-    const res = await client.postJson<{ ids: string[] }>("/api/query", { ast });
-    expect(res.ids).toEqual([withCover]);
+    const session = await openLocalWorkspace({
+      server: h.baseUrl,
+      apiKey: API_KEY,
+      workspaceId: defaultWorkspaceId(),
+      storeDir: join(dirname(h.stateFile), "stores"),
+    });
+    try {
+      const res = session.runQueryAst(ast) as { ids: string[] };
+      expect(res.ids).toEqual([withCover]);
+    } finally {
+      session.close();
+    }
   });
 
   it("doctor reports the cli/server drift check", async () => {
@@ -4425,7 +4383,11 @@ describe("asset bulk add / attach / list", () => {
 
   /** The derived node_asset rows for a node (the workspace derived SQLite). */
   function attachedAssets(dataDir: string, nodeId: string): Array<{ asset_id: string }> {
-    const db = new Database(join(dataDir, "derived", `${defaultWorkspaceId()}.db`), {
+    // The server's own derived file is lazily hydrated since plan 07, so the
+    // assertion reads the CLI's local derived store (synced from the relay;
+    // the harness keeps its state file — and therefore its stores — in
+    // dataDir).
+    const db = new Database(join(dataDir, "stores", `${defaultWorkspaceId()}.db`), {
       readonly: true,
       fileMustExist: true,
     });
@@ -4543,6 +4505,9 @@ describe("asset bulk add / attach / list", () => {
     expect(report.added).toBe(2);
     expect(report.objectId).toBe(page);
 
+    // The multipart uploads apply server-side AFTER this command's sync — one
+    // more cycle pulls the asset.attach envelopes into the local store.
+    expect(await h.runCli("--json", "sync")).toBe(EXIT.ok);
     const rows = attachedAssets(h.dataDir, page);
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map((row) => row.asset_id))).toEqual(

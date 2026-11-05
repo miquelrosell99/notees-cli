@@ -1,19 +1,26 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { Clock, newEnvelope, type Envelope } from "@notees/protocol";
 import { SYSTEM_PROPERTY_UUIDS, planWorkflowToggle } from "@notees/domain";
 
 import { run, type CliIo } from "../src/cli.js";
 import { EXIT } from "../src/exit-codes.js";
+import { DEFAULT_WORKSPACE_ID } from "../src/uuid.js";
 
-// Unit specs for the workflow + feature surface (the test/tag.test.ts
-// precedent): the wire is mocked at the fetch level — every probe count,
-// envelope shape, and read-modify-merge is asserted against the recorded
-// calls, with no live dependency. The pinned ids below are the derived-UUID
-// snapshot from @notees/domain's workflow registry (the task-2 report).
+import { FakeRelay } from "./fake-relay.js";
+
+// Unit specs for the workflow + feature surface over the plan-07 local-first
+// architecture: the CLI syncs through the relay wire protocol into a local
+// derived store (test/fake-relay.ts implements that wire over an in-memory
+// envelope log); the convergence probes read the local store; the writes ride
+// the outbox as envelopes. Graph state is seeded by appending envelopes to
+// the fake relay's log — every CLI run syncs first, so the command under test
+// sees the seed. The pinned ids below are the derived-UUID snapshot from
+// @notees/domain's workflow registry.
 
 class Capture implements CliIo {
   stdoutText = "";
@@ -43,84 +50,80 @@ const WRITING_PLAN_HAS_TEMPLATE_ELEMENT = "405ee13a-7512-5c37-a09f-05e7a41bf031"
 
 const BASE = "http://notees-mock.test";
 
-interface RecordedCall {
-  method: string;
-  path: string;
+const relay = new FakeRelay();
+let stateDir = "";
+
+const clock = new Clock("workflow-test");
+/** A stamped envelope for the fake relay's log (the seed path). */
+function stamp(opType: string, payload: Record<string, unknown>, affected: string[] = []): Envelope {
+  return newEnvelope({
+    workspaceId: DEFAULT_WORKSPACE_ID,
+    actorId: "99999999-8888-4777-8666-555555555555",
+    deviceId: "workflow-test",
+    hlc: clock.now(),
+    affectedNodeIds: affected,
+    opType,
+    payload,
+  });
 }
 
-let calls: RecordedCall[] = [];
-/** Captured JSON request bodies by request order (POST/PUT/PATCH only). */
-let bodies: unknown[] = [];
-// Responder lookup: first match on "METHOD /path/regex" wins; a request with
-// no responder fails the spec loudly (a route the test didn't plan for).
-let responders: Array<{ method: string; pattern: RegExp; status: number; body: (url: URL) => unknown }> = [];
-
-function route(method: string, pattern: RegExp, body: (url: URL) => unknown, status = 200): void {
-  responders.push({ method, pattern, status, body });
+/** Stamp every step of a workflow plan onto the fake relay's log. */
+function seedPlan(target: "enabled" | "disabled"): void {
+  for (const step of planWorkflowToggle("research", target)) {
+    const id = step.payload.objectId ?? step.payload.classId;
+    relay.append(
+      stamp(step.opType, step.payload as Record<string, unknown>, typeof id === "string" ? [id] : []),
+    );
+  }
 }
 
 beforeAll(() => {
-  process.env.NOTEES_STATE_FILE = mkdtempSync(join(tmpdir(), "notees-cli-workflow-test-")) + "/state.json";
+  stateDir = mkdtempSync(join(tmpdir(), "notees-cli-workflow-test-"));
+  process.env.NOTEES_STATE_FILE = join(stateDir, "state.json");
   for (const name of ["NOTEES_SERVER", "NOTEES_WORKSPACE", "NOTEES_API_KEY", "NOTEES_EMAIL", "NOTEES_PASSWORD"]) {
     delete process.env[name];
   }
-  vi.stubGlobal(
-    "fetch",
-    async (input: unknown, init?: RequestInit): Promise<Response> => {
-      const url = new URL(String(input));
-      const method = init?.method ?? "GET";
-      calls.push({ method, path: url.pathname + url.search });
-      if (init?.body !== undefined && typeof init.body === "string") bodies.push(JSON.parse(init.body));
-      const responder = responders.find((r) => r.method === method && r.pattern.test(url.pathname));
-      if (responder === undefined) {
-        throw new Error(`mock server: no responder for ${method} ${url.pathname}${url.search}`);
-      }
-      return new Response(JSON.stringify(responder.body(url)), {
-        status: responder.status,
-        headers: { "content-type": "application/json" },
-      });
-    },
-  );
+  vi.stubGlobal("fetch", relay.fetch);
 });
 
 afterAll(() => {
   vi.unstubAllGlobals();
-  const stateFile = process.env.NOTEES_STATE_FILE;
-  if (stateFile !== undefined) rmSync(join(stateFile, ".."), { recursive: true, force: true });
+  rmSync(stateDir, { recursive: true, force: true });
   delete process.env.NOTEES_STATE_FILE;
 });
 
 beforeEach(() => {
-  calls = [];
-  bodies = [];
-  responders = [];
+  relay.reset();
+  // The CLI's derived store is durable across runs — a fresh workspace per spec.
+  rmSync(join(stateDir, "stores"), { recursive: true, force: true });
 });
 
 afterEach(() => {
-  responders = [];
+  relay.responders = [];
 });
 
-/** The relay-batch request bodies captured so far ({envelopes: [...]} each). */
-function batchBodies(): Array<{ envelopes: Array<{ opType: string; payload: Record<string, unknown>; client?: string; deviceId?: string; affectedNodeIds?: string[] }> }> {
-  return bodies as Array<{ envelopes: Array<{ opType: string; payload: Record<string, unknown>; client?: string; deviceId?: string; affectedNodeIds?: string[] }> }>;
-}
-
-/** Drive the CLI against the mocked wire with an explicit server + key. */
+/** Drive the CLI against the fake relay with an explicit server + key. */
 async function runCli(io: Capture, ...args: string[]): Promise<number> {
   return run(["--server", BASE, "--key", "test-key", ...args], io);
 }
 
-/** Wire error body the server's 404s carry. */
-const NOT_FOUND = { error: { code: "not_found", message: "object does not exist" } };
+/** Every relay-batch POST recorded so far. */
+function batchPosts(): Array<{ method: string; path: string }> {
+  return relay.calls.filter((call) => call.method === "POST" && call.path === "/api/relay/v2/batch");
+}
 
 describe("workflow list (anchor-only probe)", () => {
-  it("probes EXACTLY ONE object read — the anchor id — and reads 404 as available", async () => {
+  it("an empty workspace reads available — the probe is ONE local store read, no content route on the wire", async () => {
     const io = new Capture();
-    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => NOT_FOUND, 404);
 
     const code = await runCli(io, "--json", "workflow", "list");
     expect(code).toBe(EXIT.ok);
-    expect(calls).toEqual([{ method: "GET", path: `/api/objects/${ANCHOR_ID}` }]);
+    // No content API route exists on the wire anymore (plan 07 retired it);
+    // the only traffic is the sync cycle (key probe + snapshot meta + catch-up).
+    expect(relay.calls.every((call) => !call.path.startsWith("/api/objects"))).toBe(true);
+    // Two catch-up cycles: the bootstrap sync, then the keyless seed-shim
+    // poke's pull (the empty-store /api/classes trigger).
+    expect(relay.calls.filter((call) => call.path === "/api/relay/v2/catch-up")).toHaveLength(2);
     expect(JSON.parse(io.stdoutText)).toEqual({
       workflows: [
         { id: "research", label: "Research", state: "available", anchorId: ANCHOR_ID },
@@ -130,7 +133,6 @@ describe("workflow list (anchor-only probe)", () => {
 
   it("human table renders the label as the first column", async () => {
     const io = new Capture();
-    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => NOT_FOUND, 404);
 
     expect(await runCli(io, "workflow", "list")).toBe(EXIT.ok);
     expect(io.stdoutText).toMatch(/^LABEL\s+/m);
@@ -138,41 +140,30 @@ describe("workflow list (anchor-only probe)", () => {
   });
 
   it("present + active reads installed; present + archived reads disabled", async () => {
+    // Seed the anchor as an active node.
+    relay.append(stamp("object.create", { objectId: ANCHOR_ID, isEmbedded: false, classIds: [] }, [ANCHOR_ID]));
     const io = new Capture();
-    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => ({ object: { id: ANCHOR_ID, isActive: true } }));
     expect(await runCli(io, "--json", "workflow", "list")).toBe(EXIT.ok);
     expect(JSON.parse(io.stdoutText).workflows[0].state).toBe("installed");
 
-    calls = [];
-    responders = [];
+    // Seed the anchor as archived (a later update wins the LWW read).
+    relay.append(stamp("object.update", { objectId: ANCHOR_ID, active: false }, [ANCHOR_ID]));
     const io2 = new Capture();
-    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => ({ object: { id: ANCHOR_ID, isActive: false } }));
     expect(await runCli(io2, "--json", "workflow", "list")).toBe(EXIT.ok);
     expect(JSON.parse(io2.stdoutText).workflows[0].state).toBe("disabled");
-    expect(calls).toHaveLength(1);
   });
 });
 
 describe("workflow enable (planWorkflowToggle → one relay batch)", () => {
-  /** The fresh-workspace responders: every probe absent, no schemas, no authored rows. */
-  function routeFreshWorkspace(): void {
-    route("GET", /^\/api\/objects\/[0-9a-f-]+$/, () => NOT_FOUND, 404);
-    route("GET", /^\/api\/property-schemas$/, () => ({ propertySchemas: [] }));
-    route("GET", /^\/api\/objects\/[0-9a-f-]+\/effective-properties$/, () => ({ properties: [] }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 48 }));
-  }
-
   it("posts ONE batch with the full 48-step enable plan, anchor first", async () => {
     const io = new Capture();
-    routeFreshWorkspace();
 
     const code = await runCli(io, "--json", "workflow", "enable", "research");
     expect(code).toBe(EXIT.ok);
-    const posts = calls.filter((c) => c.method === "POST");
-    expect(posts).toEqual([{ method: "POST", path: "/api/relay/v2/batch" }]);
+    expect(batchPosts()).toHaveLength(1);
 
-    expect(batchBodies()).toHaveLength(1);
-    const envelopes = batchBodies()[0]!.envelopes;
+    expect(relay.batchBodies()).toHaveLength(1);
+    const envelopes = relay.batchBodies()[0]!.envelopes;
     expect(envelopes).toHaveLength(48);
 
     // Anchor first: object.create at the derived anchor id.
@@ -211,51 +202,31 @@ describe("workflow enable (planWorkflowToggle → one relay batch)", () => {
   });
 
   it("un-archives an archived anchor with object.update {active:true} instead of a create", async () => {
-    const io = new Capture();
     // The anchor exists but is archived; everything else is absent.
-    route("GET", new RegExp(`^/api/objects/${ANCHOR_ID}$`), () => ({ object: { id: ANCHOR_ID, isActive: false } }));
-    route("GET", /^\/api\/objects\/[0-9a-f-]+$/, () => NOT_FOUND, 404);
-    route("GET", /^\/api\/property-schemas$/, () => ({ propertySchemas: [] }));
-    route("GET", /^\/api\/objects\/[0-9a-f-]+\/effective-properties$/, () => ({ properties: [] }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 48 }));
+    relay.append(stamp("object.create", { objectId: ANCHOR_ID, isEmbedded: false, classIds: [] }, [ANCHOR_ID]));
+    relay.append(stamp("object.update", { objectId: ANCHOR_ID, active: false }, [ANCHOR_ID]));
+    const io = new Capture();
 
     expect(await runCli(io, "workflow", "enable", "research")).toBe(EXIT.ok);
-    const envelopes = batchBodies()[0]!.envelopes;
+    const envelopes = relay.batchBodies()[0]!.envelopes;
     expect(envelopes[0]!.opType).toBe("object.update");
     expect(envelopes[0]!.payload).toEqual({ objectId: ANCHOR_ID, active: true });
   });
 
   it("a converged re-enable writes ONLY the 7 binding upserts (no REST binding read exists)", async () => {
-    const io = new Capture();
-    // Derive the fully-converged read state from the pinned plan itself:
-    // every node active, every schema listed, every property value authored.
+    // Seed the fully-converged state: the whole enable plan applied, plus the
+    // schema listing the convergence check reads (a surviving coordination route).
+    seedPlan("enabled");
     const plan = planWorkflowToggle("research", "enabled");
-    const schemaIds = plan
+    relay.propertySchemas = plan
       .filter((step) => step.opType === "propertySchema.create")
       .map((step) => ({ id: String(step.payload.propertySchemaId) }));
-    const effectiveByObject = new Map<string, Array<{ schemaId: string; elementId: string | null; value: unknown; source: string }>>();
-    for (const step of plan.filter((s) => s.opType === "property.set")) {
-      const objectId = String(step.payload.objectId);
-      const rows = effectiveByObject.get(objectId) ?? [];
-      rows.push({
-        schemaId: String(step.payload.propertySchemaId),
-        elementId: typeof step.payload.elementId === "string" ? step.payload.elementId : null,
-        value: step.payload.elementId === undefined ? step.payload.value : { nodeId: "already-there" },
-        source: "authored",
-      });
-      effectiveByObject.set(objectId, rows);
-    }
-    route("GET", /^\/api\/objects\/[0-9a-f-]+$/, () => ({ object: { id: "x", isActive: true } }));
-    route("GET", /^\/api\/property-schemas$/, () => ({ propertySchemas: schemaIds }));
-    route("GET", /^\/api\/objects\/([0-9a-f-]+)\/effective-properties$/, (url) => ({
-      properties: effectiveByObject.get(url.pathname.split("/")[3] ?? "") ?? [],
-    }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 7 }));
+    const io = new Capture();
 
     const code = await runCli(io, "--json", "workflow", "enable", "research");
     expect(code).toBe(EXIT.ok);
-    expect(batchBodies()).toHaveLength(1);
-    const envelopes = batchBodies()[0]!.envelopes;
+    expect(batchPosts()).toHaveLength(1);
+    const envelopes = relay.batchBodies()[0]!.envelopes;
     expect(envelopes).toHaveLength(7);
     for (const envelope of envelopes) expect(envelope.opType).toBe("class.property.set");
     expect(JSON.parse(io.stdoutText)).toEqual({
@@ -270,15 +241,14 @@ describe("workflow enable (planWorkflowToggle → one relay batch)", () => {
 
 describe("workflow disable (archive shape)", () => {
   it("posts ONE batch of 6 object.update {active:false} — anchor first, then classes, then templates", async () => {
+    // Seed every materialized entity as an active node (the enable plan).
+    seedPlan("enabled");
     const io = new Capture();
-    // Every materialized entity exists and is active.
-    route("GET", /^\/api\/objects\/[0-9a-f-]+$/, () => ({ object: { id: "x", isActive: true } }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 6 }));
 
     const code = await runCli(io, "--json", "workflow", "disable", "research");
     expect(code).toBe(EXIT.ok);
-    expect(batchBodies()).toHaveLength(1);
-    const envelopes = batchBodies()[0]!.envelopes;
+    expect(batchPosts()).toHaveLength(1);
+    const envelopes = relay.batchBodies()[0]!.envelopes;
     expect(envelopes.map((e: { opType: string }) => e.opType)).toEqual([
       "object.update",
       "object.update",
@@ -306,13 +276,14 @@ describe("workflow disable (archive shape)", () => {
   });
 
   it("a fully-disabled workflow writes nothing (no batch at all)", async () => {
+    // Seed the enable plan, then archive everything (the disable plan).
+    seedPlan("enabled");
+    seedPlan("disabled");
     const io = new Capture();
-    route("GET", /^\/api\/objects\/[0-9a-f-]+$/, () => ({ object: { id: "x", isActive: false } }));
 
     const code = await runCli(io, "--json", "workflow", "disable", "research");
     expect(code).toBe(EXIT.ok);
-    expect(batchBodies()).toHaveLength(0);
-    expect(calls.every((c) => c.method === "GET")).toBe(true);
+    expect(batchPosts()).toHaveLength(0);
     expect(JSON.parse(io.stdoutText)).toEqual({
       workflow: "research",
       target: "disabled",
@@ -326,16 +297,14 @@ describe("workflow disable (archive shape)", () => {
 describe("feature list (GET /api/features)", () => {
   it("defaults untoggled features to enabled and parses the toggled rows", async () => {
     const io = new Capture();
-    route("GET", /^\/api\/features$/, () => ({
-      features: [
-        { feature: "sources", enabled: false, settings: { citekeyPattern: "{{author}}{{year}}" } },
-        { feature: "journal", enabled: false, settings: null },
-      ],
-    }));
+    relay.features = [
+      { feature: "sources", enabled: false, settings: { citekeyPattern: "{{author}}{{year}}" } },
+      { feature: "journal", enabled: false, settings: null },
+    ];
 
     const code = await runCli(io, "--json", "feature", "list");
     expect(code).toBe(EXIT.ok);
-    expect(calls).toEqual([{ method: "GET", path: "/api/features" }]);
+    expect(relay.calls.filter((call) => call.path === "/api/features")).toHaveLength(1);
     const { features } = JSON.parse(io.stdoutText) as { features: Array<{ feature: string; label: string; enabled: boolean; settings: unknown }> };
     expect(features).toHaveLength(6);
     const byFeature = new Map(features.map((row) => [row.feature, row]));
@@ -357,13 +326,12 @@ describe("feature enable|disable (read-modify-merged settings)", () => {
   it("a plain toggle carries an existing settings record forward (never wiped)", async () => {
     const io = new Capture();
     const settings = { citekeyPattern: "{{author}}{{year}}", importBehavior: "merge" };
-    route("GET", /^\/api\/features$/, () => ({ features: [{ feature: "sources", enabled: true, settings }] }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 1 }));
+    relay.features = [{ feature: "sources", enabled: true, settings }];
 
     const code = await runCli(io, "--json", "feature", "disable", "sources");
     expect(code).toBe(EXIT.ok);
-    expect(batchBodies()).toHaveLength(1);
-    const envelope = batchBodies()[0]?.envelopes[0];
+    expect(relay.batchBodies()).toHaveLength(1);
+    const envelope = relay.batchBodies()[0]?.envelopes[0];
     expect(envelope?.opType).toBe("workspace.feature.set");
     expect(envelope?.payload).toEqual({ feature: "sources", enabled: false, settings });
     expect(envelope?.affectedNodeIds).toEqual([]);
@@ -377,11 +345,10 @@ describe("feature enable|disable (read-modify-merged settings)", () => {
 
   it("a toggle against an untoggled row writes {feature, enabled} with NO settings key", async () => {
     const io = new Capture();
-    route("GET", /^\/api\/features$/, () => ({ features: [] }));
-    route("POST", /^\/api\/relay\/v2\/batch$/, () => ({ savedCount: 1 }));
+    relay.features = [];
 
     expect(await runCli(io, "feature", "enable", "tasks")).toBe(EXIT.ok);
-    const envelope = batchBodies()[0]?.envelopes[0];
+    const envelope = relay.batchBodies()[0]?.envelopes[0];
     expect(envelope?.payload).toEqual({ feature: "tasks", enabled: true });
     expect(envelope !== undefined && "settings" in envelope.payload).toBe(false);
   });
@@ -393,7 +360,7 @@ describe("usage errors", () => {
     const code = await runCli(io, "workflow", "enable", "nope");
     expect(code).toBe(EXIT.usage);
     expect(io.stderrText).toContain('unknown workflow "nope"');
-    expect(calls).toHaveLength(0);
+    expect(relay.calls).toHaveLength(0);
   });
 
   it("an unknown feature is a usage error listing the known features", async () => {
@@ -401,7 +368,7 @@ describe("usage errors", () => {
     const code = await runCli(io, "feature", "enable", "nope");
     expect(code).toBe(EXIT.usage);
     expect(io.stderrText).toContain('unknown feature "nope"');
-    expect(calls).toHaveLength(0);
+    expect(relay.calls).toHaveLength(0);
   });
 });
 
@@ -421,12 +388,10 @@ describe("workflow/feature help surface", () => {
 
 // --- e2e against the real vendored server ------------------------------------
 //
-// The vendor bump lands the whole workflows slice on the server under test,
-// so the executor runs for real here: 48 envelopes through the relay batch,
-// the anchor probe over the live projection, and the settings merge against
-// a real workspace_feature row.
+// The live relay drives the whole local-first path for real: the sync cycle
+// (catch-up pull), the convergence probes over the local projection, and the
+// outbox push the engine batches.
 
-import { newEnvelope } from "@notees/protocol";
 import { buildServer, defaultWorkspaceId } from "@notees/server";
 
 import { ApiClient } from "../src/client.js";
@@ -438,10 +403,13 @@ describe("e2e: workflow + feature against the vendored server", () => {
   let app: { close: () => Promise<void> };
   let io: Capture;
   let client: ApiClient;
+  let e2eStateDir = "";
 
   beforeAll(async () => {
     vi.unstubAllGlobals(); // restore real fetch for the live server
-    const dataDir = mkdtempSync(join(tmpdir(), "notees-cli-workflow-e2e-"));
+    e2eStateDir = mkdtempSync(join(tmpdir(), "notees-cli-workflow-e2e-"));
+    process.env.NOTEES_STATE_FILE = join(e2eStateDir, "state.json");
+    const dataDir = mkdtempSync(join(tmpdir(), "notees-cli-workflow-e2e-data-"));
     const built = await buildServer(
       {
         dataDir,
@@ -471,6 +439,8 @@ describe("e2e: workflow + feature against the vendored server", () => {
 
   afterAll(async () => {
     await app.close();
+    rmSync(e2eStateDir, { recursive: true, force: true });
+    delete process.env.NOTEES_STATE_FILE;
   });
 
   async function runLive(...args: string[]): Promise<number> {
@@ -489,7 +459,7 @@ describe("e2e: workflow + feature against the vendored server", () => {
     expect(await runLive("--json", "workflow", "list")).toBe(EXIT.ok);
     expect(JSON.parse(io.stdoutText).workflows[0].state).toBe("installed");
 
-    // The anchor page exists for real.
+    // The anchor page exists for real (read locally, synced from the relay).
     expect(await runLive("object", "get", ANCHOR_ID)).toBe(EXIT.ok);
     expect(io.stdoutText).toContain(ANCHOR_ID);
 

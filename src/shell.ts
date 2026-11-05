@@ -23,14 +23,14 @@ import { format } from "node:util";
 import vm from "node:vm";
 
 import { concatBundleMarkdown } from "@notees/export";
-import { Clock, describeOp, newEnvelope, OP_CATALOG, type Envelope } from "@notees/protocol";
+import { describeOp, OP_CATALOG, type Envelope } from "@notees/protocol";
 
 import type { ApiClient } from "./client.js";
 import { expandAssetInputs, uploadAssetFile, assertObjectExists } from "./assets-lib.js";
 import { CliError, EXIT } from "./exit-codes.js";
-import { buildMarkdownBundle } from "./markdown-export.js";
-import { queryString, readStdin } from "./util.js";
-import { DEFAULT_WORKSPACE_ID, deriveUuid } from "./uuid.js";
+import type { LocalWorkspace } from "./local-workspace.js";
+import { buildMarkdownBundle, fetchSchemaIndex } from "./markdown-export.js";
+import { readStdin } from "./util.js";
 
 export interface ShellIo {
   stdout: { write(chunk: string): unknown };
@@ -39,6 +39,10 @@ export interface ShellIo {
 
 export interface ShellOptions {
   client: ApiClient;
+  /** Opens the local-first content session (derived store + sync engine) —
+   * lazy so the startup probe reports auth/reachability failures first, one
+   * session for the whole shell run. */
+  openLocal: () => Promise<LocalWorkspace>;
   io: ShellIo;
   json: boolean;
   stdin?: NodeJS.ReadableStream | undefined;
@@ -166,8 +170,8 @@ export interface ShellHelpers {
 const HELP_TEXT = `notees shell helpers (object API, top-level await works; scripts run in a
 vm without require/fs — feed ids inline, and prefer a script file over a
 giant heredoc):
-  api                                        raw ApiClient: getJson/postJson/patchJson/deleteJson/postMultipart, .server, .apiKey
-  get(id)                                    fetch an object (contentAst + authored properties)
+  api                                        raw ApiClient: the surviving server routes (auth, assets, property-schema CRUD, coordination reads)
+  get(id)                                    fetch an object (contentAst + authored properties) — the local derived store
   list(opts?)                                list objects -> array (opts: isClass, isEmbedded, class, q, property, limit, cursor)
   search(q, opts?)                           full-text search -> results array (opts: isClass, isEmbedded, limit)
   classes()                                  list classes
@@ -175,15 +179,15 @@ giant heredoc):
   backlinks(id)                              edges pointing at id
   props(id)                                  authored properties of an object
   effective(id)                              authored + class-default effective properties
-  create(partial)                            POST /objects -> created object (fields: isClass, isEmbedded, name, contentAst, classIds, parentId)
-  update(id, fields)                         PATCH fields (isEmbedded, icon, color, contentAst; name becomes a single text token) -> updated object
+  create(partial)                            create an object (fields: isClass, isEmbedded, name, contentAst, classIds, parentId) -> created object
+  update(id, fields)                         update fields (isEmbedded, icon, color, contentAst; name becomes a single text token) -> updated object
   del(id, opts?)                             delete; opts.permanent = true for a hard delete (auto-confirms the id)
-  merge(sourceId, targetId)                  POST /objects/:sourceId/merge — merge source into target (source trashes; guards fail loud)
-  mergePlan(sourceId, targetId)              the merge plan only (?dryRun=true) — summary, nothing written
+  merge(sourceId, targetId)                  merge source into target (source trashes; the store planner's guards fail loud)
+  mergePlan(sourceId, targetId)              the merge plan only — summary, nothing written
   setProperty(id, schemaId, value, opts?)    set a property (opts: idx, metadata) -> updated object
   unsetProperty(id, schemaId, idx?)          unset a property slot (idx defaults 0) -> updated object
-  propertySchemas()                          list active property schemas
-  propertySchema(id)                         one active property schema
+  propertySchemas()                          list active property schemas (coordination route)
+  propertySchema(id)                         one active property schema (coordination route)
   createPropertySchema(input)                propertySchema.create (input carries the schema uuid) -> schema
   updatePropertySchema(id, fields)           propertySchema.update (name/options/datePrecision/dateQualified) -> schema
   deletePropertySchema(id)                   propertySchema.delete (soft-delete; authored values survive)
@@ -194,8 +198,8 @@ giant heredoc):
   attachAsset(assetId, objectId)             link an EXISTING asset to a node (idempotent — re-attach is a no-op)
   exportMd(ids) (alias: export)              markdown bundle text for the given object ids
   makeOp(opType, payload, affected?)         build an envelope-v3 op (HLC-stamped; NOT submitted)
-  submitOp(opType, payload, affected?)       submit one op via the relay batch endpoint -> {savedCount, savedIds}
-  submitOps(envelopes)                       submit makeOp-built envelopes via the relay batch endpoint
+  submitOp(opType, payload, affected?)       apply one op locally + push it through the outbox -> {savedCount, savedIds}
+  submitOps(envelopes)                       apply makeOp-built envelopes locally + push them
   ops()                                      the op catalog: opType + one-liner per registered op
   opHelp(opType)                             one op's description, example payload, affected-node shape
   pool(items, concurrency, fn)               run fn over items with N workers (1-32) -> per-item results in input order; failures are {ok:false,error}, never thrown
@@ -205,76 +209,68 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function buildHelpers(client: ApiClient): ShellHelpers {
-  const objectUrl = (id: string): string => `/api/objects/${encodeURIComponent(id)}`;
+function buildHelpers(client: ApiClient, local: LocalWorkspace): ShellHelpers {
   // `export` is a reserved word — not callable from plain script/REPL syntax,
-  // so the ergonomic entry point is the exportMd alias (same function).
+  // so the ergonomic entry point is the exportMd alias (same function). The
+  // content reads ride the local derived store (the server retired its
+  // content API in plan 07); the schema index is a surviving coordination read.
   const exportMarkdown = async (ids: string[]): Promise<string> => {
-    const bundle = await buildMarkdownBundle(client, { ids, depth: 3 });
+    const schemaIndex = await fetchSchemaIndex(client);
+    const bundle = await buildMarkdownBundle(local, schemaIndex, { ids, depth: 3 });
     return concatBundleMarkdown(bundle);
   };
-  // Envelope stamping for the op-submission helpers: one monotonic HLC per
-  // shell run, the workspace from --workspace (server default otherwise),
-  // and an actor derived deterministically from the credential — the same
-  // philosophy as the server's actorIdForKey.
-  const clock = new Clock("notees-cli");
-  const actorId = deriveUuid(`notees:actor:cli:${client.apiKey}`);
+  // Envelope stamping for the op-submission helpers rides the local session
+  // (one monotonic HLC per shell run, workspace + actor from the session).
   const makeOp: ShellHelpers["makeOp"] = async (opType, payload, affectedNodeIds) =>
-    newEnvelope({
-      workspaceId: (await client.workspaceId()) ?? DEFAULT_WORKSPACE_ID,
-      actorId,
-      deviceId: "notees-cli",
-      client: "cli",
-      hlc: clock.now(),
-      affectedNodeIds: affectedNodeIds ?? [],
-      opType,
-      payload,
-    });
-  const submitOps: ShellHelpers["submitOps"] = (envelopes) =>
-    client.postJson<{ savedCount: number; savedIds: string[] }>("/api/relay/v2/batch", { envelopes });
+    local.makeEnvelope(opType, payload, affectedNodeIds ?? []);
+  const submitOps: ShellHelpers["submitOps"] = async (envelopes) => {
+    for (const envelope of envelopes) {
+      await local.submitEnvelope(envelope, { push: false });
+    }
+    await local.push();
+    return { savedCount: envelopes.length, savedIds: envelopes.map((envelope) => envelope.id) };
+  };
   return {
     api: client,
-    get: async (id) => (await client.getJson<{ object: unknown }>(objectUrl(id))).object,
+    get: async (id) => (await local.getObject(id)).object,
     list: async (opts = {}) => {
-      const query = queryString({
-        isClass: opts.isClass,
-        isEmbedded: opts.isEmbedded,
-        class: opts.class,
-        q: opts.q,
-        property: opts.property,
-        limit: opts.limit,
-        cursor: opts.cursor,
+      const body = await local.listObjects({
+        ...(opts.isClass !== undefined ? { isClass: opts.isClass } : {}),
+        ...(opts.isEmbedded !== undefined ? { isEmbedded: opts.isEmbedded } : {}),
+        ...(opts.class !== undefined ? { class: opts.class } : {}),
+        ...(opts.q !== undefined ? { q: opts.q } : {}),
+        ...(opts.property !== undefined ? { property: opts.property } : {}),
+        ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+        ...(opts.cursor !== undefined ? { cursor: opts.cursor } : {}),
       });
-      const body = await client.getJson<{ objects: unknown[] }>(`/api/objects${query}`);
       return body.objects;
     },
     search: async (q, opts = {}) => {
-      const query = queryString({ q, isClass: opts.isClass, isEmbedded: opts.isEmbedded, limit: opts.limit });
-      const body = await client.getJson<{ results: unknown[] }>(`/api/search${query}`);
+      const body = await local.searchObjects({
+        q,
+        ...(opts.isClass !== undefined ? { isClass: opts.isClass } : {}),
+        ...(opts.isEmbedded !== undefined ? { isEmbedded: opts.isEmbedded } : {}),
+        ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+      });
       return body.results;
     },
-    classes: async () => (await client.getJson<{ classes: unknown[] }>("/api/classes")).classes,
+    classes: async () => (await local.listClasses()).classes,
     classInfo: async (id) => {
-      const body = await client.getJson<{ class: Record<string, unknown>; members: unknown[] }>(
-        `/api/classes/${encodeURIComponent(id)}`,
-      );
+      const body = await local.getClass(id);
       return { ...body.class, members: body.members };
     },
-    backlinks: async (id) =>
-      (await client.getJson<{ backlinks: unknown[] }>(`${objectUrl(id)}/backlinks`)).backlinks,
+    backlinks: async (id) => (await local.backlinks(id)).backlinks,
     props: async (id) => {
-      const body = await client.getJson<{ object: { properties?: unknown[] } }>(objectUrl(id));
-      return body.object.properties ?? [];
+      const body = await local.getObject(id);
+      return (body.object as { properties?: unknown[] }).properties ?? [];
     },
-    effective: async (id) =>
-      (await client.getJson<{ properties: unknown[] }>(`${objectUrl(id)}/effective-properties`)).properties,
-    create: async (partial) =>
-      (await client.postJson<{ object: unknown }>("/api/objects", partial)).object,
+    effective: async (id) => (await local.effectiveProperties(id)).properties,
+    create: async (partial) => (await local.createObject(partial)).object,
     update: async (id, fields) => {
       const body = { ...fields };
       // Title-is-content: `name` rewrites the node's text content (its title),
-      // mirroring `object update --name` (cli.ts) — the server rejects a bare
-      // `name` key.
+      // mirroring `object update --name` (cli.ts) — a bare `name` key is
+      // rejected by the op payload schema.
       if (body.name !== undefined) {
         if (body.contentAst !== undefined) {
           throw new CliError(
@@ -285,28 +281,17 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         body.contentAst = [{ type: "text", text: String(body.name) }];
         delete body.name;
       }
-      return (await client.patchJson<{ object: unknown }>(objectUrl(id), body)).object;
+      return (await local.updateObject(id, body)).object;
     },
     del: async (id, opts = {}) => {
       const permanent = opts.permanent === true;
-      const query = permanent ? `?permanent=true&confirm=${encodeURIComponent(id)}` : "";
-      return client.deleteJson<{ id: string; deleted: boolean; permanent: boolean }>(
-        `${objectUrl(id)}${query}`,
-      );
+      return local.deleteObject(id, { permanent });
     },
-    merge: async (sourceId, targetId) =>
-      client.postJson<{ merged: boolean; targetId: string; summary: unknown }>(
-        `${objectUrl(sourceId)}/merge`,
-        { targetId },
-      ),
-    mergePlan: async (sourceId, targetId) =>
-      client.postJson<{ dryRun: boolean; summary: unknown }>(
-        `${objectUrl(sourceId)}/merge?dryRun=true`,
-        { targetId },
-      ),
+    merge: async (sourceId, targetId) => local.mergeObjects(sourceId, targetId, { dryRun: false }),
+    mergePlan: async (sourceId, targetId) => local.mergeObjects(sourceId, targetId, { dryRun: true }),
     setProperty: async (id, schemaId, value, opts = {}) =>
       (
-        await client.postJson<{ object: unknown }>(`${objectUrl(id)}/properties`, {
+        await local.setProperty(id, {
           propertySchemaId: schemaId,
           value,
           idx: opts.idx ?? 0,
@@ -314,11 +299,10 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         })
       ).object,
     unsetProperty: async (id, schemaId, idx = 0) =>
-      (
-        await client.deleteJson<{ object: unknown }>(
-          `${objectUrl(id)}/properties/${encodeURIComponent(schemaId)}?idx=${idx}`,
-        )
-      ).object,
+      (await local.unsetProperty(id, schemaId, idx)).object,
+    // Property-schema CRUD and class binding ride the surviving coordination
+    // routes (server-side writes); each helper refreshes the local store
+    // afterwards so a later helper in the same session observes the write.
     propertySchemas: async () =>
       (await client.getJson<{ propertySchemas: unknown[] }>("/api/property-schemas")).propertySchemas,
     propertySchema: async (id) =>
@@ -327,30 +311,45 @@ function buildHelpers(client: ApiClient): ShellHelpers {
           `/api/property-schemas/${encodeURIComponent(id)}`,
         )
       ).propertySchema,
-    createPropertySchema: async (input) =>
-      (await client.postJson<{ propertySchema: unknown }>("/api/property-schemas", input)).propertySchema,
-    updatePropertySchema: async (id, fields) =>
-      (
+    createPropertySchema: async (input) => {
+      const schema = (await client.postJson<{ propertySchema: unknown }>("/api/property-schemas", input)).propertySchema;
+      await local.refresh();
+      return schema;
+    },
+    updatePropertySchema: async (id, fields) => {
+      const schema = (
         await client.patchJson<{ propertySchema: unknown }>(
           `/api/property-schemas/${encodeURIComponent(id)}`,
           fields,
         )
-      ).propertySchema,
-    deletePropertySchema: async (id) =>
-      client.deleteJson<{ id: string; deleted: boolean }>(
+      ).propertySchema;
+      await local.refresh();
+      return schema;
+    },
+    deletePropertySchema: async (id) => {
+      const result = await client.deleteJson<{ id: string; deleted: boolean }>(
         `/api/property-schemas/${encodeURIComponent(id)}`,
-      ),
-    setClassProperty: async (classId, propertySchemaId, fields) =>
-      (
+      );
+      await local.refresh();
+      return result;
+    },
+    setClassProperty: async (classId, propertySchemaId, fields) => {
+      const binding = (
         await client.postJson<{ binding: unknown }>(
           `/api/classes/${encodeURIComponent(classId)}/properties`,
           { propertySchemaId, ...fields },
         )
-      ).binding,
-    unsetClassProperty: async (classId, propertySchemaId) =>
-      client.deleteJson<{ classId: string; propertySchemaId: string; unbound: boolean }>(
+      ).binding;
+      await local.refresh();
+      return binding;
+    },
+    unsetClassProperty: async (classId, propertySchemaId) => {
+      const result = await client.deleteJson<{ classId: string; propertySchemaId: string; unbound: boolean }>(
         `/api/classes/${encodeURIComponent(classId)}/properties/${encodeURIComponent(propertySchemaId)}`,
-      ),
+      );
+      await local.refresh();
+      return result;
+    },
     upload: async (filePath) => {
       const bytes = readFileSync(filePath);
       const form = new FormData();
@@ -367,7 +366,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         throw new CliError(EXIT.usage, "addAssets: pass one path or a non-empty array of paths");
       }
       const { files, failures } = expandAssetInputs(inputs);
-      if (objectId !== undefined) await assertObjectExists(client, objectId);
+      if (objectId !== undefined) await assertObjectExists(local, objectId);
       const uploaded: Array<{ file: string; assetId: string }> = [];
       for (const file of files) {
         try {
@@ -385,7 +384,7 @@ function buildHelpers(client: ApiClient): ShellHelpers {
       };
     },
     attachAsset: async (assetId, objectId) => {
-      await assertObjectExists(client, objectId);
+      await assertObjectExists(local, objectId);
       const info = await client.getJson<{
         assetId: string;
         hash: string;
@@ -393,19 +392,20 @@ function buildHelpers(client: ApiClient): ShellHelpers {
         size: number;
         originalName: string;
       }>(`/api/assets/${encodeURIComponent(assetId)}/info`);
-      const envelope = await makeOp(
-        "asset.attach",
-        {
-          objectId,
-          assetId: info.assetId,
-          hash: info.hash,
-          mimeType: info.mimeType,
-          size: info.size,
-          originalName: info.originalName,
-        },
-        [objectId, info.assetId],
-      );
-      await submitOps([envelope]);
+      await submitOps([
+        await makeOp(
+          "asset.attach",
+          {
+            objectId,
+            assetId: info.assetId,
+            hash: info.hash,
+            mimeType: info.mimeType,
+            size: info.size,
+            originalName: info.originalName,
+          },
+          [objectId, info.assetId],
+        ),
+      ]);
       return { assetId: info.assetId, objectId, attached: true };
     },
     export: exportMarkdown,
@@ -458,10 +458,12 @@ function buildHelpers(client: ApiClient): ShellHelpers {
   };
 }
 
-/** Doctor-style startup probe: reachability first (public route), then key validity (authenticated read). */
+/** Doctor-style startup probe: reachability first (the public server-info
+ * route — /api/version retired with the content API), then key validity
+ * against a surviving coordination read (the property-schema listing). */
 async function probe(client: ApiClient): Promise<void> {
   try {
-    await client.getJson<{ name: string; version: string }>("/api/version");
+    await client.getJson<{ name: string; version: string }>("/api/server-info");
   } catch (error) {
     throw new CliError(
       error instanceof CliError ? error.exitCode : EXIT.network,
@@ -469,7 +471,7 @@ async function probe(client: ApiClient): Promise<void> {
     );
   }
   try {
-    await client.getJson<unknown>("/api/classes");
+    await client.getJson<unknown>("/api/property-schemas");
   } catch (error) {
     throw new CliError(
       error instanceof CliError ? error.exitCode : EXIT.auth,
@@ -695,7 +697,16 @@ function startRepl(
  */
 export async function runShell(options: ShellOptions): Promise<number> {
   await probe(options.client);
-  const helpers = buildHelpers(options.client);
+  const local = await options.openLocal();
+  try {
+    return await runShellWith(options, local);
+  } finally {
+    local.close();
+  }
+}
+
+async function runShellWith(options: ShellOptions, local: LocalWorkspace): Promise<number> {
+  const helpers = buildHelpers(options.client, local);
   if (options.scriptFile !== undefined) {
     let source: string;
     try {

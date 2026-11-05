@@ -10,6 +10,7 @@ import { basename, join } from "node:path";
 
 import type { ApiClient } from "./client.js";
 import { CliError, EXIT } from "./exit-codes.js";
+import type { LocalWorkspace } from "./local-workspace.js";
 
 /**
  * Expand bulk-upload inputs: files given directly plus every regular file
@@ -51,13 +52,13 @@ export function expandAssetInputs(inputs: string[]): {
 }
 
 /**
- * Fail loud (exit domain via the client's 404 mapping) when a node id does
- * not exist — asset.attach's applier upserts node_asset rows without
- * validating the node, so without this check an attach to a dangling id
- * would silently succeed and leave an orphan row.
+ * Fail loud (exit domain via the local store's not-found mapping) when a
+ * node id does not exist — asset.attach's applier upserts node_asset rows
+ * without validating the node, so without this check an attach to a
+ * dangling id would silently succeed and leave an orphan row.
  */
-export async function assertObjectExists(client: ApiClient, objectId: string): Promise<void> {
-  await client.getJson<unknown>(`/api/objects/${encodeURIComponent(objectId)}`);
+export async function assertObjectExists(local: LocalWorkspace, objectId: string): Promise<void> {
+  await local.getObject(objectId);
 }
 
 /**

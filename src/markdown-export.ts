@@ -14,6 +14,7 @@ import {
 
 import type { ApiClient } from "./client.js";
 import { CliError, EXIT } from "./exit-codes.js";
+import type { LocalWorkspace } from "./local-workspace.js";
 
 export interface ExportApiObject {
   id: string;
@@ -150,20 +151,20 @@ export interface ObjectResolver {
 /**
  * Cached full-object fetch shared by both exporters; parent ids kept on the
  * side for containing-page walks (ExportNode carries placement since
- * Revision 11 — the map stays as the walk's cheap lookup).
+ * Revision 11 — the map stays as the walk's cheap lookup). The reads ride
+ * the local derived store (the server retired its content API in plan 07).
  */
-export function makeObjectResolver(client: ApiClient, schemaIndex?: SchemaIndex): ObjectResolver {
+export function makeObjectResolver(local: LocalWorkspace, schemaIndex?: SchemaIndex): ObjectResolver {
   const objectCache = new Map<string, ExportNode | undefined>();
   const parentOf = new Map<string, string | null>();
   const getObject = async (id: string): Promise<ExportNode | undefined> => {
     if (objectCache.has(id)) return objectCache.get(id);
     let node: ExportNode | undefined;
     try {
-      const body = await client.getJson<{ object: ExportApiObject }>(
-        `/api/objects/${encodeURIComponent(id)}`,
-      );
-      parentOf.set(id, body.object.parentId ?? null);
-      node = toExportNode(body.object, schemaIndex);
+      const body = await local.getObject(id);
+      const object = body.object as unknown as ExportApiObject;
+      parentOf.set(id, object.parentId ?? null);
+      node = toExportNode(object, schemaIndex);
     } catch (error) {
       if (error instanceof CliError && error.exitCode === EXIT.domain) node = undefined;
       else throw error;
@@ -193,7 +194,7 @@ export function makeObjectResolver(client: ApiClient, schemaIndex?: SchemaIndex)
  * which then renders the block inline).
  */
 export async function collectClosure(
-  client: ApiClient,
+  local: LocalWorkspace,
   resolver: ObjectResolver,
   options: { ids: string[]; linkedTo?: string | undefined; depth: number },
 ): Promise<Map<string, ExportNode>> {
@@ -215,10 +216,8 @@ export async function collectClosure(
     while (frontier.length > 0 && level <= options.depth) {
       const next: string[] = [];
       for (const id of frontier) {
-        const body = await client.getJson<{ nodeId: string; backlinks: ApiEdgeRow[] }>(
-          `/api/objects/${encodeURIComponent(id)}/backlinks`,
-        );
-        for (const edge of body.backlinks) {
+        const body = await local.backlinks(id);
+        for (const edge of body.backlinks as ApiEdgeRow[]) {
           const sourceId = edge.source_id;
           if (visitedSources.has(sourceId)) continue;
           visitedSources.add(sourceId);
@@ -251,12 +250,12 @@ export interface MarkdownBundleSelection {
  * returns it as concatenated text.
  */
 export async function buildMarkdownBundle(
-  client: ApiClient,
+  local: LocalWorkspace,
+  schemaIndex: SchemaIndex,
   selection: MarkdownBundleSelection,
 ): Promise<ExportBundle> {
-  const schemaIndex = await fetchSchemaIndex(client);
-  const resolver = makeObjectResolver(client, schemaIndex);
-  const included = await collectClosure(client, resolver, {
+  const resolver = makeObjectResolver(local, schemaIndex);
+  const included = await collectClosure(local, resolver, {
     ids: selection.ids,
     linkedTo: selection.linkedTo,
     depth: selection.depth,
@@ -276,10 +275,8 @@ export async function buildMarkdownBundle(
     fetchedChildrenOf.add(id);
     let rows: ExportApiObject[];
     try {
-      const body = await client.getJson<{ children: ExportApiObject[] }>(
-        `/api/objects/${encodeURIComponent(id)}/children`,
-      );
-      rows = body.children;
+      const body = await local.getChildren(id);
+      rows = body.children as unknown as ExportApiObject[];
     } catch (error) {
       // A node trashed between the closure pass and this fetch exports
       // without children (its subtree is trashed with it) — the scan-era
