@@ -41,6 +41,7 @@ import {
   b64uDecode,
   b64uEncode,
   compareHlc,
+  deriveMachineKey,
   importMasterKey,
   importWorkspaceKey,
   maxHlc,
@@ -226,7 +227,7 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
 }
 
 /** How the envelope crypto for a keyed workspace was resolved (surfaced by `notees auth unlock`). */
-export type KeySource = "cache" | "password" | null;
+export type KeySource = "cache" | "machine" | "password" | null;
 
 export interface ResolveKeyedCryptoOptions {
   base: string;
@@ -242,12 +243,14 @@ export interface ResolveKeyedCryptoOptions {
 /**
  * Resolve the envelope crypto for a keyed workspace. The CACHED master key
  * is tried first — a hit needs neither the password nor an /auth/unlock
- * round-trip; on miss the password path re-derives the master key
- * (/auth/unlock answers the KDF record, the unwrap runs locally) and caches
- * the raw bytes for later invocations — the web client's persisted-custody
- * parity (IndexedDB there, the CLI state file here). A stale cache (rotated
- * password, replaced key) fails the unwrap locally and falls through to the
- * password path, which overwrites the cache on success.
+ * round-trip; then MACHINE-KEY custody (a key minted with custody unwraps
+ * the master key from its own token — no password, nothing cached); on miss
+ * the password path re-derives the master key (/auth/unlock answers the KDF
+ * record, the unwrap runs locally) and caches the raw bytes for later
+ * invocations — the web client's persisted-custody parity (IndexedDB there,
+ * the CLI state file here). A stale cache (rotated password, replaced key)
+ * fails the unwrap locally and falls through, same as a failed machine
+ * unwrap, to the password path, which overwrites the cache on success.
  */
 export async function resolveKeyedCrypto(
   options: ResolveKeyedCryptoOptions,
@@ -256,6 +259,12 @@ export async function resolveKeyedCrypto(
     const fromCache = await unlockFromCache(options.statePath, options.stateKey, options.wrappedKey);
     if (fromCache !== undefined) return { provider: fromCache, source: "cache" };
   }
+
+  // Machine-key custody: a key minted with custody opens the workspace with
+  // no password (the token itself unwraps the master key) — tried before the
+  // password path; a human key (404) or any failure falls through.
+  const fromMachine = await unlockFromMachineKey(options.base, options.apiKey, options.wrappedKey, options.fetchImpl);
+  if (fromMachine !== undefined) return { provider: fromMachine, source: "machine" };
 
   const email = process.env.NOTEES_EMAIL;
   const password = process.env.NOTEES_PASSWORD;
@@ -290,6 +299,39 @@ async function unlockFromCache(
   if (cached === undefined) return undefined;
   try {
     const masterKey = await importMasterKey(b64uDecode(cached.bytes));
+    return await workspaceCryptoFromMaster(masterKey, wrappedKey);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Machine-key custody (`GET /api-keys/self/custody`, the key authenticates
+ * itself): the token derives the key that unwraps the stored master key,
+ * which unwraps the workspace key — the key alone opens the workspace, no
+ * password and nothing cached on disk. A human key (404) or any fetch/unwrap
+ * failure returns undefined (the password path is the fallback).
+ */
+async function unlockFromMachineKey(
+  base: string,
+  apiKey: string,
+  wrappedKey: string,
+  fetchImpl: typeof fetch,
+): Promise<ReturnType<typeof keyCryptoProvider> | undefined> {
+  try {
+    const response = await fetchImpl(`${base}/api/api-keys/self/custody`, {
+      headers: { "x-api-key": apiKey },
+    });
+    if (!response.ok) return undefined;
+    const body = (await response.json()) as { salt: string; wrappedMaster: string };
+    const machineKey = await importMasterKey(deriveMachineKey(apiKey, b64uDecode(body.salt)));
+    const unwrapped = await unwrapWorkspaceKey(machineKey, body.wrappedMaster);
+    // unwrapWorkspaceKey imports its result with workspace-key usages
+    // (encrypt/decrypt); the master must ALSO unwrap — re-import the raw
+    // bytes with the master usages (the recovery path never needs this: it
+    // only re-WRAPS the master).
+    const raw = new Uint8Array(await globalThis.crypto.subtle.exportKey("raw", unwrapped as never));
+    const masterKey = await importMasterKey(raw);
     return await workspaceCryptoFromMaster(masterKey, wrappedKey);
   } catch {
     return undefined;

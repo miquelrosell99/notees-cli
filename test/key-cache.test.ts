@@ -16,8 +16,10 @@ import {
   b64uDecode,
   b64uEncode,
   createKdfRecord,
+  deriveMachineKey,
   generateMasterKey,
   generateWorkspaceKey,
+  importMasterKey,
   masterKeyFp,
   wrapWorkspaceKey,
 } from "@notees/protocol";
@@ -40,10 +42,11 @@ let masterFp: string;
 interface FetchLog {
   unlockCalls: number;
   keyCalls: number;
+  custodyCalls: number;
 }
 
 /** A fake fetch serving the custody endpoints and counting oracle calls. */
-function fakeFetch(wrappedKey: string, log: FetchLog, kdfOverride?: unknown): typeof fetch {
+function fakeFetch(wrappedKey: string, log: FetchLog, kdfOverride?: unknown, custody?: { salt: string; wrappedMaster: string } | "404"): typeof fetch {
   return (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     if (url === `${BASE}/api/auth/unlock`) {
@@ -57,6 +60,13 @@ function fakeFetch(wrappedKey: string, log: FetchLog, kdfOverride?: unknown): ty
     if (url === `${BASE}/api/workspaces/${WORKSPACE_ID}/key`) {
       log.keyCalls += 1;
       return new Response(JSON.stringify({ wrappedKey }), { status: 200 });
+    }
+    if (url === `${BASE}/api/api-keys/self/custody`) {
+      log.custodyCalls += 1;
+      if (custody === undefined || custody === "404") {
+        return new Response(JSON.stringify({ error: { code: "not_found", message: "no custody", status: 404 } }), { status: 404 });
+      }
+      return new Response(JSON.stringify(custody), { status: 200 });
     }
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
@@ -93,7 +103,7 @@ afterEach(() => {
 describe("resolveKeyedCrypto (master-key cache)", () => {
   it("with no cache and no password env fails loud, pointing at the unlock path", async () => {
     const { wrappedKey, kdf } = await buildWrapped();
-    const log: FetchLog = { unlockCalls: 0, keyCalls: 0 };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
     const failure = await resolveKeyedCrypto({
       base: BASE,
       apiKey: API_KEY,
@@ -113,7 +123,7 @@ describe("resolveKeyedCrypto (master-key cache)", () => {
 
   it("password path unwraps, caches the master key, and never re-asks the oracle on a cache hit", async () => {
     const { wrappedKey, kdf } = await buildWrapped();
-    const log: FetchLog = { unlockCalls: 0, keyCalls: 0 };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
     process.env.NOTEES_EMAIL = "cli-ws@example.test";
     process.env.NOTEES_PASSWORD = PASSWORD;
 
@@ -153,7 +163,7 @@ describe("resolveKeyedCrypto (master-key cache)", () => {
 
   it("a stale cache (rotated key) falls back to the password path and overwrites the cache", async () => {
     const { wrappedKey, kdf } = await buildWrapped();
-    const log: FetchLog = { unlockCalls: 0, keyCalls: 0 };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
     storeCachedMasterKey(statePath, stateKey, b64uEncode(new Uint8Array(32).fill(7)));
     process.env.NOTEES_EMAIL = "cli-ws@example.test";
     process.env.NOTEES_PASSWORD = PASSWORD;
@@ -173,7 +183,7 @@ describe("resolveKeyedCrypto (master-key cache)", () => {
 
   it("a wrong password surfaces the oracle's 401 as an auth error", async () => {
     const { wrappedKey, kdf } = await buildWrapped();
-    const log: FetchLog = { unlockCalls: 0, keyCalls: 0 };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
     process.env.NOTEES_EMAIL = "cli-ws@example.test";
     process.env.NOTEES_PASSWORD = "wrong password";
 
@@ -193,7 +203,7 @@ describe("resolveKeyedCrypto (master-key cache)", () => {
 
   it("without the state seams the cache is skipped and the password path still works", async () => {
     const { wrappedKey, kdf } = await buildWrapped();
-    const log: FetchLog = { unlockCalls: 0, keyCalls: 0 };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
     process.env.NOTEES_EMAIL = "cli-ws@example.test";
     process.env.NOTEES_PASSWORD = PASSWORD;
 
@@ -206,6 +216,65 @@ describe("resolveKeyedCrypto (master-key cache)", () => {
     });
     expect(resolved.source).toBe("password");
     expect(cachedMasterKey(statePath, stateKey)).toBeUndefined();
+  });
+
+  it("machine-key custody opens the workspace with no password, no oracle call, and nothing cached on disk", async () => {
+    const master = await generateMasterKey();
+    const kdf = await createKdfRecord(master, PASSWORD); // the fallback stays reachable
+    const workspaceKey = await generateWorkspaceKey();
+    const wrappedKey = await wrapWorkspaceKey(master, workspaceKey);
+    const salt = new Uint8Array(16).fill(9);
+    const machineKey = await importMasterKey(deriveMachineKey(API_KEY, salt));
+    const custody = {
+      salt: b64uEncode(salt),
+      wrappedMaster: await wrapWorkspaceKey(machineKey, master),
+    };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
+
+    // No password env, no cache: the machine key alone answers.
+    const resolved = await resolveKeyedCrypto({
+      base: BASE,
+      apiKey: API_KEY,
+      workspaceId: WORKSPACE_ID,
+      wrappedKey,
+      fetchImpl: fakeFetch(wrappedKey, log, kdf, custody),
+      statePath,
+      stateKey,
+    });
+    expect(resolved.source).toBe("machine");
+    expect(log.custodyCalls).toBe(1);
+    expect(log.unlockCalls).toBe(0);
+    // The machine path deliberately persists nothing: the key alone suffices.
+    expect(cachedMasterKey(statePath, stateKey)).toBeUndefined();
+  });
+
+  it("a corrupted machine custody record (wrong token's wrap) falls through to the password path", async () => {
+    const master = await generateMasterKey();
+    const kdf = await createKdfRecord(master, PASSWORD);
+    const workspaceKey = await generateWorkspaceKey();
+    const wrappedKey = await wrapWorkspaceKey(master, workspaceKey);
+    // The wrap rode a DIFFERENT token: the local unwrap fails the GCM tag.
+    const salt = new Uint8Array(16).fill(9);
+    const wrongKey = await importMasterKey(deriveMachineKey("nk_wrongtoken000000000000000000000", salt));
+    const custody = {
+      salt: b64uEncode(salt),
+      wrappedMaster: await wrapWorkspaceKey(wrongKey, master),
+    };
+    const log: FetchLog = { unlockCalls: 0, keyCalls: 0, custodyCalls: 0 };
+    process.env.NOTEES_EMAIL = "cli-ws@example.test";
+    process.env.NOTEES_PASSWORD = PASSWORD;
+
+    const resolved = await resolveKeyedCrypto({
+      base: BASE,
+      apiKey: API_KEY,
+      workspaceId: WORKSPACE_ID,
+      wrappedKey,
+      fetchImpl: fakeFetch(wrappedKey, log, kdf, custody),
+      statePath,
+      stateKey,
+    });
+    expect(resolved.source).toBe("password");
+    expect(log.custodyCalls).toBe(1);
   });
 });
 

@@ -17,7 +17,10 @@ vi.setConfig({ hookTimeout: 30_000, testTimeout: 30_000 });
 import {
   Clock,
   b64uDecode,
+  b64uEncode,
+  deriveMachineKey,
   generateWorkspaceKey,
+  importMasterKey,
   masterKeyFp,
   newEnvelope,
   unwrapMasterKeyWithBytes,
@@ -4741,5 +4744,101 @@ describe("auth unlock/lock (E2EE master-key cache)", () => {
     [code, io] = await cli("object", "list");
     expect(code).toBe(EXIT.auth);
     expect(io.stderrText).toContain("NOTEES_EMAIL");
+  });
+
+  it("a machine key opens a keyed workspace with NO password and an empty cache", async () => {
+    const h = harness;
+    // Self-contained: provision the account (login, /api/setup fallback),
+    // create a fresh keyed workspace, mint a machine key through the
+    // two-phase custody flow — all through the server's real routes.
+    let login = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { "content-type": "application/json" },
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    if (login.statusCode === 401) {
+      login = await h.app.inject({
+        method: "POST",
+        url: "/api/setup",
+        headers: { "content-type": "application/json" },
+        payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+      });
+    }
+    expect([200, 201]).toContain(login.statusCode);
+    const session = login.json().token as string;
+    const authHeaders = { authorization: `Bearer ${session}`, "content-type": "application/json" };
+
+    const workspace = (
+      await h.app.inject({ method: "POST", url: "/api/workspaces", headers: authHeaders, payload: { name: "E2EE-Machine" } })
+    ).json();
+    const workspaceId = workspace.id as string;
+
+    const unlock = await h.app.inject({
+      method: "POST",
+      url: "/api/auth/unlock",
+      headers: authHeaders,
+      payload: { email: "cli-ws@example.test", password: "correct horse battery staple" },
+    });
+    expect(unlock.statusCode).toBe(200);
+    const { bytes: masterBytes } = await unwrapMasterKeyWithBytes(
+      "correct horse battery staple",
+      unlock.json().kdf,
+    );
+    // Extractable re-import: the custody install WRAPS the master (the
+    // unwrap path's handle is non-extractable by construction).
+    const masterKey = await importMasterKey(masterBytes, true);
+    const wsKey = await generateWorkspaceKey();
+    const putKey = await h.app.inject({
+      method: "PUT",
+      url: `/api/workspaces/${workspaceId}/key`,
+      headers: authHeaders,
+      payload: { wrappedKey: await wrapWorkspaceKey(masterKey, wsKey) },
+    });
+    expect(putKey.statusCode).toBe(204);
+
+    // Phase 1: mint. Phase 2: install custody (wrap the master under a key
+    // derived from the fresh token).
+    const minted = await h.app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      headers: authHeaders,
+      payload: { name: "machine-test" },
+    });
+    expect(minted.statusCode).toBe(201);
+    const { apiKey, token } = minted.json() as { apiKey: { id: string }; token: string };
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const machineKey = await importMasterKey(deriveMachineKey(token, salt));
+    const install = await h.app.inject({
+      method: "POST",
+      url: `/api/api-keys/${apiKey.id}/custody`,
+      headers: authHeaders,
+      payload: { salt: b64uEncode(salt), wrappedMaster: await wrapWorkspaceKey(machineKey, masterKey) },
+    });
+    expect(install.statusCode).toBe(204);
+
+    // The CLI with the machine key, NO password env, empty cache: custody answers.
+    const io = new Capture();
+    expect(
+      await run(
+        ["--server", h.baseUrl, "--key", token, "--workspace", "E2EE-Machine", "--json", "auth", "unlock"],
+        io,
+      ),
+    ).toBe(EXIT.ok);
+    expect(JSON.parse(io.stdoutText)).toMatchObject({ encrypted: true, keySource: "machine" });
+
+    const io2 = new Capture();
+    expect(
+      await run(
+        ["--server", h.baseUrl, "--key", token, "--workspace", "E2EE-Machine", "--json", "object", "create", "--name", "via-machine-key"],
+        io2,
+      ),
+    ).toBe(EXIT.ok);
+
+    // And the machine path persisted nothing to the state file.
+    const state = JSON.parse(readFileSync(h.stateFile, "utf8")) as {
+      servers: Record<string, { masterKey?: unknown }>;
+    };
+    expect(state.servers[`default:${h.baseUrl}`]?.masterKey).toBeUndefined();
   });
 });

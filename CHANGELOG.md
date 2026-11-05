@@ -8,6 +8,30 @@ history.
 
 ## 2026-11-05
 
+- **feat: machine keys — an API key minted with custody opens encrypted
+  workspaces alone: no password, no cache.** `resolveKeyedCrypto` gains a
+  third source between the cache and the password: `GET
+  /api-keys/self/custody` (the key authenticates itself) hands the opaque
+  wrap, the token derives the machine key locally (`deriveMachineKey`), and
+  the unwrapped master opens the workspace key — so scripted manipulation
+  against an encrypted workspace rides the key alone, with nothing persisted
+  to the state file (the machine path deliberately skips the master-key
+  cache; a password-unlocked cache still takes precedence when present).
+  `notees auth unlock` reports `keySource: "machine"`. The unwrapped master
+  is re-imported with master usages — `unwrapWorkspaceKey` imports its result
+  workspace-key-shaped (encrypt/decrypt), and the recovery precedent never
+  needs the master to unwrap. `vendor/notees` pin `83e6fa105` → `2bce845`
+  (the machine-keys slice: custody routes + `deriveMachineKey`).
+  - Files: `src/local-workspace.ts` (the machine source + the
+    re-import), `src/cli.ts` (the unlock report), `test/key-cache.test.ts`
+    (+2 pins: machine custody answers with no password/no oracle call/nothing
+    cached; a corrupted record falls through to the password path),
+    `test/cli.test.ts` (+1 pin: the full two-phase mint through the real
+    server routes — machine key opens the keyed workspace with NO password
+    env and an empty cache, and persists nothing), `README.md`,
+    `vendor/notees`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (201 tests).
+
 - **feat: encrypted workspaces stop asking for the password on every command
   — the unlocked master key caches in the state file (the web client's
   persisted-custody parity), with `notees auth unlock` / `notees auth

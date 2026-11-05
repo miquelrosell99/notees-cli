@@ -4034,13 +4034,18 @@ async function authUnlock(ctx: CommandContext): Promise<void> {
   });
   try {
     const machine = { workspaceId, encrypted: session.keySource !== null, keySource: session.keySource };
+    const machineLine =
+      session.keySource === "machine"
+        ? "unlocked by machine key — this API key carries custody: no password, ever\n"
+        : null;
     const human =
-      session.keySource === null
+      machineLine ??
+      (session.keySource === null
         ? `workspace ${workspaceId} is not encrypted — nothing to unlock\n`
         : session.keySource === "cache"
           ? "already unlocked — the cached master key answered (no password needed)\n"
           : "unlocked — the master key is cached in the state file; later commands need no " +
-            "password (`notees auth lock` reverts)\n";
+            "password (`notees auth lock` reverts)\n");
     emit(ctx, human, machine);
   } finally {
     session.close();
