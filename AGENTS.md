@@ -1,12 +1,18 @@
 # AGENTS.md
 
 Notees CLI — the `notees` command-line client for Notees: the
-object/property/search surface over the server's public API, plus markdown /
-JSON-archive export and a scripting REPL (`notees shell`). A standalone pnpm
-workspace (Node 22 or 26, pnpm 9, TypeScript, vitest) that consumes the main
-monorepo's TypeScript packages (`@notees/protocol`, `@notees/domain`,
-`@notees/query`, `@notees/export`; `@notees/server` for the test suite) from a
-**pinned git submodule at `vendor/notees`** — never edit anything under
+object/property/search surface, plus markdown / JSON-archive export and a
+scripting REPL (`notees shell`). **Local-first like the other clients**
+since the server retired its content API (plan 07): the CLI syncs a
+workspace through the vendored `@notees/sync` engine into a per-workspace
+derived SQLite store (the vendored `@notees/store`, better-sqlite3 backend,
+one file under `<state-dir>/stores/<workspace-id>.db`), serves every content
+read from that store, and pushes writes as protocol-v3 envelopes through the
+engine's outbox. A standalone pnpm workspace (Node 22 or 26, pnpm 9,
+TypeScript, vitest) that consumes the main monorepo's TypeScript packages
+(`@notees/protocol`, `@notees/domain`, `@notees/store`, `@notees/sync`,
+`@notees/query`, `@notees/export`; `@notees/server` for the test suite) from
+a **pinned git submodule at `vendor/notees`** — never edit anything under
 `vendor/` (it is a snapshot of the main repo with its own lifecycle).
 
 ## Skills (mandatory)
@@ -43,13 +49,20 @@ operations.)
 ## Layout
 
 - `src/` — the CLI (`cli.ts` commander program + `notees` bin entry;
-  `shell.ts` the scripting REPL; per-concern modules: `client.ts` fetch
-  client, `exit-codes.ts` the exit-code contract, `state.ts` the local state
-  file, `json-export.ts` / `markdown-export.ts` the exporters, `util.ts`,
+  `shell.ts` the scripting REPL; per-concern modules: `local-workspace.ts`
+  the local-first session — sync engine bootstrap, the E2EE custody probe,
+  the retired server read projections ported over the local store, the
+  envelope write seam, the durable restore backend; `client.ts` the fetch
+  client (surviving coordination routes only), `exit-codes.ts` the
+  exit-code contract, `state.ts` the local state file,
+  `json-export.ts` / `markdown-export.ts` the exporters, `util.ts`,
   `uuid.ts`)
 - `test/` — vitest suite; boots a **real** server from `@notees/server`
   against a temp workspace (`vitest.config.ts` deliberately excludes the
-  vendored packages' own suites)
+  vendored packages' own suites); `test/fake-relay.ts` implements the relay
+  wire over an in-memory envelope log for the mocked unit specs (the
+  retired content REST API can no longer be mocked — there is nothing left
+  to mock it with)
 - `scripts/install.sh` — release-bundle installer (fetches a tag's `cli.mjs`
   + checksum, links `notees` into `~/.local/bin`)
 - `packaging/arch/` — the pacman PKGBUILD (builds from the release assets;
@@ -82,9 +95,13 @@ operations.)
   reference + GTK + Flutter over byte-identical, sha256-pinned fixtures) has
   converged. Never edit `vendor/` — fix it in the main repo, then bump the
   pin. Never edit fixture bytes anywhere.
-- **The CLI holds no object state** — no local database; the only state is the
-  session credential + workspace cursor in `~/.notees/state.json` (mode 0600)
-  and the resolved name→workspace-id cache.
+- **The CLI's only authoritative state is the relay log** — the per-workspace
+  derived store (`<state-dir>/stores/<workspace-id>.db`) is a disposable
+  projection (delete it any time; the next command re-syncs). The state file
+  keeps the session credential + the resolved name→workspace-id cache (mode
+  0600); the sync cursor lives in the store's `app_meta`, not the state
+  file. Writes apply locally before they push — a failed push is durable in
+  the store's local op log, never lost with the process.
 - **Exit-code contract** (`src/exit-codes.ts`): 0 ok, 1 domain, 2 usage,
   3 auth, 4 conflict, 5 network. Wire errors map onto these codes.
 - **`--json` is the stable machine surface**: the JSON output shape is

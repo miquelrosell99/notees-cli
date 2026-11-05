@@ -2,7 +2,9 @@
 
 The `notees` command-line client for [Notees](https://github.com/miquelrosell99/notees) — the object/property/search surface over the server's public API. Split out of the main monorepo (`apps/cli`) to live alongside the other first-class clients ([GTK](https://github.com/miquelrosell99/notees-gtk), [Flutter](https://github.com/miquelrosell99/notees-flutter)).
 
-The CLI talks to a running `notees-sync` server over HTTP. It holds no state of its own beyond a session credential. `notees help` prints the full command overview; `notees help <command> [subcommand]` prints the full help for one command — see Command reference below.
+The CLI is **local-first like the other clients**: it syncs a workspace through the relay wire protocol (the vendored `@notees/sync` engine) into a local derived SQLite store (the vendored `@notees/store`, better-sqlite3 backend, one file per workspace under `~/.notees/stores/`), and serves every content read — objects, children, backlinks, search/FTS, the query language — from that store. Writes author op envelopes (protocol v3), apply locally through the store appliers, and push through the engine's outbox; a write that can't push stays durable in the local op log and syncs on the next successful `notees sync`. The server retired its content REST API (plan 07), so no content command makes a server round-trip beyond the sync cycle itself. `notees help` prints the full command overview; `notees help <command> [subcommand]` prints the full help for one command — see Command reference below.
+
+Encrypted (keyed) workspaces: the CLI unwraps the workspace key like any other client — with a user credential (from `notees auth login`) plus `NOTEES_EMAIL` and `NOTEES_PASSWORD` set, the master key re-derives via `/auth/unlock` and the stored wrapped key unwraps. An operator credential can never read a workspace key (user custody by design), and a keyed workspace is refused loudly when no key is derivable.
 
 ## Layout
 
@@ -16,7 +18,7 @@ notees-cli/
 └── pnpm-workspace.yaml  # consumes @notees/* from the submodule checkout
 ```
 
-The CLI imports the TypeScript protocol packages (`@notees/protocol`, `@notees/domain`, `@notees/query`, `@notees/export`) and uses `@notees/server` in tests to boot a real server. They are consumed from the `vendor/notees` submodule as pnpm workspace packages — no npm publishing involved (the SDK-publish track is archived in the main repo).
+The CLI imports the TypeScript protocol packages (`@notees/protocol`, `@notees/domain`, `@notees/store`, `@notees/sync`, `@notees/query`, `@notees/export`) and uses `@notees/server` in tests to boot a real server. They are consumed from the `vendor/notees` submodule as pnpm workspace packages — no npm publishing involved (the SDK-publish track is archived in the main repo).
 
 ## Getting started
 
@@ -26,7 +28,7 @@ cd notees-cli
 corepack enable && corepack prepare pnpm@9.0.0 --activate
 pnpm install
 pnpm build        # tsup bundle → dist/cli.js (the `notees` bin)
-pnpm test         # vitest (85 tests)
+pnpm test         # vitest (189 tests)
 pnpm dev -- --help    # run from source via tsx
 ```
 
@@ -80,7 +82,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `ops` | the operation catalog (or one op's shape) | `[opType]` |
 | `backlinks` | list backlinks to an object | — |
 | `asset` | bulk upload / attach / list / download files | `add <path…> --object --jobs`, `attach --object`, `list --object --limit`, `get --output` |
-| `sync` | server stats + local cursor | `status` |
+| `sync` | sync the local store with the relay (push the unpushed backlog, pull catch-up) | (bare), `status` |
 | `doctor` | auth + reachability + version probe | (resolves flag > env > stored) |
 | `shell` | scripting REPL over the object API | `[script]` |
 | `export` | Markdown / JSON archive / BibTeX bundles | `markdown --ids`, `json --class` |
@@ -88,7 +90,9 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 
 Destructive commands refuse without `--yes`: they print a blast-radius preview and exit 2. Exit codes: 0 ok, 1 domain, 2 usage, 3 auth, 4 conflict, 5 network.
 
-Workflows and features: `workflow list` derives install state from ONE `GET /api/objects/:anchorId` probe per workflow (absent = available, present + active = installed, present + archived = disabled — no ledger); `workflow enable|disable <id>` executes `@notees/domain`'s pure `planWorkflowToggle` as ONE relay batch, skipping steps that already converge (re-runs never overwrite user edits). `feature list` reads `GET /api/features` and defaults untoggled features to enabled; `feature enable|disable <feature>` writes one `workspace.feature.set` envelope, read-modify-merging an existing settings record forward (a plain toggle never wipes the Sources settings).
+Workflows and features: `workflow list` derives install state from ONE local-store probe of the workflow's anchor page per workflow (absent = available, present + active = installed, present + archived = disabled — no ledger); `workflow enable|disable <id>` executes `@notees/domain`'s pure `planWorkflowToggle` as ONE outbox batch, skipping steps that already converge (re-runs never overwrite user edits). `feature list` reads `GET /api/features` (a surviving coordination route) and defaults untoggled features to enabled; `feature enable|disable <feature>` writes one `workspace.feature.set` envelope, read-modify-merging an existing settings record forward (a plain toggle never wipes the Sources settings).
+
+The local store: one derived SQLite file per workspace at `~/.notees/stores/<workspace-id>.db` (beside the state file; `NOTEES_STATE_FILE` relocates both). It is a disposable projection — the relay log is the authority — so it can be deleted at any time; the next command re-syncs from scratch. `sync status` reports the persisted cursor against the relay stats without running a cycle; a bare `notees sync` runs the cycle (push, then pull) and prints the watermarks.
 
 Display names: the human tables of `object children` / `object list` render a row's NAME from its content (title-is-content). The API `name` flattens text tokens only, so a node whose content is rich tokens alone — a lone mention, a class chip, math — has no API name; the CLI then derives the display text from the content, resolving mentions to the target's *current* title (live, never stored — an unresolvable target reads as `(untitled)`, like the web mention chip).
 

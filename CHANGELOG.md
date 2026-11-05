@@ -6,6 +6,60 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-05
+
+- **feat: local-first rewrite — the CLI works against the post-plan-07
+  server again.** The server retired its content API (object CRUD,
+  /api/search, /api/query, backlinks, effective-properties, merge,
+  export.zip, /api/version — plan 07), so every content command on a current
+  deployment rode retired routes. The CLI is now local-first like the other
+  clients: each command syncs the workspace through the vendored
+  `@notees/sync` engine into a per-workspace derived SQLite store (the
+  vendored `@notees/store`, better-sqlite3 backend, one file per workspace
+  under `<state-dir>/stores/<workspace-id>.db`), serves ALL content reads
+  from that store (objects, children, backlinks, search/FTS, the query
+  language — the retired server read projections ported to
+  `src/local-workspace.ts`, response shapes unchanged), and authors writes
+  as protocol-v3 envelopes that apply locally through the store appliers
+  and push through the engine's outbox — a failed push leaves the write
+  durable in the local op log instead of losing it (exit 0 with a stderr
+  warning; `notees sync` drains the backlog).
+  - `notees sync` (bare) runs one sync cycle and reports the watermarks;
+    `sync status` reports them without running a cycle. The old
+    state-file `cursorSeq` bookkeeping is gone — the cursor lives in the
+    store's `app_meta`.
+  - Keyed (E2EE) workspaces: with a user credential plus `NOTEES_EMAIL` /
+    `NOTEES_PASSWORD` the master key re-derives via `/auth/unlock` and the
+    wrapped workspace key unwraps (user custody — an operator credential
+    can never read a key and is refused loudly on a keyed workspace, as is
+    any keyed workspace without the password env pair).
+  - A fresh keyless workspace is seeded by the server's lazy shim, poked
+    by the bootstrap's `GET /api/classes` (the kept coordination read) so
+    read-first commands never see an empty workspace; an empty KEYED
+    workspace is client-seeded like the web client's bootstrap.
+  - The command surface is unchanged (`--json` shapes additive-only as
+    always); coordination reads that survived plan 07 (property-schema
+  CRUD, class bindings, features, assets, resolve's metadata branch) keep
+    riding the server. `doctor` probes `/api/server-info` (`/api/version`
+    retired); the shell probes the same plus the property-schema listing.
+  - `install.sh` now provisions the native `better-sqlite3` module beside
+    the release bundle (`NOTEES_SKIP_SQLITE=1` to opt out) — it cannot be
+    bundled. The Arch PKGBUILD/release-smoke plumbing still needs the same
+    provision (recorded debt).
+  - Files: `src/local-workspace.ts` (new — session, custody, read
+    projections, write seam, durable restore backend), `src/cli.ts`
+    (command ports), `src/shell.ts`, `src/markdown-export.ts`,
+    `src/json-export.ts`, `src/import-logseq-db.ts`, `src/assets-lib.ts`,
+    `src/client.ts` (nameless-workspace listing fix), `test/fake-relay.ts`
+    (new — the relay wire over an in-memory envelope log, replacing the
+    retired-API fetch mocks), `test/*.test.ts` (ports), `package.json`,
+    `pnpm-lock.yaml`, `vendor/notees` (pin `17ec1da49` → `eb50ade7f`),
+    `scripts/install.sh`, `README.md`, `AGENTS.md`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (189 tests),
+    `pnpm build` green. The suite's sync-against-a-real-server integration
+    pattern is preserved (one vendored server per file; the workflow e2e
+    drives the full toggle lifecycle through the local-first path).
+
 ## 2026-11-04
 
 - **chore(skills): move the `notees-cli-manipulation` skill from this repo

@@ -10,6 +10,13 @@
 # so cmd/PowerShell can invoke the CLI on Windows (a unix-shebang extensionless
 # script is not executable there). Requires bash, curl, and node (>= 22) on PATH.
 #
+# Since the local-first rewrite the bundle needs the NATIVE better-sqlite3
+# module at runtime (the per-workspace derived store) — it cannot be bundled.
+# The installer provisions it into a `node_modules` beside `notees.mjs` with
+# npm (a prebuilt binary is fetched for the host platform; no build toolchain
+# needed). Set NOTEES_SKIP_SQLITE=1 to skip (only safe when something else
+# already provides the module).
+#
 # Env overrides:
 #   NOTEES_INSTALL_DIR    where `notees` lands (default: ~/.local/bin)
 #   NOTEES_VERSION        release to install when no argument is given
@@ -75,6 +82,21 @@ cat > "$INSTALL_DIR/notees.cmd" <<'EOF'
 @echo off
 node "%~dp0notees.mjs" %*
 EOF
+
+# better-sqlite3 (native, runtime-required since the local-first rewrite):
+# provision it beside the bundle unless the caller opted out or it already
+# resolves from here. npm fetches a prebuilt binary for the host platform —
+# no build toolchain needed.
+if [ "${NOTEES_SKIP_SQLITE:-0}" != "1" ]; then
+  if (cd "$INSTALL_DIR" && node -e 'require("better-sqlite3")' 2>/dev/null); then
+    log "better-sqlite3 already provisioned beside the bundle — skipping"
+  else
+    command -v npm >/dev/null 2>&1 || die "npm is required to provision better-sqlite3 (or set NOTEES_SKIP_SQLITE=1 when it resolves already)"
+    log "installing better-sqlite3 into $INSTALL_DIR/node_modules (native prebuilt)"
+    (cd "$INSTALL_DIR" && npm install --no-save --no-fund --no-audit --omit=dev better-sqlite3@12) \
+      || die "better-sqlite3 provisioning failed (network? set NOTEES_SKIP_SQLITE=1 if provided otherwise)"
+  fi
+fi
 
 # Sanity: the installed symlink must answer --version with a version string
 # (a bare exit-code check is not enough — a silently no-op'ing binary also
