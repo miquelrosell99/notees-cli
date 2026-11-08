@@ -17,6 +17,7 @@ let session: BridgeSession;
 let duneId = "";
 let articleId = "";
 let plainPageId = "";
+let bareSourceId = "";
 
 beforeAll(async () => {
   harness = await bootServer();
@@ -35,6 +36,11 @@ beforeAll(async () => {
   ]);
   await harness.seedProperty(articleId, SYSTEM_PROPERTY_UUIDS.authors, ["Atreides, Paul"]);
   plainPageId = await harness.seedObject("Some plain page", []);
+  // A bare-source node (no roster subclass): search surfaces it with
+  // classKey "source", so the citation arm must too — nodeToCsl types it
+  // via the vendor document fallback.
+  bareSourceId = await harness.seedObject("Dune Messiah", [SYSTEM_CLASS_UUIDS.source]);
+  await harness.seedProperty(bareSourceId, SYSTEM_PROPERTY_UUIDS.citekey, "herbert1969messiah");
   session = await openBridgeSession({
     server: harness.baseUrl,
     apiKey: API_KEY,
@@ -75,5 +81,12 @@ describe("cslItemFor", () => {
   it("returns undefined for non-source nodes and unknown ids", () => {
     expect(cslItemFor(session.local, plainPageId)).toBeUndefined();
     expect(cslItemFor(session.local, "00000000-0000-0000-0000-00000000dead")).toBeUndefined();
+  });
+
+  it("renders a bare class:source node through the vendor document fallback", () => {
+    const item = cslItemFor(session.local, bareSourceId)!;
+    expect(item.type).toBe("document");
+    expect(item.id).toBe("herbert1969messiah");
+    expect(item.title).toBe("Dune Messiah");
   });
 });
