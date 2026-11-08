@@ -8,6 +8,23 @@ history.
 
 ## 2026-11-08
 
+- **feat: notees serve — the render arms go live: citations and
+  bibliographies over the bridge.** `render-citation` / `render-bibliography`
+  resolve every requested object id through the CSL-JSON projection against
+  the local store and render with the bundled citeproc: a missing id or a
+  non-source node answers `not_found` (404) so the add-in can tell "bad id"
+  from "render broke"; an unknown style id answers `not_found` too; a
+  citeproc exception answers `render_failed` (422) and leaves the bridge
+  usable. Several ids render as ONE combined citation cluster, an optional
+  `locator` rides as a page locator, and citekey-less sources render through
+  the node-id fallback — a search hit can never 404 at the render arm.
+  Dispatch never throws: every failure is an error envelope.
+  - Files: `src/serve/document.ts` (the render arms replace the stub),
+    `test/serve.test.ts` (+5: apa citation, locator, multi-source cluster,
+    citekey-less fallback, 404 pins for unknown id/style).
+  - Verification: `pnpm typecheck && pnpm test` — all green (13 files,
+    254 tests); `pnpm build` green.
+
 - **feat: notees serve — citeproc citation rendering with bundled CSL
   styles.** The render/list-styles arms go live: `citeproc` (citeproc-js)
   renders in-text citations and bibliographies from CSL-JSON items (one

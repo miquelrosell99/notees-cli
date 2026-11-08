@@ -221,6 +221,48 @@ describe("render smoke", () => {
   });
 });
 
+describe("render-citation", () => {
+  it("renders an apa in-text citation for a seeded source", async () => {
+    const res = await call({ cmd: "render-citation", objectIds: [duneId], styleId: "apa" });
+    expect(res.status).toBe(200);
+    if (!res.body.ok || !("citation" in res.body)) throw new Error(JSON.stringify(res.body));
+    expect(res.body.citation).toContain("Herbert");
+    expect(res.body.citation).toContain("1965");
+  });
+
+  it("renders a locator into the citation", async () => {
+    const res = await call({ cmd: "render-citation", objectIds: [duneId], styleId: "apa", locator: "42" });
+    if (!res.body.ok || !("citation" in res.body)) throw new Error(JSON.stringify(res.body));
+    expect(res.body.citation).toContain("42");
+  });
+
+  it("renders a multi-source cluster", async () => {
+    const res = await call({ cmd: "render-citation", objectIds: [duneId, articleId], styleId: "apa" });
+    if (!res.body.ok || !("citation" in res.body)) throw new Error(JSON.stringify(res.body));
+    expect(res.body.citation).toContain("Herbert");
+    expect(res.body.citation).toContain("Atreides");
+  });
+
+  it("renders a citekey-less source via the node-id fallback", async () => {
+    const res = await call({ cmd: "render-citation", objectIds: [articleId], styleId: "apa" });
+    expect(res.status).toBe(200);
+  });
+
+  it("answers not_found for an unknown object id or unknown style", async () => {
+    const unknownId = await call({
+      cmd: "render-citation",
+      objectIds: ["00000000-0000-0000-0000-00000000dead"],
+      styleId: "apa",
+    });
+    expect(unknownId.status).toBe(404);
+    expect(unknownId.body).toMatchObject({ ok: false, error: { code: "not_found" } });
+
+    const unknownStyle = await call({ cmd: "render-citation", objectIds: [duneId], styleId: "vancouver" });
+    expect(unknownStyle.status).toBe(404);
+    expect(unknownStyle.body).toMatchObject({ ok: false, error: { code: "not_found" } });
+  });
+});
+
 describe("store lock", () => {
   it("refuses a second bridge on the same store (exit 4 contract)", async () => {
     await expect(
