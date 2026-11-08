@@ -55,6 +55,18 @@ describe("startBridge", () => {
     }
   });
 
+  it("compares the bearer token in constant time — an equal-length wrong token still 401s", async () => {
+    const config = resolveServeConfig({ port: "0" }, { NOTEES_SERVE_TOKEN: "test-token" });
+    bridge = await startBridge(config, { dispatch: async () => ({ ok: true, styles: [] }) });
+    // Same length as the real token: the only case a length-early-exit could
+    // leak, so the pin rides the equal-length path through timingSafeEqual.
+    const res = await post(bridge.port, { cmd: "list-styles" }, {
+      authorization: "Bearer test-tokem",
+    });
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(serveError("bad_request", "missing or invalid bearer token"));
+  });
+
   it("rejects a disallowed Origin with 403, allows listed ones, and requires Origin when an allowlist exists", async () => {
     const config = resolveServeConfig(
       { port: "0", origin: ["https://word.example"] },

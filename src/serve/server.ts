@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import { CliError, EXIT } from "../exit-codes.js";
@@ -82,6 +83,20 @@ export async function startBridge(config: ServeConfig, handlers: BridgeHandlers)
   };
 }
 
+/**
+ * Bearer compare. `timingSafeEqual` needs equal-length buffers (it throws
+ * otherwise), so the length check stays a plain early exit — the standard
+ * caveat. On the loopback threat model the constant-time compare is
+ * defense-in-depth; it is the rigorous form for a pairing-token compare
+ * regardless.
+ */
+function bearerMatches(header: string | undefined, token: string): boolean {
+  if (header === undefined || !header.startsWith("Bearer ")) return false;
+  const presented = Buffer.from(header.slice("Bearer ".length), "utf8");
+  const expected = Buffer.from(token, "utf8");
+  return presented.length === expected.length && timingSafeEqual(presented, expected);
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -113,7 +128,7 @@ async function handleRequest(
       respond(403, serveError("bad_request", "origin is not allowed"));
       return;
     }
-    if (req.headers.authorization !== `Bearer ${config.token}`) {
+    if (!bearerMatches(req.headers.authorization, config.token)) {
       respond(401, serveError("bad_request", "missing or invalid bearer token"));
       return;
     }

@@ -98,6 +98,22 @@ The local store: one derived SQLite file per workspace at `~/.notees/stores/<wor
 
 Display names: the human tables of `object children` / `object list` render a row's NAME from its content (title-is-content). The API `name` flattens text tokens only, so a node whose content is rich tokens alone — a lone mention, a class chip, math — has no API name; the CLI then derives the display text from the content, resolving mentions to the target's *current* title (live, never stored — an unresolvable target reads as `(untitled)`, like the web mention chip).
 
+## `notees serve` — the localhost citation bridge
+
+`notees serve` runs a small HTTP server on `127.0.0.1` so the Notees Word add-in can search your synced store and render citations/bibliographies while you work — the Zotero connector architecture (Word add-in ↔ localhost bridge). The add-in never talks to the network; sync is the bridge's problem, and Word citations keep working with no connectivity.
+
+    notees serve [--port 8474] [--origin <add-in origin> …]
+                 [--token-file <path>] [--sync-interval 60] [--styles-dir <dir>]
+
+- **Loopback only.** The bind is `127.0.0.1`; there is no `--host` flag. The post-listen address check refuses to serve if the platform ever resolved anything else.
+- **Pairing.** The first connect needs a bearer token: a fresh one is printed at startup (or pin it with `NOTEES_SERVE_TOKEN`, or write it for the add-in with `--token-file`, mode 0600). The compare is constant-time (`crypto.timingSafeEqual`).
+- **Origin allowlist, fail-closed.** Browser requests must carry an `Origin` header matching a repeatable `--origin` value. Once one `--origin` exists, a missing or unlisted Origin is a 403 — never a pass.
+- **No filesystem endpoints.** The bridge exposes exactly one endpoint — search and CSL renders over the local store. Nothing reads or writes your files in response to a request; the only filesystem touches are startup-time (`--token-file`, `--styles-dir`).
+- **Protocol.** `POST /document` with `{cmd: "search" | "render-citation" | "render-bibliography" | "list-styles", …}` — see the Word add-in docs. Every failure answers the `{ok: false, error: {code, message}}` envelope (unknown_cmd / not_found / render_failed / bad_request).
+- **One bridge per store.** A second `notees serve` on the same workspace store exits 4 (conflict) — the derived store is single-writer. The lock records the holder pid; a stale lock from a dead process is stolen on the next start.
+- **Offline-first.** One `LocalWorkspace` stays open for the server's lifetime with a background sync every `--sync-interval` seconds (≥ 5, default 60). A failed initial sync still serves the last synced store; a store that has never synced fails loudly instead of serving an empty projection. Request handling performs no network I/O.
+- **Styles.** APA, IEEE, and Chicago (notes & bibliography) are bundled; drop additional `.csl` files in a `--styles-dir`.
+
 ## Installing
 
 Every `v*` tag carries a prebuilt bundle (`cli.mjs`, ESM with a `node` shebang, sha256 sidecar) on its GitHub Release, built by `.github/workflows/release.yml`. The install script fetches it, verifies the checksum, and links `notees` into `~/.local/bin` (override with `NOTEES_INSTALL_DIR`):

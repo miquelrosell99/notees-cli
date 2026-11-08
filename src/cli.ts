@@ -4228,7 +4228,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   backlinks: { flags: "<id>" },
   asset: { flags: "add <path…> --object --jobs --stop-on-error · attach --object · list --object --limit · get --output" },
   sync: { flags: "status" },
-  serve: { flags: "[--port · --origin · --token-file · --styles-dir]" },
+  serve: { flags: "[--port · --origin · --token-file · --sync-interval · --styles-dir]" },
   doctor: { flags: "(resolves flag > env > stored)" },
   shell: { flags: "[script]" },
   export: { flags: "markdown · json · bibtex" },

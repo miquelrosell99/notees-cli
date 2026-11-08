@@ -8,6 +8,42 @@ history.
 
 ## 2026-11-08
 
+- **feat: `notees serve` — the localhost citation bridge for the Word add-in
+  goes live: search + CSL citation/bibliography renders over the local derived
+  store.** A long-running `node:http` server bound to 127.0.0.1 only (no
+  `--host` flag exists; a post-listen address check refuses to serve if the
+  bind ever resolved anything else), speaking one JSON endpoint — `POST
+  /document` with `search` / `render-citation` / `render-bibliography` /
+  `list-styles` — so the Office.js task pane can cite the synced store
+  offline (the Zotero connector architecture: the add-in holds no credentials
+  and never touches the network). First-connect pairing is a bearer token
+  printed at startup (env-pinnable via `NOTEES_SERVE_TOKEN`, writable via
+  `--token-file`, mode 0600), compared constant-time via
+  `crypto.timingSafeEqual`; browser origins must match the repeatable
+  `--origin` allow-list, fail-closed — a missing Origin is never a pass. One
+  `LocalWorkspace` stays open for the server's lifetime with a background
+  sync every `--sync-interval` seconds (≥ 5, default 60); a failed initial
+  sync still serves the last synced store (offline-first), a never-synced
+  store fails loudly, and a second bridge on the same store exits 4 on the
+  pid-checked serve lock (a stale lock from a dead process is stolen). Search
+  executes through `@notees/query` (`LocalWorkspace.runQueryAst`, member
+  class-in-[source + roster] + quoted FTS tokens — an unparseable query
+  answers `[]`, never a 500); CSL-JSON items ride `@notees/export`'s existing
+  `nodeToCsl` (the mapping is reused, not duplicated). The bridge exposes no
+  filesystem endpoints — startup-time `--token-file` / `--styles-dir` touches
+  only — and every failure answers the `{ok: false, error: {code, message}}`
+  envelope (unknown_cmd / not_found / render_failed / bad_request). The
+  citeproc renderer, the bundled apa/ieee/chicago-note-bibliography styles,
+  and the render arms ship in the two entries below; the README documents the
+  operator contract (security posture, pairing, the lock, the protocol).
+  - Files: `src/serve/{config,protocol,server,session,document,cite,csl-items,styles}.ts`,
+    `src/serve/citeproc.d.ts`, `src/serve/styles/*` (vendored CSL + generated.ts),
+    `scripts/bundle-styles.mts`, `src/cli.ts` (the command + the HELP_ROWS row),
+    `src/local-workspace.ts` (best-effort sync option), `test/serve*.test.ts`,
+    `package.json` (+ `citeproc`), `tsup.config.ts`, `README.md`, `NOTICE`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (13 files,
+    262 tests); `pnpm build` green.
+
 - **feat: notees serve — the render arms go live: citations and
   bibliographies over the bridge.** `render-citation` / `render-bibliography`
   resolve every requested object id through the CSL-JSON projection against
