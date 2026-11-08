@@ -2053,7 +2053,11 @@ async function runServe(ctx: CommandContext, options: {
   });
   const renderer = createCiteRenderer(config.stylesDir);
   const bridge = await startBridge(config, {
-    dispatch: (request) => dispatchDocument({ session, renderer }, request),
+    dispatch: (request) =>
+      dispatchDocument(
+        { session, renderer, ...(config.stylesDir !== undefined ? { stylesDir: config.stylesDir } : {}) },
+        request,
+      ),
   });
   const shutdown = async (): Promise<void> => {
     await bridge.close();

@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup",
+    "bundle:styles": "tsx scripts/bundle-styles.mts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -18,7 +19,9 @@
     "@notees/query": "workspace:*",
     "@notees/store": "workspace:*",
     "@notees/sync": "workspace:*",
+    "@xmldom/xmldom": "^0.9.12",
     "better-sqlite3": "^12.11.1",
+    "citeproc": "^2.4.63",
     "commander": "^12.1.0",
     "sax": "^1.6.1"
   },

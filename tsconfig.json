@@ -2,7 +2,12 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "esModuleInterop": true,
-    "types": ["node"]
+    "types": ["node"],
+    // The drift-gate test imports scripts/bundle-styles.mts by its real
+    // extension; tsc only allows that with noEmit (build is tsup, tsc never
+    // emits here).
+    "noEmit": true,
+    "allowImportingTsExtensions": true
   },
   "include": ["src", "test"]
 }

@@ -84,6 +84,7 @@ Every command takes a credential via `--key` / `NOTEES_API_KEY`, or falls back t
 | `backlinks` | list backlinks to an object | — |
 | `asset` | bulk upload / attach / list / download files | `add <path…> --object --jobs`, `attach --object`, `list --object --limit`, `get --output` |
 | `sync` | sync the local store with the relay (push the unpushed backlog, pull catch-up) | (bare), `status` |
+| `serve` | the localhost citation bridge for the Word add-in (127.0.0.1 only; search + CSL renders over the local store; apa / ieee / chicago-note-bibliography bundled, `--styles-dir` adds user .csl styles) | `--port`, `--origin`, `--token-file`, `--styles-dir` |
 | `doctor` | auth + reachability + version probe | (resolves flag > env > stored) |
 | `shell` | scripting REPL over the object API | `[script]` |
 | `export` | Markdown / JSON archive / BibTeX bundles | `markdown --ids`, `json --class` |

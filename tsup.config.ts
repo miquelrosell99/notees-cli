@@ -8,9 +8,10 @@ export default defineConfig({
   // dist/cli.js (as cli.mjs) with no node_modules beside it. tsup keeps
   // `dependencies` external by default; compile every runtime dependency
   // in: the @notees/* workspace packages, commander, sax (the Zotero
-  // RDF import surface in src/zotero-rdf.ts), and citeproc (the citation
-  // render surface behind `notees serve`).
-  noExternal: [/^@notees\//, "commander", "sax", "citeproc"],
+  // RDF import surface in src/zotero-rdf.ts), and citeproc + @xmldom/xmldom
+  // (the citation render surface behind `notees serve` — citeproc parses
+  // CSL XML through xmldom's DOMParser in Node).
+  noExternal: [/^@notees\//, "commander", "sax", "citeproc", "@xmldom/xmldom"],
   // commander ships its CommonJS entry to the bundler; the ESM bundle then
   // needs a real `require` for Node builtins. A global createRequire shim
   // (after the shebang — esbuild keeps the #! line first) replaces esbuild's

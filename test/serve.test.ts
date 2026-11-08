@@ -6,6 +6,7 @@ import { SYSTEM_CLASS_UUIDS, SYSTEM_PROPERTY_UUIDS } from "@notees/domain";
 import { defaultWorkspaceId } from "@notees/server";
 
 import { createCiteRenderer } from "../src/serve/cite.js";
+import { cslItemFor } from "../src/serve/csl-items.js";
 import { resolveServeConfig } from "../src/serve/config.js";
 import { dispatchDocument } from "../src/serve/document.js";
 import type { ServeResponse } from "../src/serve/protocol.js";
@@ -183,6 +184,40 @@ describe("offline-first bootstrap", () => {
         onWarning: () => {},
       }),
     ).rejects.toMatchObject({ exitCode: 5 });
+  });
+});
+
+describe("list-styles", () => {
+  it("lists the bundled catalog over the bridge", async () => {
+    const res = await call({ cmd: "list-styles" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      styles: [
+        { id: "apa", label: "APA (7th edition)" },
+        { id: "ieee", label: "IEEE" },
+        { id: "chicago-note-bibliography", label: "Chicago (notes & bibliography)" },
+      ],
+    });
+  });
+});
+
+describe("render smoke", () => {
+  // Full end-to-end render commands over the bridge land with the render
+  // slice; here the seeded source only crosses the projection + renderer.
+  it("projects a seeded source to CSL-JSON and renders an apa citation + bibliography", () => {
+    const item = cslItemFor(session.local, duneId);
+    if (item === undefined) throw new Error("seeded Dune source must project to a CSL item");
+    const renderer = createCiteRenderer();
+    const citation = renderer.renderCitation([item], "apa", "23");
+    expect(typeof citation).toBe("string");
+    expect(citation as string).toContain("Herbert");
+    expect(citation as string).toContain("1965");
+    expect(citation as string).toContain("23");
+    const bibliography = renderer.renderBibliography([item], "apa");
+    expect(typeof bibliography).toBe("string");
+    expect(bibliography as string).toContain("Herbert, F.");
+    expect(bibliography as string).toContain("Dune");
   });
 });
 

@@ -6,6 +6,42 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-08
+
+- **feat: notees serve — citeproc citation rendering with bundled CSL
+  styles.** The render/list-styles arms go live: `citeproc` (citeproc-js)
+  renders in-text citations and bibliographies from CSL-JSON items (one
+  engine per request — engine registry state never leaks between
+  documents; a corrupt style answers render_failed and leaves the bridge
+  usable), and apa / ieee / chicago-note-bibliography ship INSIDE the
+  release bundle — the CSL XML and the en-US locale are inlined as
+  `src/serve/styles/generated.ts` (produced by `pnpm bundle:styles`, kept
+  honest by a drift-gate test that diffs the generated module against the
+  canonical .csl/.xml files). `--styles-dir` user styles resolve after the
+  bundled ones (ids are strict file names, so traversal is impossible) and
+  appear in `list-styles` after the catalog. citeproc parses CSL XML
+  through a DOM parser, so `@xmldom/xmldom` installs itself as the global
+  `DOMParser` before the first Engine (bundled via `noExternal`, no
+  node_modules beside cli.mjs); the locale lookup maps citeproc's bare
+  "en-US" tag onto the vendored `locales-en-US.xml`. CC BY-SA 3.0
+  attribution for the CSL styles/locale and the citeproc license live in
+  `NOTICE`.
+  - Files: `src/serve/cite.ts` (the real renderer over the Task 4 stub),
+    `src/serve/citeproc.d.ts` (ambient types — the package ships none),
+    `src/serve/styles.ts`, `src/serve/styles/` (the four vendored CSL
+    assets + `generated.ts`), `src/serve/document.ts` (the list-styles arm
+    goes live), `scripts/bundle-styles.mts` (+ `package.json`
+    `bundle:styles`), `src/cli.ts` (`--styles-dir` reaches the list-styles
+    arm), `tsup.config.ts` (`@xmldom/xmldom` joins `noExternal`),
+    `tsconfig.json` (`allowImportingTsExtensions` for the drift-gate
+    import), `test/serve-cite.test.ts` (new), `test/serve-styles.test.ts`
+    (new), `test/serve.test.ts` (+2: list-styles over the bridge, an apa
+    projection+renderer smoke), `NOTICE`, `README.md`, `package.json`
+    (`citeproc`, `@xmldom/xmldom`), `pnpm-lock.yaml`.
+  - Verification: `pnpm typecheck && pnpm test` — all green (13 files,
+    249 tests); `pnpm build` green (the 1.7 MB cli.mjs carries styles,
+    locale, citeproc, and xmldom).
+
 ## 2026-11-05
 
 - **feat: machine keys — an API key minted with custody opens encrypted
