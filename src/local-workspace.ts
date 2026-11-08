@@ -215,6 +215,11 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
     keySource = resolved.source;
   }
 
+  // Store.open (better-sqlite3) creates the store file EAGERLY — capture
+  // existence BEFORE the open, else the best-effort check below is vacuous
+  // (a first run against an unreachable server would "serve" a store that
+  // did not exist until this very call).
+  const hadStore = existsSync(storePath);
   const store = Store.open(durableFileBackend(storePath));
   const transport = new HttpTransport({
     baseUrl: base,
@@ -228,7 +233,7 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
   try {
     await session.bootstrap();
   } catch (error) {
-    if (options.bestEffortSync === true && existsSync(storePath)) {
+    if (options.bestEffortSync === true && hadStore) {
       options.onWarning?.(
         `initial sync failed — serving the last synced store (${error instanceof Error ? error.message : String(error)})`,
       );

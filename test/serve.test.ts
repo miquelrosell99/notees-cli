@@ -25,6 +25,7 @@ const warnings: string[] = [];
 let duneId = "";
 let articleId = "";
 let plainPageId = "";
+let bareSourceId = "";
 
 beforeAll(async () => {
   harness = await bootServer();
@@ -47,6 +48,9 @@ beforeAll(async () => {
   await harness.seedProperty(articleId, SYSTEM_PROPERTY_UUIDS.publicationDate, { nodeId: year2020 });
   // A non-source page that FTS would still hit — search must filter it out.
   plainPageId = await harness.seedObject("Dune (film) notes", []);
+  // A bare-source node (no roster subclass) — search must surface it with
+  // classKey "source", not drop it.
+  bareSourceId = await harness.seedObject("Dune Messiah", [SYSTEM_CLASS_UUIDS.source]);
 
   session = await openBridgeSession({
     server: harness.baseUrl,
@@ -111,6 +115,74 @@ describe("search", () => {
   it("answers an empty results array for a no-match query", async () => {
     const res = await call({ cmd: "search", query: "no-such-title-xyz" });
     expect(res.body).toEqual({ ok: true, results: [] });
+  });
+
+  it("surfaces a bare class:source hit with classKey \"source\"", async () => {
+    const res = await call({ cmd: "search", query: "Messiah" });
+    if (!res.body.ok || !("results" in res.body)) throw new Error(JSON.stringify(res.body));
+    expect(res.body.results).toHaveLength(1);
+    expect(res.body.results[0]).toMatchObject({ title: "Dune Messiah", classKey: "source" });
+    expect(bareSourceId).not.toBe("");
+  });
+});
+
+describe("offline-first bootstrap", () => {
+  const deadServer = "http://127.0.0.1:1"; // nothing listens — refused instantly
+
+  it("serves the last synced store when the server is unreachable", async () => {
+    const storeDir = join(harness.dataDir, "offline-store");
+    // First session syncs against the live server, then releases the lock.
+    const first = await openBridgeSession({
+      server: harness.baseUrl,
+      apiKey: API_KEY,
+      workspaceId: defaultWorkspaceId(),
+      storeDir,
+      statePath: harness.stateFile,
+      stateKey: `default:${harness.baseUrl}`,
+      syncIntervalMs: 3_600_000,
+      onWarning: () => {},
+    });
+    first.close();
+    // Same store, unreachable server: the best-effort path warns and serves
+    // the stale projection — never a fatal error.
+    const offlineWarnings: string[] = [];
+    const offline = await openBridgeSession({
+      server: deadServer,
+      apiKey: API_KEY,
+      workspaceId: defaultWorkspaceId(),
+      storeDir,
+      statePath: harness.stateFile,
+      stateKey: `default:${deadServer}`,
+      syncIntervalMs: 3_600_000,
+      onWarning: (message) => offlineWarnings.push(message),
+    });
+    try {
+      expect(offlineWarnings.some((message) => message.includes("initial sync failed"))).toBe(true);
+      const hits = offline.searchSources("Dune");
+      expect(hits.some((hit) => hit.title === "Dune" && hit.classKey === "book")).toBe(true);
+    } finally {
+      offline.close();
+    }
+  });
+
+  it("fails loud when there is no store and the server is unreachable", async () => {
+    const storeDir = join(harness.dataDir, "never-synced-store");
+    // No store file yet + unreachable server: best-effort must NOT invent an
+    // empty projection — the open rejects (network exit code) and nothing
+    // is served. (Store.open creates the file eagerly, so the existence
+    // check must be captured BEFORE the open.)
+    await expect(
+      openBridgeSession({
+        server: deadServer,
+        apiKey: API_KEY,
+        workspaceId: defaultWorkspaceId(),
+        storeDir,
+        statePath: harness.stateFile,
+        stateKey: `default:${deadServer}`,
+        syncIntervalMs: 3_600_000,
+        onWarning: () => {},
+      }),
+    ).rejects.toMatchObject({ exitCode: 5 });
   });
 });
 

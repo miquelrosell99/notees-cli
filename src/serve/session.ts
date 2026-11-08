@@ -150,8 +150,10 @@ export async function openBridgeSession(options: BridgeSessionOptions): Promise<
           classIds: string[];
           properties?: Array<{ schemaId: string; value: unknown }>;
         };
-        const classKey = sourceClassOf(object.classIds);
-        if (classKey === undefined) continue; // lost the class race — never leak non-sources
+        // The member query already guarantees source-family membership; a
+        // node carrying ONLY the bare `source` class (no roster subclass)
+        // surfaces as classKey "source" instead of being dropped.
+        const classKey = sourceClassOf(object.classIds) ?? "source";
         const props = Array.isArray(object.properties) ? object.properties : [];
         const valuesOf = (schemaId: string): unknown[] =>
           props.filter((p) => p.schemaId === schemaId).map((p) => p.value);
