@@ -27,7 +27,7 @@
  * returned, so the command layer and `--json` contract are unchanged.
  */
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -92,6 +92,14 @@ export interface LocalWorkspaceOptions {
    */
   statePath?: string;
   stateKey?: string;
+  /**
+   * `notees serve`: a failed bootstrap sync with an EXISTING store file
+   * serves the last synced projection (offline-first) instead of dying.
+   * A missing store still fails loud — there is nothing to serve.
+   */
+  bestEffortSync?: boolean;
+  /** Warning sink for the best-effort path (and future advisory notes). */
+  onWarning?: (message: string) => void;
 }
 
 interface ApiObject {
@@ -220,8 +228,14 @@ export async function openLocalWorkspace(options: LocalWorkspaceOptions): Promis
   try {
     await session.bootstrap();
   } catch (error) {
-    store.close();
-    throw mapSyncError(error, base);
+    if (options.bestEffortSync === true && existsSync(storePath)) {
+      options.onWarning?.(
+        `initial sync failed — serving the last synced store (${error instanceof Error ? error.message : String(error)})`,
+      );
+    } else {
+      store.close();
+      throw mapSyncError(error, base);
+    }
   }
   return session;
 }

@@ -79,6 +79,10 @@ import {
 import { buildJsonArchiveDocument } from "./json-export.js";
 import { runLogseqDbImport } from "./import-logseq-db.js";
 import { resolveServeConfig } from "./serve/config.js";
+import { createCiteRenderer } from "./serve/cite.js";
+import { dispatchDocument } from "./serve/document.js";
+import { startBridge } from "./serve/server.js";
+import { openBridgeSession } from "./serve/session.js";
 import { runShell } from "./shell.js";
 import { clearCachedMasterKey, defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, readStdin } from "./util.js";
@@ -2036,12 +2040,38 @@ async function runServe(ctx: CommandContext, options: {
   if (config.tokenFile !== undefined) {
     writeFileSync(config.tokenFile, `${config.token}\n`, { mode: 0o600 });
   }
-  // Task 4 wires the real session + bridge; the skeleton keeps the command
-  // parseable and the config tested end-to-end.
-  ctx.io.stderr.write(
-    `notees serve: listening on http://${config.host}:${config.port} (sync every ${config.syncIntervalMs / 1000}s)\n` +
-      `pairing token: ${config.token}\n`,
-  );
+  const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
+  const session = await openBridgeSession({
+    server: ctx.client.server,
+    apiKey: ctx.client.apiKey,
+    workspaceId,
+    storeDir: join(dirname(ctx.statePath), "stores"),
+    statePath: ctx.statePath,
+    stateKey: ctx.stateKey,
+    syncIntervalMs: config.syncIntervalMs,
+    onWarning: (message) => ctx.io.stderr.write(`warning: ${message}\n`),
+  });
+  const renderer = createCiteRenderer(config.stylesDir);
+  const bridge = await startBridge(config, {
+    dispatch: (request) => dispatchDocument({ session, renderer }, request),
+  });
+  const shutdown = async (): Promise<void> => {
+    await bridge.close();
+    session.close();
+  };
+  process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
+  process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
+  const machine = { ok: true, port: bridge.port, token: bridge.token, workspaceId };
+  if (ctx.opts.json === true) {
+    ctx.io.stdout.write(`${JSON.stringify(machine)}\n`);
+  } else {
+    ctx.io.stderr.write(
+      `notees serve: bridge listening on http://${config.host}:${bridge.port} (workspace ${workspaceId})\n` +
+        `pairing token: ${bridge.token}\n` +
+        `press Ctrl-C to stop\n`,
+    );
+  }
+  await new Promise<never>(() => {}); // runs until SIGINT/SIGTERM
 }
 
 /** CLI release version — aligned with the server release train. */
