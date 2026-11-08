@@ -320,3 +320,78 @@ describe("store lock", () => {
     ).rejects.toMatchObject({ exitCode: 4 });
   });
 });
+
+describe("hardening", () => {
+  it("serves 24 concurrent mixed requests, all well-formed", async () => {
+    const bodies = [
+      { cmd: "search", query: "Dune" },
+      { cmd: "list-styles" },
+      { cmd: "render-citation", objectIds: [duneId], styleId: "apa" },
+      { cmd: "render-bibliography", objectIds: [duneId, articleId], styleId: "apa" },
+    ];
+    const responses = await Promise.all(
+      Array.from({ length: 24 }, (_, i) => call(bodies[i % bodies.length]!)),
+    );
+    for (const res of responses) {
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true });
+    }
+    // And a follow-up after the burst still works (no wedged state).
+    const after = await call({ cmd: "search", query: "Dune" });
+    expect(after.body).toMatchObject({ ok: true });
+  });
+
+  it("answers every wire error shape with its pinned HTTP status", async () => {
+    const cases: Array<[unknown, number, string]> = [
+      [{ cmd: "nope" }, 400, "unknown_cmd"],
+      [{ cmd: "search" }, 400, "bad_request"],
+      [{ cmd: "render-citation", objectIds: [], styleId: "apa" }, 400, "bad_request"],
+      [{ cmd: "render-citation", objectIds: [duneId], styleId: "../traversal" }, 404, "not_found"],
+      [{ cmd: "render-citation", objectIds: ["00000000-0000-0000-0000-00000000dead"], styleId: "apa" }, 404, "not_found"],
+    ];
+    for (const [body, status, code] of cases) {
+      const res = await call(body);
+      expect(res.status).toBe(status);
+      expect(res.body).toMatchObject({ ok: false, error: { code } });
+    }
+  });
+
+  it("serves from the last synced store when the server goes dark (offline-first)", async () => {
+    // Close the first session (releases the lock), then open against a
+    // dead port with the SAME store dir — search must still answer.
+    // The workspace id must be the primary session's: the store file is
+    // <storeDir>/<workspaceId>.db, and a never-synced id has no store —
+    // with the server unreachable that fails loud (exit 5), never serves.
+    const workspaceId = defaultWorkspaceId();
+    session.close();
+    const offline = await openBridgeSession({
+      server: "http://127.0.0.1:1", // nothing listens here
+      apiKey: API_KEY,
+      workspaceId,
+      storeDir: join(dirname(harness.stateFile), "stores"),
+      statePath: harness.stateFile,
+      stateKey: `default:${harness.baseUrl}`,
+      syncIntervalMs: 3_600_000,
+      onWarning: (message) => warnings.push(message),
+    });
+    try {
+      const results = offline.searchSources("Dune");
+      expect(results.some((r) => r.title === "Dune")).toBe(true);
+      expect(warnings.some((w) => w.includes("initial sync failed"))).toBe(true);
+    } finally {
+      offline.close();
+    }
+    // Re-open the primary session for any later tests (same options as the
+    // beforeAll hook, so the lock and the store dir line up exactly).
+    session = await openBridgeSession({
+      server: harness.baseUrl,
+      apiKey: API_KEY,
+      workspaceId: defaultWorkspaceId(),
+      storeDir: join(dirname(harness.stateFile), "stores"),
+      statePath: harness.stateFile,
+      stateKey: `default:${harness.baseUrl}`,
+      syncIntervalMs: 3_600_000,
+      onWarning: (message) => warnings.push(message),
+    });
+  });
+});
