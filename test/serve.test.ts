@@ -263,6 +263,47 @@ describe("render-citation", () => {
   });
 });
 
+describe("render-bibliography", () => {
+  it("renders an apa bibliography across source classes", async () => {
+    const res = await call({ cmd: "render-bibliography", objectIds: [duneId, articleId], styleId: "apa" });
+    expect(res.status).toBe(200);
+    if (!res.body.ok || !("bibliography" in res.body)) throw new Error(JSON.stringify(res.body));
+    expect(res.body.bibliography).toContain("Herbert, F.");
+    expect(res.body.bibliography).toContain("Dune");
+    expect(res.body.bibliography).toContain("Atreides, P.");
+  });
+
+  it("renders the bundled styles end-to-end (ieee + chicago smoke)", async () => {
+    const ieee = await call({ cmd: "render-bibliography", objectIds: [duneId], styleId: "ieee" });
+    if (!ieee.body.ok || !("bibliography" in ieee.body)) throw new Error(JSON.stringify(ieee.body));
+    expect(ieee.body.bibliography).toContain("Dune");
+
+    const chicago = await call({ cmd: "render-bibliography", objectIds: [duneId], styleId: "chicago-note-bibliography" });
+    if (!chicago.body.ok || !("bibliography" in chicago.body)) throw new Error(JSON.stringify(chicago.body));
+    expect(chicago.body.bibliography).toContain("Herbert");
+  });
+
+  it("answers not_found for a non-source object id", async () => {
+    const res = await call({ cmd: "render-bibliography", objectIds: [plainPageId], styleId: "apa" });
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ ok: false, error: { code: "not_found" } });
+  });
+});
+
+describe("list-styles", () => {
+  it("lists the bundled styles", async () => {
+    const res = await call({ cmd: "list-styles" });
+    expect(res.body).toEqual({
+      ok: true,
+      styles: [
+        { id: "apa", label: "APA (7th edition)" },
+        { id: "ieee", label: "IEEE" },
+        { id: "chicago-note-bibliography", label: "Chicago (notes & bibliography)" },
+      ],
+    });
+  });
+});
+
 describe("store lock", () => {
   it("refuses a second bridge on the same store (exit 4 contract)", async () => {
     await expect(
