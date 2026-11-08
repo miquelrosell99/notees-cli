@@ -97,6 +97,15 @@ function bearerMatches(header: string | undefined, token: string): boolean {
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 
+/**
+ * Exact-match allowlist lookup. Returns the presented origin only when it is
+ * one of the configured values — never "*" and never a substring/regex match —
+ * so the caller can echo it as Access-Control-Allow-Origin.
+ */
+function matchedOrigin(origin: string | undefined, config: ServeConfig): string | undefined {
+  return typeof origin === "string" && config.origins.includes(origin) ? origin : undefined;
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -104,32 +113,58 @@ async function handleRequest(
   handlers: BridgeHandlers,
 ): Promise<void> {
   let answered = false;
-  const respond = (status: number, body: ServeResponse): void => {
+  const baseHeaders = {
+    // Loopback pairing bridge: a fresh socket per request keeps close()
+    // drain prompt instead of waiting out client keep-alive timeouts.
+    connection: "close" as const,
+    "cache-control": "no-store",
+  };
+  const respond = (status: number, body: ServeResponse, extraHeaders: Record<string, string> = {}): void => {
     if (answered) return;
     answered = true;
     res.writeHead(status, {
       "content-type": "application/json",
-      "cache-control": "no-store",
-      // Loopback pairing bridge: a fresh socket per request keeps close()
-      // drain prompt instead of waiting out client keep-alive timeouts.
-      connection: "close",
+      ...baseHeaders,
+      ...extraHeaders,
     });
     res.end(JSON.stringify(body));
   };
-  try {
+  const origin = req.headers.origin;
+  const allowed = matchedOrigin(origin, config);
+  const corsHeaders = allowed === undefined ? {} : { "access-control-allow-origin": allowed };
+  try {    // The Word add-in pane is served cross-origin, so its fetch is a non-simple
+    // CORS request: the browser OPTIONS-preflights /document and blocks the
+    // actual response without an echoed Access-Control-Allow-Origin. Fail-closed
+    // like the origin gate below: only a listed origin gets ACAO, anything else
+    // (including no allowlist at all) is a 403 with no ACAO headers.
+    if (req.method === "OPTIONS") {
+      if (allowed === undefined) {
+        respond(403, serveError("bad_request", "origin is not allowed"));
+        return;
+      }
+      answered = true;
+      res.writeHead(204, {
+        ...baseHeaders,
+        "access-control-allow-origin": allowed,
+        "access-control-allow-methods": "POST, OPTIONS",
+        "access-control-allow-headers": "authorization, content-type",
+      });
+      res.end();
+      return;
+    }
+
     if (req.method !== "POST" || req.url !== "/document") {
       respond(404, serveError("bad_request", "POST /document only"));
       return;
     }
-    const origin = req.headers.origin;
     // Exact-match allowlist: once one exists, every request needs an Origin
     // header carrying a listed value — a missing header is not a pass.
-    if (config.origins.length > 0 && (typeof origin !== "string" || !config.origins.includes(origin))) {
+    if (config.origins.length > 0 && allowed === undefined) {
       respond(403, serveError("bad_request", "origin is not allowed"));
       return;
     }
     if (!bearerMatches(req.headers.authorization, config.token)) {
-      respond(401, serveError("bad_request", "missing or invalid bearer token"));
+      respond(401, serveError("bad_request", "missing or invalid bearer token"), corsHeaders);
       return;
     }
     const raw = await readBody(req);
@@ -137,23 +172,23 @@ async function handleRequest(
     try {
       parsed = JSON.parse(raw);
     } catch {
-      respond(400, serveError("bad_request", "body is not valid JSON"));
+      respond(400, serveError("bad_request", "body is not valid JSON"), corsHeaders);
       return;
     }
     const request = parseServeRequest(parsed);
     if (!request.ok) {
-      respond(400, request.response);
+      respond(400, request.response, corsHeaders);
       return;
     }
     const response = await handlers.dispatch(request.request);
-    respond(statusFor(response), response);
+    respond(statusFor(response), response, corsHeaders);
   } catch (error) {
     if (error instanceof BodyTooLargeError) {
-      respond(413, serveError("bad_request", error.message));
+      respond(413, serveError("bad_request", error.message), corsHeaders);
       return;
     }
     // A dispatch (or plumbing) exception is a 500 with a generic body: the
     // server never crashes and never leaks internals through the wire.
-    respond(500, serveError("bad_request", "internal error"));
+    respond(500, serveError("bad_request", "internal error"), corsHeaders);
   }
 }

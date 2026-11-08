@@ -88,6 +88,73 @@ describe("startBridge", () => {
     expect(noOrigin.status).toBe(403);
   });
 
+  it("answers CORS preflight: 204 + the three ACAO headers for a listed origin, 403 without ACAO otherwise", async () => {
+    const config = resolveServeConfig(
+      { port: "0", origin: ["https://word.example"] },
+      { NOTEES_SERVE_TOKEN: "test-token" },
+    );
+    bridge = await startBridge(config, { dispatch: async () => ({ ok: true, styles: [] }) });
+
+    async function preflight(origin: string | undefined): Promise<Response> {
+      return fetch(`http://127.0.0.1:${bridge!.port}/document`, {
+        method: "OPTIONS",
+        headers: origin === undefined ? {} : { origin },
+      });
+    }
+
+    const ok = await preflight("https://word.example");
+    expect(ok.status).toBe(204);
+    expect(ok.headers.get("access-control-allow-origin")).toBe("https://word.example");
+    expect(ok.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
+    expect(ok.headers.get("access-control-allow-headers")).toBe("authorization, content-type");
+
+    for (const bad of ["https://evil.example", undefined] as const) {
+      const denied = await preflight(bad);
+      expect(denied.status).toBe(403);
+      expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+    }
+
+    // Fail-closed even with no allowlist configured: no match, no ACAO.
+    const open = resolveServeConfig({ port: "0" }, { NOTEES_SERVE_TOKEN: "test-token" });
+    const openBridge = await startBridge(open, { dispatch: async () => ({ ok: true, styles: [] }) });
+    const denied = await fetch(`http://127.0.0.1:${openBridge.port}/document`, {
+      method: "OPTIONS",
+      headers: { origin: "https://word.example" },
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+    await openBridge.close();
+  });
+
+  it("echoes Access-Control-Allow-Origin on POST responses for a matched origin only", async () => {
+    const config = resolveServeConfig(
+      { port: "0", origin: ["https://word.example"] },
+      { NOTEES_SERVE_TOKEN: "test-token" },
+    );
+    bridge = await startBridge(config, { dispatch: async () => ({ ok: true, styles: [] }) });
+    const headers = { authorization: "Bearer test-token" };
+
+    const res = await fetch(`http://127.0.0.1:${bridge.port}/document`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers, origin: "https://word.example" },
+      body: JSON.stringify({ cmd: "list-styles" }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("https://word.example");
+    await res.json();
+
+    // The disallowed POST still 403s through the origin gate — and carries no
+    // ACAO, so the browser hides the body cross-origin too.
+    const denied = await fetch(`http://127.0.0.1:${bridge.port}/document`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers, origin: "https://evil.example" },
+      body: JSON.stringify({ cmd: "list-styles" }),
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+    await denied.json();
+  });
+
   it("answers 404 for wrong paths and methods", async () => {
     const config = resolveServeConfig({ port: "0" }, { NOTEES_SERVE_TOKEN: "test-token" });
     bridge = await startBridge(config, { dispatch: async () => ({ ok: true, styles: [] }) });

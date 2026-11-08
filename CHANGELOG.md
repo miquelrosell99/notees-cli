@@ -8,6 +8,25 @@ history.
 
 ## 2026-11-08
 
+- **fix: `notees serve` answers CORS preflight and echoes `Access-Control-Allow-Origin`
+  for allowlisted origins — the Word add-in can pair across origins.** The pane
+  is served from the Notees origin (`https://<host>/word/`) but fetches
+  `127.0.0.1`, so every pane request is a non-simple cross-origin fetch: the
+  browser preflights with `OPTIONS` and blocks the response without ACAO. Until
+  now the bridge answered anything but `POST /document` with a bare 404 and set
+  no CORS headers, so no pane fetch could ever succeed. `OPTIONS` is now
+  answered with `204` plus `Access-Control-Allow-Origin` (the exact matched
+  origin, never `*`), `Access-Control-Allow-Methods: POST, OPTIONS`, and
+  `Access-Control-Allow-Headers: authorization, content-type`; `POST`
+  responses echo ACAO for the same matched origin so the pane can read them.
+  Fail-closed like the origin gate: no allowlist configured, or an origin that
+  does not match, means no ACAO at all — the preflight itself 403s — and
+  non-OPTIONS method/path 404s are unchanged. The README states the operator
+  requirement: `--origin https://<host>` (the Notees origin serving `/word/`)
+  is mandatory for pairing.
+  - Files: `src/serve/server.ts`, `test/serve-server.test.ts` (+2 specs),
+    `README.md`.
+
 - **fix: `notees serve` review fixes — the `--token-file` write lands after the
   bridge is listening, search guards its per-id reads, and the session close
   is idempotent.** A failed bridge start (or a failed token-file write) now
