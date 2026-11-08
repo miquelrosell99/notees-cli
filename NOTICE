@@ -56,9 +56,8 @@ Fonts (Export/PDF rendering)
 CSL citation styles and locales
 
   Source: https://github.com/citation-style-language/styles
-           (apa, ieee) and
-           https://github.com/citation-style-language/styles
-           (chicago-notes-bibliography, vendored as chicago-note-bibliography)
+           (apa.csl, ieee.csl, and chicago-notes-bibliography.csl —
+           vendored as chicago-note-bibliography.csl)
   Locale: https://github.com/citation-style-language/locales
            (locales-en-US.xml)
   License: CC BY-SA 3.0
@@ -75,6 +74,15 @@ citeproc (citeproc-js)
   Copyright: Frank Bennett and contributors (npm package authored by
              Michael McMillan)
   Used in: the `notees serve` citation renderer (src/serve/cite.ts)
+
+---
+
+@xmldom/xmldom
+
+  Source: https://github.com/xmldom/xmldom (npm package `@xmldom/xmldom`)
+  License: MIT
+  Used in: the `notees serve` citation renderer (CSL XML parsing,
+           src/serve/cite.ts)
 
 ---
 

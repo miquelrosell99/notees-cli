@@ -8,6 +8,26 @@ history.
 
 ## 2026-11-08
 
+- **fix: `notees serve` review fixes — the `--token-file` write lands after the
+  bridge is listening, search guards its per-id reads, and the session close
+  is idempotent.** A failed bridge start (or a failed token-file write) now
+  tears down the session and leaves no stale pairing token behind, instead of
+  writing the token before the bridge was ever up; `searchSources` skips an
+  object id whose row throws between the query and the read (parity with the
+  name-ref resolver) and the result slice happens inside the query's
+  try/catch; `session.close()` carries a `closed` guard so a double close
+  cannot delete a lock a fresh bridge on the same store has since acquired,
+  and `runServe` closes the session if `startBridge` throws. The README and
+  this changelog now state the filesystem posture honestly — request-time
+  reads are confined to the traversal-guarded `--styles-dir` and the
+  workspace's own derived store — and NOTICE dedupes the CSL styles-repo
+  attribution (upstream filename `chicago-notes-bibliography.csl`), plus the
+  `@xmldom/xmldom` (MIT) attribution.
+  - Files: `src/cli.ts` (`runServe`), `src/serve/session.ts`, `README.md`,
+    `NOTICE`, `test/serve.test.ts` (+2: a stale-lock steal against a real
+    dead child pid, a 422 `render_failed` pin for a corrupt `.csl` over the
+    bridge; one duplicate list-styles block dropped).
+
 - **feat: `notees serve` — the localhost citation bridge for the Word add-in
   goes live: search + CSL citation/bibliography renders over the local derived
   store.** A long-running `node:http` server bound to 127.0.0.1 only (no
@@ -30,8 +50,9 @@ history.
   class-in-[source + roster] + quoted FTS tokens — an unparseable query
   answers `[]`, never a 500); CSL-JSON items ride `@notees/export`'s existing
   `nodeToCsl` (the mapping is reused, not duplicated). The bridge exposes no
-  filesystem endpoints — startup-time `--token-file` / `--styles-dir` touches
-  only — and every failure answers the `{ok: false, error: {code, message}}`
+  arbitrary filesystem endpoints — request-time reads are confined to the
+  traversal-guarded `--styles-dir` and the workspace's own derived store —
+  and every failure answers the `{ok: false, error: {code, message}}`
   envelope (unknown_cmd / not_found / render_failed / bad_request). The
   citeproc renderer, the bundled apa/ieee/chicago-note-bibliography styles,
   and the render arms ship in the two entries below; the README documents the

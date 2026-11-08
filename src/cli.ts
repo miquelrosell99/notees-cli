@@ -81,7 +81,7 @@ import { runLogseqDbImport } from "./import-logseq-db.js";
 import { resolveServeConfig } from "./serve/config.js";
 import { createCiteRenderer } from "./serve/cite.js";
 import { dispatchDocument } from "./serve/document.js";
-import { startBridge } from "./serve/server.js";
+import { startBridge, type Bridge } from "./serve/server.js";
 import { openBridgeSession } from "./serve/session.js";
 import { runShell } from "./shell.js";
 import { clearCachedMasterKey, defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
@@ -2037,9 +2037,6 @@ async function runServe(ctx: CommandContext, options: {
   stylesDir?: string;
 }): Promise<void> {
   const config = resolveServeConfig(options);
-  if (config.tokenFile !== undefined) {
-    writeFileSync(config.tokenFile, `${config.token}\n`, { mode: 0o600 });
-  }
   const workspaceId = (await ctx.client.workspaceId()) ?? DEFAULT_WORKSPACE_ID;
   const session = await openBridgeSession({
     server: ctx.client.server,
@@ -2051,14 +2048,31 @@ async function runServe(ctx: CommandContext, options: {
     syncIntervalMs: config.syncIntervalMs,
     onWarning: (message) => ctx.io.stderr.write(`warning: ${message}\n`),
   });
-  const renderer = createCiteRenderer(config.stylesDir);
-  const bridge = await startBridge(config, {
-    dispatch: (request) =>
-      dispatchDocument(
-        { session, renderer, ...(config.stylesDir !== undefined ? { stylesDir: config.stylesDir } : {}) },
-        request,
-      ),
-  });
+  // The bridge goes live first; only a listening bridge gets a token file —
+  // a failed start must never leave a stale pairing token behind.
+  let bridge: Bridge;
+  try {
+    const renderer = createCiteRenderer(config.stylesDir);
+    bridge = await startBridge(config, {
+      dispatch: (request) =>
+        dispatchDocument(
+          { session, renderer, ...(config.stylesDir !== undefined ? { stylesDir: config.stylesDir } : {}) },
+          request,
+        ),
+    });
+  } catch (error) {
+    session.close();
+    throw error;
+  }
+  if (config.tokenFile !== undefined) {
+    try {
+      writeFileSync(config.tokenFile, `${bridge.token}\n`, { mode: 0o600 });
+    } catch (error) {
+      await bridge.close();
+      session.close();
+      throw error;
+    }
+  }
   const shutdown = async (): Promise<void> => {
     await bridge.close();
     session.close();

@@ -65,6 +65,13 @@ export interface BridgeSessionOptions {
   onWarning(message: string): void;
 }
 
+interface SourceRow {
+  id: string;
+  name: string | null;
+  classIds: string[];
+  properties?: Array<{ schemaId: string; value: unknown }>;
+}
+
 export interface BridgeSession {
   readonly local: LocalWorkspace;
   /** FTS over the local derived store, filtered to the source class family. */
@@ -103,6 +110,7 @@ export async function openBridgeSession(options: BridgeSessionOptions): Promise<
     });
   }, options.syncIntervalMs);
   syncTimer.unref();
+  let closed = false;
   return {
     local,
     searchSources(query, limit = 20) {
@@ -138,18 +146,18 @@ export async function openBridgeSession(options: BridgeSessionOptions): Promise<
             ],
           },
         }) as { ids: string[] };
-        ids = result.ids;
+        ids = result.ids.slice(0, limit);
       } catch {
         return []; // an FTS-unparseable query answers empty, never a 500
       }
       const results: SearchResultItem[] = [];
-      for (const id of ids.slice(0, limit)) {
-        const object = local.getObject(id).object as {
-          id: string;
-          name: string | null;
-          classIds: string[];
-          properties?: Array<{ schemaId: string; value: unknown }>;
-        };
+      for (const id of ids) {
+        let object: SourceRow;
+        try {
+          object = local.getObject(id).object as unknown as SourceRow;
+        } catch {
+          continue; // an id gone between the query and the read is skipped
+        }
         // The member query already guarantees source-family membership; a
         // node carrying ONLY the bare `source` class (no roster subclass)
         // surfaces as classKey "source" instead of being dropped.
@@ -190,6 +198,10 @@ export async function openBridgeSession(options: BridgeSessionOptions): Promise<
       return results;
     },
     close() {
+      // Idempotent: a double close must not delete a lock a fresh bridge on
+      // the same store has since acquired.
+      if (closed) return;
+      closed = true;
       clearInterval(syncTimer);
       local.close();
       releaseServeLock(lockPath);

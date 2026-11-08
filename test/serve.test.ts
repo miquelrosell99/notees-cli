@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { SYSTEM_CLASS_UUIDS, SYSTEM_PROPERTY_UUIDS } from "@notees/domain";
@@ -290,20 +292,6 @@ describe("render-bibliography", () => {
   });
 });
 
-describe("list-styles", () => {
-  it("lists the bundled styles", async () => {
-    const res = await call({ cmd: "list-styles" });
-    expect(res.body).toEqual({
-      ok: true,
-      styles: [
-        { id: "apa", label: "APA (7th edition)" },
-        { id: "ieee", label: "IEEE" },
-        { id: "chicago-note-bibliography", label: "Chicago (notes & bibliography)" },
-      ],
-    });
-  });
-});
-
 describe("store lock", () => {
   it("refuses a second bridge on the same store (exit 4 contract)", async () => {
     await expect(
@@ -318,6 +306,32 @@ describe("store lock", () => {
         onWarning: () => {},
       }),
     ).rejects.toMatchObject({ exitCode: 4 });
+  });
+
+  it("steals a stale lock whose recorded pid is a reaped process", async () => {
+    // Spawn a child that exits immediately — its pid is a REAL dead pid, so
+    // the isProcessAlive probe in acquireServeLock must fail and the lock
+    // must be stolen rather than answered with exit 4.
+    const child = spawnSync(process.execPath, ["-e", ""], {});
+    if (child.status !== 0 || child.pid === undefined) throw new Error("failed to reap a child pid");
+    const storeDir = join(harness.dataDir, "stale-lock-store");
+    mkdirSync(storeDir, { recursive: true });
+    writeFileSync(join(storeDir, `${defaultWorkspaceId()}.serve.lock`), `${child.pid}\n`);
+    const stolen = await openBridgeSession({
+      server: harness.baseUrl,
+      apiKey: API_KEY,
+      workspaceId: defaultWorkspaceId(),
+      storeDir,
+      statePath: harness.stateFile,
+      stateKey: `default:${harness.baseUrl}`,
+      syncIntervalMs: 3_600_000,
+      onWarning: () => {},
+    });
+    try {
+      expect(stolen.searchSources("Dune").some((hit) => hit.title === "Dune")).toBe(true);
+    } finally {
+      stolen.close();
+    }
   });
 });
 
@@ -353,6 +367,32 @@ describe("hardening", () => {
       const res = await call(body);
       expect(res.status).toBe(status);
       expect(res.body).toMatchObject({ ok: false, error: { code } });
+    }
+  });
+
+  it("answers 422 render_failed over the wire for a corrupt .csl in --styles-dir", async () => {
+    // The renderer-level pin lives in serve-cite.test.ts; this one closes the
+    // wire path — a corrupt user style must arrive as the HTTP 422 envelope,
+    // not a bare renderer error.
+    const stylesDir = mkdtempSync(join(tmpdir(), "notees-styles-"));
+    writeFileSync(join(stylesDir, "broken.csl"), "<style>not valid csl</style>");
+    const renderer = createCiteRenderer(stylesDir);
+    const extra = await startBridge(resolveServeConfig({ port: "0" }, {}), {
+      dispatch: (request) => dispatchDocument({ session, renderer, stylesDir }, request),
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${extra.port}/document`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${extra.token}` },
+        body: JSON.stringify({ cmd: "render-citation", objectIds: [duneId], styleId: "broken" }),
+      });
+      expect(response.status).toBe(422);
+      expect((await response.json()) as ServeResponse).toMatchObject({
+        ok: false,
+        error: { code: "render_failed" },
+      });
+    } finally {
+      await extra.close();
     }
   });
 
