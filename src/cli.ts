@@ -78,6 +78,7 @@ import {
 } from "./markdown-export.js";
 import { buildJsonArchiveDocument } from "./json-export.js";
 import { runLogseqDbImport } from "./import-logseq-db.js";
+import { resolveServeConfig } from "./serve/config.js";
 import { runShell } from "./shell.js";
 import { clearCachedMasterKey, defaultStatePath, profileDefaults, serverState, updateProfileDefaults, updateServerState, type StoredCredential } from "./state.js";
 import { formatTable, readStdin } from "./util.js";
@@ -2022,6 +2023,25 @@ async function syncOnce(ctx: CommandContext): Promise<void> {
   } finally {
     session.close();
   }
+}
+
+async function runServe(ctx: CommandContext, options: {
+  port?: string;
+  origin?: string[];
+  tokenFile?: string;
+  syncInterval?: string;
+  stylesDir?: string;
+}): Promise<void> {
+  const config = resolveServeConfig(options);
+  if (config.tokenFile !== undefined) {
+    writeFileSync(config.tokenFile, `${config.token}\n`, { mode: 0o600 });
+  }
+  // Task 4 wires the real session + bridge; the skeleton keeps the command
+  // parseable and the config tested end-to-end.
+  ctx.io.stderr.write(
+    `notees serve: listening on http://${config.host}:${config.port} (sync every ${config.syncIntervalMs / 1000}s)\n` +
+      `pairing token: ${config.token}\n`,
+  );
 }
 
 /** CLI release version — aligned with the server release train. */
@@ -4174,6 +4194,7 @@ const HELP_ROWS: Record<string, { flags: string }> = {
   backlinks: { flags: "<id>" },
   asset: { flags: "add <path…> --object --jobs --stop-on-error · attach --object · list --object --limit · get --output" },
   sync: { flags: "status" },
+  serve: { flags: "[--port · --origin · --token-file · --styles-dir]" },
   doctor: { flags: "(resolves flag > env > stored)" },
   shell: { flags: "[script]" },
   export: { flags: "markdown · json · bibtex" },
@@ -4829,6 +4850,29 @@ function buildProgram(): Command {
   sync.action(async (_options: object, command: Command) => {
     await syncOnce(ctxOf(command));
   });
+
+  program
+    .command("serve")
+    .description(
+      "run the localhost citation bridge for the Word add-in (127.0.0.1 only; search + CSL renders over the local store; runs until Ctrl-C)",
+    )
+    .option("--port <n>", "port to bind (default 8474; 0 = OS-assigned)", "8474")
+    .addOption(
+      new Option("--origin <url>", "allowed Word add-in web origin (repeatable); requests carrying an Origin header must match")
+        .argParser((value: string, previous: string[] | undefined) => [...(previous ?? []), value]),
+    )
+    .option("--token-file <path>", "also write the pairing token to this file (mode 0600)")
+    .option("--sync-interval <seconds>", "background sync interval, >= 5 (default 60)", "60")
+    .option("--styles-dir <dir>", "directory of user-supplied .csl styles (bundled styles always available)")
+    .action(async (options: {
+      port?: string;
+      origin?: string[];
+      tokenFile?: string;
+      syncInterval?: string;
+      stylesDir?: string;
+    }, command: Command) => {
+      await runServe(ctxOf(command), options);
+    });
 
   program
     .command("doctor")
