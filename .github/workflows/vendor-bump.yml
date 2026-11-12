@@ -3,14 +3,12 @@ name: vendor-bump
 # Automated vendor pin bump: move vendor/notees to the core repo's newest
 # main, rebuild the vendored packages, refresh the lockfile, run the gate,
 # and open the bump PR with its changelog entry. Triggered by an hourly
-# scheduled drift net, the core repo's vendor-dispatch
-# (repository_dispatch on every main push — active only while the
-# VENDOR_DISPATCH_TOKEN secret exists there), and workflow_dispatch. A green gate auto-merges (squash); a red gate still
+# scheduled drift net plus manual workflow_dispatch. (A repository_dispatch
+# leg existed 2026-11-12 and was retired the same day: it needed a web-UI-only
+# PAT and bought minutes over the hourly net — see CHANGELOG.) A green gate auto-merges (squash); a red gate still
 # opens the PR — it is the lockstep alarm, and ci.yml runs on the PR too.
 
 on:
-  repository_dispatch:
-    types: [notees-sync-updated]
   schedule:
     - cron: "23 * * * *"
   workflow_dispatch:
@@ -49,7 +47,6 @@ jobs:
           echo "old=$(git ls-tree HEAD vendor/notees | awk '{print $3}')" >> "$GITHUB_OUTPUT"
           git -C vendor/notees fetch origin
           TARGET="${{ github.event.inputs.sha }}"
-          if [ -z "$TARGET" ]; then TARGET="${{ github.event.client_payload.sha }}"; fi
           if [ -z "$TARGET" ]; then TARGET="origin/main"; fi
           git -C vendor/notees checkout "$TARGET"
           git submodule update --init --recursive

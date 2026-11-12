@@ -142,7 +142,7 @@ Every tag's `pacman-smoke` CI job build-installs this exact PKGBUILD on Arch bef
 
 The submodule pin is the lockstep boundary: bump it after the main repo ships protocol/store changes the CLI needs.
 
-Bumps normally arrive as **automated PRs**: the core repo's (`miquelrosell99/notees`) `vendor-dispatch` notifies this repo on every sync main push, and `.github/workflows/vendor-bump.yml` opens the bump PR (gate green → squash-merge; a Monday scheduled run is the drift net). The manual recipe below remains for exceptional pins.
+Bumps normally arrive as **automated PRs**: `.github/workflows/vendor-bump.yml` runs every hour, pins `vendor/notees` at the core repo's (`miquelrosell99/notees`) newest main, and opens the bump PR (gate green → squash-merge). The manual recipe below remains for exceptional pins.
 
 ```bash
 cd vendor/notees && git fetch origin && git checkout origin/main && cd ../..
