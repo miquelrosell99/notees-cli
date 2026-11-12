@@ -1,18 +1,18 @@
 name: vendor-bump
 
-# Automated vendor pin bump: move vendor/notees to notees-sync's newest
+# Automated vendor pin bump: move vendor/notees to the core repo's newest
 # main, rebuild the vendored packages, refresh the lockfile, run the gate,
-# and open the bump PR with its changelog entry. Triggered by notees-sync's
-# vendor-dispatch (repository_dispatch on every sync main push), a weekly
-# scheduled drift net (missed dispatches, absent secret), and
-# workflow_dispatch. A green gate auto-merges (squash); a red gate still
+# and open the bump PR with its changelog entry. Triggered by an hourly
+# scheduled drift net, the core repo's vendor-dispatch
+# (repository_dispatch on every main push — active only while the
+# VENDOR_DISPATCH_TOKEN secret exists there), and workflow_dispatch. A green gate auto-merges (squash); a red gate still
 # opens the PR — it is the lockstep alarm, and ci.yml runs on the PR too.
 
 on:
   repository_dispatch:
     types: [notees-sync-updated]
   schedule:
-    - cron: "17 4 * * 1"
+    - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
       sha:
