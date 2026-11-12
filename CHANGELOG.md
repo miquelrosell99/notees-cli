@@ -6,6 +6,10 @@ goes; those stay static guidance. Before implementing a change, skim this
 file for recent related work. Anything before 2026-10-06 lives in git
 history.
 
+## 2026-11-12
+
+- **chore(ci): automated vendor-bump — the `vendor/notees` pin now bumps by PR, opened by `.github/workflows/vendor-bump.yml`.** notees-sync's `vendor-dispatch` fires a `notees-sync-updated` `repository_dispatch` on every sync main push; this workflow pins `vendor/notees` at the pushed SHA (manual `workflow_dispatch` takes an optional SHA; the Monday 04:17 UTC scheduled run re-pins to sync's `origin/main` as the drift net), rebuilds the vendored `@notees/*` dists, refreshes the lockfile, runs the gate (`pnpm typecheck && pnpm test`), prepends the changelog entry, and opens `vendor/bump-<sha>` — auto-squash-merged when the gate is green, left open as the lockstep alarm when red (`ci.yml` also runs on the PR). No CLI release rides on a bump (the operations law stands); this only retires the hand-run bookkeeping. Verification: YAML parse clean; changelog-insert path exercised against a scratch copy (fresh-date and same-date headings); the live run happens on the next sync main push or the next scheduled run.
+
 ## 2026-11-08
 
 - **fix: `notees serve` answers CORS preflight and echoes `Access-Control-Allow-Origin`

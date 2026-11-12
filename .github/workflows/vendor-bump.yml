@@ -1,0 +1,132 @@
+name: vendor-bump
+
+# Automated vendor pin bump: move vendor/notees to notees-sync's newest
+# main, rebuild the vendored packages, refresh the lockfile, run the gate,
+# and open the bump PR with its changelog entry. Triggered by notees-sync's
+# vendor-dispatch (repository_dispatch on every sync main push), a weekly
+# scheduled drift net (missed dispatches, absent secret), and
+# workflow_dispatch. A green gate auto-merges (squash); a red gate still
+# opens the PR — it is the lockstep alarm, and ci.yml runs on the PR too.
+
+on:
+  repository_dispatch:
+    types: [notees-sync-updated]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "notees-sync commit to pin (default: origin/main)"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: vendor-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@9.0.0 --activate
+
+      - name: Pin vendor/notees at the target
+        id: pin
+        run: |
+          set -euo pipefail
+          echo "old=$(git ls-tree HEAD vendor/notees | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          git -C vendor/notees fetch origin
+          TARGET="${{ github.event.inputs.sha }}"
+          if [ -z "$TARGET" ]; then TARGET="${{ github.event.client_payload.sha }}"; fi
+          if [ -z "$TARGET" ]; then TARGET="origin/main"; fi
+          git -C vendor/notees checkout "$TARGET"
+          git submodule update --init --recursive
+          echo "sha=$(git -C vendor/notees rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git -C vendor/notees rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Delta check
+        id: delta
+        run: |
+          if git diff --quiet -- vendor/notees; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebuild the vendored packages + refresh the lockfile
+        if: steps.delta.outputs.changed == 'true'
+        run: pnpm -r --filter "@notees/*" build && pnpm install
+
+      - name: Gate (typecheck + test)
+        if: steps.delta.outputs.changed == 'true'
+        id: gate
+        continue-on-error: true
+        run: pnpm typecheck && pnpm test
+
+      - name: Open the bump PR
+        if: steps.delta.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD: ${{ steps.pin.outputs.old }}
+          SHA: ${{ steps.pin.outputs.sha }}
+          SHORT: ${{ steps.pin.outputs.short }}
+          GATE: ${{ steps.gate.outcome }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="vendor/bump-${SHORT}"
+          git checkout -b "$BRANCH"
+          python3 - "$SHORT" <<'EOF'
+          import datetime, re, sys
+          short = sys.argv[1]
+          today = datetime.date.today().isoformat()
+          entry = (f"- **chore(vendor): bump notees pin — notees-sync main @ {short}.** "
+                   "Automated vendor-bump PR (`.github/workflows/vendor-bump.yml`); "
+                   "the vendored change list is in the PR body.\n")
+          text = open("CHANGELOG.md").read()
+          if re.search(f"^## {today}$", text, re.M):
+              text = re.sub(f"(^## {today}$)", r"\1\n" + entry.rstrip(), text, count=1, flags=re.M) + "\n"
+          else:
+              text = re.sub(r"^(## )", f"## {today}\n\n{entry}\n\\1", text, count=1, flags=re.M)
+          open("CHANGELOG.md", "w").write(text)
+          EOF
+          git add vendor/notees pnpm-lock.yaml CHANGELOG.md
+          git commit -m "chore(vendor): bump notees pin to ${SHORT}"
+          git push -u origin "$BRANCH"
+          RANGE="$(git -C vendor/notees log --oneline "${OLD}..${SHA}" 2>/dev/null || echo '(first pin — no range)')"
+          cat > /tmp/pr-body.md <<EOF
+          Automated vendor bump: \`vendor/notees\` → notees-sync @ ${SHORT}.
+
+          **Gate (this workflow): ${GATE}** — typecheck + test. \`ci.yml\` also runs on this PR.
+
+          ## Vendored changes
+
+          \`\`\`
+          ${RANGE}
+          \`\`\`
+          EOF
+          URL="$(gh pr list --head "$BRANCH" --json url --jq '.[0].url')"
+          if [ -z "$URL" ]; then
+            URL="$(gh pr create --title "chore(vendor): bump notees pin to ${SHORT}" --body-file /tmp/pr-body.md --head "$BRANCH")"
+          fi
+          echo "PR: ${URL}"
+          if [ "$GATE" = "success" ]; then
+            gh pr merge --squash --auto "$URL" || echo "auto-merge unavailable (repo setting); merge manually"
+          fi
+
+      - name: Report
+        if: steps.delta.outputs.changed == 'false'
+        run: echo "vendor/notees is already pinned at the target — nothing to bump."

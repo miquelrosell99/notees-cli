@@ -69,6 +69,9 @@ release coordinate; moving one breaks "which source is this install".
 
 - A `vendor/notees` pin bump tracks the main repo's protocol/store changes
   (recipe in the development skill's `development-workflow.md`); it does not
-  require a tag.
+  require a tag. Bumps normally arrive as automated PRs from
+  `.github/workflows/vendor-bump.yml` (dispatched by notees-sync on main
+  pushes; a weekly scheduled run is the drift net) — the manual recipe is
+  for exceptional pins only.
 - Tag when a user-visible CLI slice ships (new/changed commands, flags,
   output contracts) or when the version train moves.
