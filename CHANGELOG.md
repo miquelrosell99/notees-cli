@@ -8,6 +8,7 @@ history.
 
 ## 2026-11-12
 
+- **chore(vendor): repoint `vendor/notees` at the re-merged `miquelrosell99/notees` repo — ADR-001 ships.** The sync+web split was re-merged into the `notees` repo (2026-11-12); the submodule URL moves with it (`.gitmodules` + local remote), the pinned commit is unchanged and verified reachable in the new remote. The vendor-dispatch/vendor-bump automation is unaffected — bumps now track `notees` main.
 - **chore(ci): automated vendor-bump — the `vendor/notees` pin now bumps by PR, opened by `.github/workflows/vendor-bump.yml`.** notees-sync's `vendor-dispatch` fires a `notees-sync-updated` `repository_dispatch` on every sync main push; this workflow pins `vendor/notees` at the pushed SHA (manual `workflow_dispatch` takes an optional SHA; the Monday 04:17 UTC scheduled run re-pins to sync's `origin/main` as the drift net), rebuilds the vendored `@notees/*` dists, refreshes the lockfile, runs the gate (`pnpm typecheck && pnpm test`), prepends the changelog entry, and opens `vendor/bump-<sha>` — auto-squash-merged when the gate is green, left open as the lockstep alarm when red (`ci.yml` also runs on the PR). No CLI release rides on a bump (the operations law stands); this only retires the hand-run bookkeeping. Verification: YAML parse clean; changelog-insert path exercised against a scratch copy (fresh-date and same-date headings); the live run happens on the next sync main push or the next scheduled run.
 
 ## 2026-11-08
