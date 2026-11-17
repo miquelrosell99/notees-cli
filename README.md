@@ -1,3 +1,5 @@
+> **Archived (2026-11-17).** This repository has merged into the Notees monorepo — [`miquelrosell99/notees`](https://github.com/miquelrosell99/notees), under `clients/cli/` with the full git history (ADR-002, the monorepo reunification). Releases stay available here; new releases, issues, and PRs live in the monorepo, and the per-component pipeline moved with it (tags are now `cli-v*`-prefixed there — the release history here predates the move). See `clients/cli/` in the monorepo for the live tree.
+
 # Notees CLI
 
 The `notees` command-line client for [Notees](https://github.com/miquelrosell99/notees) — the object/property/search surface over the server's public API. Split out of the main monorepo (`apps/cli`) to live alongside the other first-class clients ([GTK](https://github.com/miquelrosell99/notees-gtk), [Flutter](https://github.com/miquelrosell99/notees-flutter)).
